@@ -192,12 +192,16 @@ const fx = (() => {
     let saved = 'dark';
     try { saved = localStorage.getItem('knoxmap.base') || 'dark'; } catch (_) {}
     if (!layers[saved]) saved = 'dark';
-    layers[saved].addTo(map);
+    function showBase(name) {
+      Object.values(layers).forEach(l => map.removeLayer(l));
+      layers[name].addTo(map);
+      map.getContainer().classList.toggle('base-light', name === 'streets');
+    }
+    showBase(saved);
     document.querySelectorAll('#basemaps button').forEach(btn => {
       btn.classList.toggle('is-on', btn.dataset.base === saved);
       btn.addEventListener('click', () => {
-        Object.values(layers).forEach(l => map.removeLayer(l));
-        layers[btn.dataset.base].addTo(map);
+        showBase(btn.dataset.base);
         document.querySelectorAll('#basemaps button')
           .forEach(b => b.classList.toggle('is-on', b === btn));
         try { localStorage.setItem('knoxmap.base', btn.dataset.base); } catch (_) {}

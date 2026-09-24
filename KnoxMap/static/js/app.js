@@ -17,6 +17,10 @@ const BIG_TILES_PER_SIDE = 9000;
 const BIG_LANDMARK_KM2 = 40.0;
 const OVERPASS_TILE_KM2 = 30.0;
 const SLOW_ABOVE_KM2 = 60.0;
+// Each mod is 20 cells on a side. A cell is 300 tiles, so neighbouring mods
+// meet on a cell edge.
+const MOD_CELLS = 20;
+const MOD_TILES = MOD_CELLS * 300;
 
 // ---- errors -------------------------------------------------------------
 // Every failure the server answers with carries an id (E-7F3A2C) that is also
@@ -169,6 +173,256 @@ const LassoControl = L.Control.extend({
   },
 });
 map.addControl(new LassoControl());
+
+// The base game's Knox County is one header file per 256-tile cell
+// (media/maps/Muldraugh, KY/<x>_<y>.lotheader). The overlay is those cells,
+// not the rectangle around them. /api/vanilla-cells reads the names.
+const VANILLA_CELL_TILES = 256;
+const METRES_PER_DEGREE = 111320;
+let vanillaCells = [];
+let vanillaGroups = null;
+let vanillaParts = [];
+let vanillaMarker = null;
+
+function vanillaMetresPerTile() {
+  return parseFloat(document.getElementById('metersPerTile').value) || 1;
+}
+
+function vanillaKm(metres) {
+  const km = metres / 1000;
+  return km >= 100 ? String(Math.round(km)) : (Math.round(km * 10) / 10).toFixed(1);
+}
+
+function signedRingArea(ring) {
+  let sum = 0;
+  for (let i = 0; i < ring.length - 1; i++) {
+    sum += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
+  }
+  return sum / 2;
+}
+
+function pointInCellRing(x, y, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1];
+    const xj = ring[j][0], yj = ring[j][1];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+// Outer boundary and holes, in cell-corner coordinates. Shared edges cancel,
+// so a missing cell stays a bite out of the county rather than being filled in.
+function vanillaOutlineGroups(cells) {
+  const edges = new Map();
+  const add = (x1, y1, x2, y2) => {
+    const fwd = `${x1},${y1},${x2},${y2}`;
+    const rev = `${x2},${y2},${x1},${y1}`;
+    if (edges.has(rev)) edges.delete(rev);
+    else edges.set(fwd, [x1, y1, x2, y2]);
+  };
+  for (const [x, y] of cells) {
+    add(x, y, x + 1, y);
+    add(x + 1, y, x + 1, y + 1);
+    add(x + 1, y + 1, x, y + 1);
+    add(x, y + 1, x, y);
+  }
+  const from = new Map();
+  for (const edge of edges.values()) {
+    const key = `${edge[0]},${edge[1]}`;
+    if (!from.has(key)) from.set(key, []);
+    from.get(key).push(edge);
+  }
+  const unused = new Set(edges.keys());
+  const rings = [];
+  for (const edge of edges.values()) {
+    const key = `${edge[0]},${edge[1]},${edge[2]},${edge[3]}`;
+    if (!unused.has(key)) continue;
+    const ring = [[edge[0], edge[1]]];
+    let cur = edge;
+    unused.delete(key);
+    let guard = 0;
+    while (guard++ < edges.size + 2) {
+      ring.push([cur[2], cur[3]]);
+      if (cur[2] === ring[0][0] && cur[3] === ring[0][1]) break;
+      const nexts = from.get(`${cur[2]},${cur[3]}`) || [];
+      const nxt = nexts.find(n => unused.has(`${n[0]},${n[1]},${n[2]},${n[3]}`));
+      if (!nxt) break;
+      unused.delete(`${nxt[0]},${nxt[1]},${nxt[2]},${nxt[3]}`);
+      cur = nxt;
+    }
+    if (ring.length >= 4) rings.push(ring);
+  }
+  const scored = rings.map(ring => ({ ring, area: signedRingArea(ring) }));
+  scored.sort((a, b) => Math.abs(b.area) - Math.abs(a.area));
+  if (!scored.length) return [];
+  const outerSign = Math.sign(scored[0].area) || 1;
+  const groups = [];
+  const holes = [];
+  for (const item of scored) {
+    if (Math.sign(item.area) === outerSign) groups.push({ outer: item.ring, holes: [] });
+    else holes.push(item.ring);
+  }
+  for (const hole of holes) {
+    const [x, y] = hole[0];
+    const host = groups.find(g => pointInCellRing(x, y, g.outer));
+    if (host) host.holes.push(hole);
+  }
+  return groups;
+}
+
+function vanillaExtentMetres() {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const group of vanillaGroups || []) {
+    for (const [x, y] of group.outer) {
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  const mpt = vanillaMetresPerTile();
+  return {
+    width: (maxX - minX) * VANILLA_CELL_TILES * mpt,
+    height: (maxY - minY) * VANILLA_CELL_TILES * mpt,
+    minX, maxX, minY, maxY,
+  };
+}
+
+function vanillaLatLngRings(center) {
+  const { minX, maxX, minY, maxY } = vanillaExtentMetres();
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const mpt = vanillaMetresPerTile();
+  const cos = Math.cos(center.lat * Math.PI / 180);
+  const toLL = (x, y) => {
+    const east = (x - cx) * VANILLA_CELL_TILES * mpt;
+    const north = (cy - y) * VANILLA_CELL_TILES * mpt;
+    return [
+      center.lat + north / METRES_PER_DEGREE,
+      center.lng + east / (METRES_PER_DEGREE * cos),
+    ];
+  };
+  return (vanillaGroups || []).map(group =>
+    [group.outer, ...group.holes].map(ring => ring.map(([x, y]) => toLL(x, y))));
+}
+
+function vanillaIcon() {
+  const { width, height } = vanillaExtentMetres();
+  return L.divIcon({
+    className: 'vanilla-handle',
+    html: `<span class="vanilla-name">Vanilla map</span><span class="vanilla-size">${vanillaKm(width)} × ${vanillaKm(height)} km</span>`,
+    iconSize: [230, 24],
+    iconAnchor: [115, 12],
+  });
+}
+
+function setVanillaButton(on) {
+  const btn = document.getElementById('vanillaOverlayBtn');
+  btn.classList.toggle('is-on', on);
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+}
+
+function placeVanilla(center) {
+  const rings = vanillaLatLngRings(center);
+  vanillaParts.forEach((part, i) => { if (rings[i]) part.setLatLngs(rings[i]); });
+  if (vanillaMarker) {
+    vanillaMarker.setLatLng(center);
+    vanillaMarker.setIcon(vanillaIcon());
+  }
+}
+
+function bindVanillaDrag(layer) {
+  const el = layer.getElement();
+  if (!el) return;
+    el.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0 || !vanillaMarker) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (el.setPointerCapture) el.setPointerCapture(ev.pointerId);
+    const start = map.mouseEventToLatLng(ev);
+    const origin = vanillaMarker.getLatLng();
+    el.style.cursor = 'grabbing';
+    const move = (e) => {
+      const now = map.mouseEventToLatLng(e);
+      placeVanilla(L.latLng(
+        origin.lat + (now.lat - start.lat),
+        origin.lng + (now.lng - start.lng),
+      ));
+    };
+    const up = () => {
+      el.style.cursor = 'grab';
+      el.removeEventListener('pointermove', move);
+      el.removeEventListener('pointerup', up);
+      el.removeEventListener('pointercancel', up);
+    };
+    el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', up);
+    el.addEventListener('pointercancel', up);
+  });
+}
+
+function hideVanillaOverlay() {
+  vanillaParts.forEach(part => map.removeLayer(part));
+  vanillaParts = [];
+  if (vanillaMarker) map.removeLayer(vanillaMarker);
+  vanillaMarker = null;
+  setVanillaButton(false);
+}
+
+function syncVanillaOverlay() {
+  if (!vanillaMarker) return;
+  placeVanilla(vanillaMarker.getLatLng());
+}
+
+function showVanillaOverlay() {
+  const note = document.getElementById('vanillaNote');
+  if (!vanillaCells.length || !vanillaGroups || !vanillaGroups.length) {
+    if (note) note.textContent = 'The base game\'s Knox County map was not found.';
+    return;
+  }
+  if (note) note.textContent = '';
+  hideVanillaOverlay();
+  const center = map.getCenter();
+  const style = {
+    color: '#ffc857', weight: 2, dashArray: '7 6',
+    fillColor: '#ffc857', fillOpacity: 0.08,
+    interactive: true, smoothFactor: 0, className: 'vanilla-shape',
+  };
+  vanillaParts = vanillaLatLngRings(center).map(rings => L.polygon(rings, style).addTo(map));
+  vanillaParts.forEach(bindVanillaDrag);
+  vanillaMarker = L.marker(center, {
+    draggable: true, keyboard: false, zIndexOffset: 600,
+    bubblingMouseEvents: false, icon: vanillaIcon(),
+  }).addTo(map);
+  vanillaMarker.on('drag', () => placeVanilla(vanillaMarker.getLatLng()));
+  setVanillaButton(true);
+  const pts = [];
+  const walk = (node) => {
+    if (!node) return;
+    if (typeof node.lat === 'number') pts.push(node);
+    else if (Array.isArray(node)) node.forEach(walk);
+  };
+  vanillaParts.forEach(part => walk(part.getLatLngs()));
+  if (pts.length) map.fitBounds(L.latLngBounds(pts), { padding: [28, 28] });
+}
+
+async function loadVanillaCells() {
+  try {
+    const data = await (await fetch('/api/vanilla-cells')).json();
+    vanillaCells = data.cells || [];
+    vanillaGroups = vanillaOutlineGroups(vanillaCells);
+  } catch (_) {
+    vanillaCells = [];
+    vanillaGroups = [];
+  }
+}
+loadVanillaCells();
+
+document.getElementById('vanillaOverlayBtn').addEventListener('click', () => {
+  if (vanillaParts.length) hideVanillaOverlay();
+  else showVanillaOverlay();
+});
 
 function startLasso(button) {
   const box = map.getContainer();
@@ -386,6 +640,98 @@ function rectBounds(rect) {
   };
 }
 
+function formatSpan(metres) {
+  const a = Math.abs(metres);
+  if (a >= 1000) {
+    const km = a / 1000;
+    const text = km >= 100 ? String(Math.round(km)) : (Math.round(km * 10) / 10).toFixed(1);
+    return `${text} km`;
+  }
+  return `${Math.round(a)} m`;
+}
+
+function formatKm2(km2) {
+  if (km2 < 10) return `${km2.toFixed(2)} km²`;
+  return `${Math.round(km2)} km²`;
+}
+
+function coordText(lat, lon) {
+  return `${Number(lat).toFixed(5)}, ${wrapLon(lon).toFixed(5)}`;
+}
+
+function cornerItems(bounds) {
+  const s = bounds.getSouth(), n = bounds.getNorth();
+  const w = wrapLon(bounds.getWest()), e = wrapLon(bounds.getEast());
+  return [['SW', s, w], ['SE', s, e], ['NE', n, e], ['NW', n, w]];
+}
+
+function pointItems(latlngs) {
+  const pts = latlngs.slice();
+  if (pts.length > 1) {
+    const a = pts[0], b = pts[pts.length - 1];
+    if (a.lat === b.lat && a.lng === b.lng) pts.pop();
+  }
+  return pts.map(ll => ['', ll.lat, ll.lng]);
+}
+
+function asPolygons(latlngs) {
+  if (!latlngs || !latlngs.length) return [];
+  const first = latlngs[0];
+  if (first && typeof first.lat === 'number') return [[latlngs]];
+  if (first && first[0] && typeof first[0].lat === 'number') return [latlngs];
+  return latlngs;
+}
+
+function layerBlocks(layer) {
+  if (layer instanceof L.Circle) {
+    const c = layer.getLatLng();
+    const radius = formatSpan(layer.getRadius());
+    return [{
+      name: 'Circle',
+      points: [['Centre', c.lat, c.lng], ['Radius', null, null, radius],
+        ...cornerItems(layer.getBounds())],
+    }];
+  }
+  if (layer instanceof L.Rectangle) {
+    return [{ name: 'Rectangle', points: cornerItems(layer.getBounds()) }];
+  }
+  const kind = layer._knoxKind === 'freehand' ? 'Freehand' : 'Polygon';
+  const blocks = [];
+  for (const rings of asPolygons(layer.getLatLngs ? layer.getLatLngs() : [])) {
+    rings.forEach((ring, i) => {
+      blocks.push({ name: i === 0 ? kind : 'Hole', points: pointItems(ring) });
+    });
+  }
+  return blocks;
+}
+
+function selectionPieces() {
+  if (!currentRect) return [];
+  if (currentRect instanceof L.FeatureGroup && !(currentRect instanceof L.Path)) {
+    return currentRect.getLayers();
+  }
+  return [currentRect];
+}
+
+function renderAreaLayers() {
+  const host = document.getElementById('area-layers');
+  if (!host) return;
+  const blocks = selectionPieces().flatMap(layerBlocks);
+  if (!blocks.length) {
+    host.innerHTML = '<div class="empty-state">Nothing selected yet.</div>';
+    return;
+  }
+  host.innerHTML = blocks.map(block => `
+    <div class="area-layer">
+      <div class="area-layer-name">${block.name}</div>
+      <ul class="area-points">${block.points.map(item => {
+        const [label, lat, lon, text] = item;
+        const value = text || coordText(lat, lon);
+        return `<li>${label ? `<span class="pt-k">${label}</span> ` : ''}${value}</li>`;
+      }).join('')}</ul>
+    </div>`).join('');
+}
+
 function updateBboxFields() {
   if (!currentRect) return clearBboxFields();
   const { s, w, n, e } = rectBounds(currentRect);
@@ -393,6 +739,7 @@ function updateBboxFields() {
   document.getElementById('west').value  = w.toFixed(6);
   document.getElementById('north').value = n.toFixed(6);
   document.getElementById('east').value  = e.toFixed(6);
+  renderAreaLayers();
 
   const area = bboxAreaKm2(s, w, n, e);
   const mpt = parseFloat(document.getElementById('metersPerTile').value);
@@ -403,11 +750,9 @@ function updateBboxFields() {
   const cellsX = tilesX / 300;
   const cellsY = tilesY / 300;
 
-  const queries = area > OVERPASS_TILE_KM2
-    ? Math.ceil(Math.sqrt(area / OVERPASS_TILE_KM2)) ** 2 : 1;
-  // Landscape and vegetation images, 3 bytes a tile each.
-  const pixelsMB = (tilesX * tilesY * 3 * 2) / 1e6;
-
+  const modsX = Math.max(1, Math.ceil(tilesX / MOD_TILES));
+  const modsY = Math.max(1, Math.ceil(tilesY / MOD_TILES));
+  const mods = modsX * modsY;
   const stats = document.getElementById('area-stats');
   const btn = document.getElementById('generateBtn');
   const side = Math.max(tilesX, tilesY);
@@ -417,38 +762,37 @@ function updateBboxFields() {
              + `(${BIG_AREA_KM2} km²).`);
   }
   if (side > BIG_TILES_PER_SIDE) {
-    heavy.push(`${side} tiles a side is past what is comfortable `
-             + `(${BIG_TILES_PER_SIDE}) — about ${bitmapFor(tilesX, tilesY)} of `
-             + 'ground and greenery held in memory at once. Raising metres per '
-             + 'tile is the cheapest fix: 2 m is a quarter of the memory of 1 m.');
+    heavy.push(`${side} tiles a side is a large selection `
+             + `(${BIG_TILES_PER_SIDE} is a comfortable one). It is drawn as `
+             + `${mods} mods of ${MOD_CELLS}×${MOD_CELLS} cells.`);
   }
   const slow = !heavy.length && area > SLOW_ABOVE_KM2;
-  const bitmap = bitmapFor(tilesX, tilesY);
-  const fill = Math.min(100, (area / BIG_AREA_KM2) * 100);
+  const shape = selectionAreaKm2();
+  const shown = shape !== null ? shape : area;
 
-  stats.className = heavy.length ? 'warn' : (slow ? 'warn' : 'ok');
+  stats.hidden = false;
+  stats.className = heavy.length || slow ? 'warn' : 'ok';
   stats.innerHTML = `
-    <div class="tiles">
-      ${fx.tile(area, 'km²', 'area', area < 10 ? 2 : 1)}
-      <div class="tile"><div class="v"><span data-count="${cellsX}">0</span><small>×</small><span
-        data-count="${cellsY}">0</span></div><div class="k">cells</div></div>
-      ${fx.tile(tilesX * tilesY / 1e6, 'M', 'tiles', 2)}
-      ${fx.tile(queries, '', queries === 1 ? 'osm query' : 'osm queries')}
+    <div class="size-block">
+      <div class="size-k">Real world</div>
+      <div class="size-line">${formatSpan(widthM)} × ${formatSpan(heightM)}</div>
+      <div class="size-line">${formatKm2(shown)}</div>
     </div>
-    <div class="meter">
-      <div class="meter-top"><span>~${Math.round(widthM)} × ${Math.round(heightM)} m · ${bitmap} of bitmap</span>
-        <span>${fill < 1 ? '<1' : Math.round(fill)}% of limit</span></div>
-      <div class="bar"><div class="bar-fill" style="width:${fill}%"></div></div>
+    <div class="size-block">
+      <div class="size-k">In game</div>
+      <div class="size-line">${tilesX.toLocaleString()} × ${tilesY.toLocaleString()} <span>tiles</span></div>
+      <div class="size-line">${cellsX} × ${cellsY} <span>cells</span></div>
     </div>
-    ${selectionAreaKm2() !== null ? `<div class="stat-note shape">Only the drawn shape is built:
-      <b>${selectionAreaKm2().toFixed(2)} km²</b> of this ${area.toFixed(2)} km² box. Outside it the land
+    ${shape !== null ? `<div class="stat-note shape">Only the drawn shape is built:
+      <b>${shape.toFixed(2)} km²</b> of this ${area.toFixed(2)} km² box. Outside it the land
       turns back to countryside, with the main roads and rivers running on.</div>` : ''}
     ${heavy.length ? `<div class="stat-note warn">${heavy.join(' ')}
       You can still build it — this is a heads-up, not a wall.</div>` : ''}
-    ${slow ? `<div class="stat-note warn">A big map — roughly ${Math.ceil(queries * 12 / 60)}+ min
-      of OpenStreetMap queries before rendering starts.</div>` : ''}
+    <div class="stat-note">Drawn as ${modsX} × ${modsY} mods of ${MOD_CELLS}×${MOD_CELLS} cells.
+      They meet at the edges. The build downloads the smallest daily OpenStreetMap
+      regions that cover this box.</div>
+    ${slow ? `<div class="stat-note warn">A large selection — ${mods} mods, drawn one at a time.</div>` : ''}
   `;
-  fx.countUp(stats);
   btn.disabled = false;
   fx.step('area', 'done');
 
@@ -463,17 +807,21 @@ function clearBboxFields() {
   ['south', 'west', 'north', 'east'].forEach(id => {
     document.getElementById(id).value = '';
   });
+  renderAreaLayers();
   const stats = document.getElementById('area-stats');
   stats.className = 'empty';
-  stats.innerHTML = `<div class="empty-state">
-    Draw an area on the map - rectangle, polygon, circle or freehand - to see what you'll get.</div>`;
+  stats.hidden = true;
+  stats.innerHTML = '';
   document.getElementById('generateBtn').disabled = true;
   document.getElementById('landmarksBtn').disabled = true;
   document.getElementById('landmark-results').innerHTML = '';
   fx.resetFrom('area');
 }
 
-document.getElementById('metersPerTile').addEventListener('change', updateBboxFields);
+document.getElementById('metersPerTile').addEventListener('change', () => {
+  updateBboxFields();
+  syncVanillaOverlay();
+});
 
 // Landscape and vegetation, 3 bytes a tile each, held at full size while the
 // map is drawn. It is the number that decides whether a big map finishes.
@@ -1182,7 +1530,13 @@ function renderResults(data) {
       <div class="tile"><div class="v"><span data-count="${data.cellsX}">0</span><small>×</small><span
         data-count="${data.cellsY}">0</span></div><div class="k">cells</div></div>
       ${fx.tile(data.featureCount, '', 'osm features')}
-    </div>`;
+      ${data.modCount ? fx.tile(data.modCount, '', data.modCount === 1 ? 'mod' : 'mods') : ''}
+    </div>`
+    + (data.regions && data.regions.length
+      ? `<div class="stat-note">Daily extracts: ${data.regions.join(', ')}. `
+        + `Each mod is ${MOD_CELLS}×${MOD_CELLS} cells and lines up with the next `
+        + `when every mod is enabled.</div>`
+      : '');
   fx.countUp(info);
 
   // One click gets the lot; the individual files stay available but folded away.
@@ -1577,8 +1931,10 @@ document.getElementById('installBtn').addEventListener('click', async () => {
         lifts += ' With "Spawn Selector" enabled you can start at any landmark of the map.';
       }
     } catch (_) { /* the install itself worked; the tip is optional */ }
+    const many = data.mods > 1 ? ` as ${data.mods} mods` : '';
     note('installNote',
-         `Installed ${data.cells} cells to ${data.modRoot}. Enable "${data.title}" `
+         `Installed ${data.cells} cells${many} to ${data.modRoot}. Enable `
+         + `"${data.title}"${data.mods > 1 ? ' and the numbered mods beside it' : ''} `
          + 'in the game\'s Mods menu, then start a NEW save. In a save you are '
          + 'already playing, right-click the ground and pick "Reset loot" for '
          + 'fresh loot in a building.' + lifts, 'ok');

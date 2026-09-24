@@ -101,6 +101,43 @@ def worlded_gui() -> Path | None:
     return _tool("PZWorldEd", "PZWORLDED")
 
 
+# Compiled vanilla cells are 256 tiles. The base game keeps one header per
+# cell of Knox County in media/maps/Muldraugh, KY, named "<x>_<y>.lotheader".
+VANILLA_CELL_TILES = 256
+VANILLA_MAP_NAME = "Muldraugh, KY"
+
+
+def vanilla_map_dir() -> Path | None:
+    """The base game's Knox County map folder, when the install is known."""
+    media = pz_media_dir()
+    if not media:
+        return None
+    folder = media / "maps" / VANILLA_MAP_NAME
+    return folder if _is_dir(folder) else None
+
+
+def vanilla_cells() -> list[list[int]]:
+    """Cell coordinates that actually exist on the vanilla map.
+
+    The folder is not a solid rectangle: only the cells the game shipped
+    have a header, and those names are the outline.
+    """
+    folder = vanilla_map_dir()
+    if not folder:
+        return []
+    found: list[list[int]] = []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    for name in names:
+        match = re.fullmatch(r"(\d+)_(\d+)\.lotheader", name)
+        if match:
+            found.append([int(match.group(1)), int(match.group(2))])
+    found.sort()
+    return found
+
+
 def electron_shell() -> list[str] | None:
     """The command that opens KnoxMap's window, or None when there is no
     Electron build to run.
