@@ -14,9 +14,12 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -1266,6 +1269,195 @@ def api_zombies():
         return failed(f"Cannot recount zombies: {exc}.", 400, exc)
     _save_settings(map_dir, settings)
     return jsonify({"population": summary})
+
+
+# The community WorldEd this button offers. Pinned to one release: the
+# compiler KnoxMap ships was built against this tag, and "latest" would
+# drift away from it.
+COMMUNITY_TOOLS_TAG = "43.00B260909"
+COMMUNITY_TOOLS_REPO = "Unjammer/PZ_Mapping_Tools"
+COMMUNITY_TOOLS_BUILD = "20260909f"
+_TOOLS_LOCK = threading.Lock()
+_TOOLS_JOB = {"state": "idle", "error": None, "message": ""}
+
+
+def _community_tools_installed() -> bool:
+    """True when the mapping-tools folder is this release and WorldEd is in it."""
+    if knoxpaths.worlded_gui() is None:
+        return False
+    if knoxpaths.load_config().get("mapping_tools_release") == COMMUNITY_TOOLS_TAG:
+        return True
+    tools = knoxpaths.mapping_tools_dir()
+    if not tools:
+        return False
+    try:
+        head = (tools / "RELEASE_CHANGELOG.md").read_text(
+            encoding="utf-8", errors="replace")[:240]
+    except OSError:
+        return False
+    return "PZ Mapping Tools" in head and COMMUNITY_TOOLS_BUILD in head
+
+
+def _tools_asset(assets: list) -> dict | None:
+    """The release file for this operating system.
+
+    This tag publishes one Windows zip. That is the match on Windows. On
+    another system a native build wins when the release has one; otherwise
+    the Windows build is the one WorldEd already launches.
+    """
+    def rank(name: str) -> int:
+        n = name.lower()
+        linux = "linux" in n
+        mac = any(part in n for part in ("mac", "osx", "darwin"))
+        windows = (n.endswith(".zip") or n.endswith(".exe") or "win" in n) and not linux and not mac
+        if sys.platform == "win32":
+            return 2 if windows else -1
+        if sys.platform == "darwin":
+            if mac:
+                return 3
+            return 1 if windows else -1
+        if sys.platform.startswith("linux"):
+            if linux:
+                return 3
+            return 1 if windows else -1
+        return 1 if windows else -1
+
+    best = None
+    best_rank = 0
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        score = rank(str(asset.get("name") or ""))
+        if score > best_rank and asset.get("browser_download_url"):
+            best, best_rank = asset, score
+    return best
+
+
+def _download_tools(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "KnoxMap",
+        "Accept": "application/octet-stream",
+    })
+    with urllib.request.urlopen(req, timeout=60) as res:
+        total = int(res.headers.get("Content-Length") or 0)
+        buf = io.BytesIO()
+        done = 0
+        while True:
+            chunk = res.read(1 << 16)
+            if not chunk:
+                break
+            buf.write(chunk)
+            done += len(chunk)
+            if total:
+                pct = min(99, round(100 * done / total))
+                with _TOOLS_LOCK:
+                    _TOOLS_JOB["message"] = (
+                        f"Downloading the community world editing tools… {pct}%")
+        return buf.getvalue()
+
+
+def _install_tools_zip(data: bytes) -> Path:
+    """Unpack WorldEd into the mapping-tools folder KnoxMap already uses."""
+    target = knoxpaths.mapping_tools_dir() or (knoxpaths.VENDOR_DIR / "PZMappingTools")
+    with tempfile.TemporaryDirectory() as tmp:
+        zipfile.ZipFile(io.BytesIO(data)).extractall(tmp)
+        root = next((p.parent.parent for p in Path(tmp).rglob("PZWorldEd.exe")
+                     if p.parent.name.lower() == "bin"), None)
+        if root is None:
+            root = next((p.parent.parent for p in Path(tmp).rglob("PZWorldEd")
+                         if p.is_file() and p.parent.name.lower() == "bin"), None)
+        if root is None:
+            raise RuntimeError("The download has no WorldEd program in it.")
+        staging = target.with_name(target.name + ".new")
+        if staging.exists():
+            shutil.rmtree(staging)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(root, staging)
+    backup = target.with_name(target.name + ".old")
+    if backup.exists():
+        shutil.rmtree(backup)
+    if target.exists():
+        target.rename(backup)
+    try:
+        staging.rename(target)
+    except OSError:
+        if backup.exists() and not target.exists():
+            backup.rename(target)
+        raise
+    old_tiles = backup / "Tiles"
+    dest_tiles = target / "Tiles"
+    if old_tiles.is_dir() and not dest_tiles.exists():
+        shutil.move(str(old_tiles), str(dest_tiles))
+    if backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+    knoxpaths.save_config({
+        "mapping_tools": str(target),
+        "mapping_tools_release": COMMUNITY_TOOLS_TAG,
+    })
+    return target
+
+
+def _tools_worker() -> None:
+    try:
+        with _TOOLS_LOCK:
+            _TOOLS_JOB["message"] = "Downloading the community world editing tools…"
+        api = (f"https://api.github.com/repos/{COMMUNITY_TOOLS_REPO}"
+               f"/releases/tags/{COMMUNITY_TOOLS_TAG}")
+        req = urllib.request.Request(api, headers={
+            "User-Agent": "KnoxMap",
+            "Accept": "application/vnd.github+json",
+        })
+        with urllib.request.urlopen(req, timeout=30) as res:
+            payload = json.loads(res.read().decode("utf-8"))
+        asset = _tools_asset(payload.get("assets") or [])
+        if asset is None:
+            raise RuntimeError("This release has no WorldEd build for this system.")
+        data = _download_tools(asset["browser_download_url"])
+        with _TOOLS_LOCK:
+            _TOOLS_JOB["message"] = "Installing the community world editing tools…"
+        _install_tools_zip(data)
+        with _TOOLS_LOCK:
+            _TOOLS_JOB["state"] = "done"
+            _TOOLS_JOB["error"] = None
+            _TOOLS_JOB["message"] = ""
+    except Exception as exc:  # noqa: BLE001 - shown in the export panel
+        with _TOOLS_LOCK:
+            _TOOLS_JOB["state"] = "error"
+            _TOOLS_JOB["error"] = str(exc)
+            _TOOLS_JOB["message"] = ""
+
+
+@app.route("/api/vanilla-cells")
+def api_vanilla_cells():
+    """Cells the base game actually shipped, from their header file names."""
+    cells = knoxpaths.vanilla_cells()
+    return jsonify({
+        "cells": cells,
+        "cellTiles": knoxpaths.VANILLA_CELL_TILES,
+        "found": bool(cells),
+    })
+
+
+@app.route("/api/worlded-tools", methods=["GET", "POST"])
+def api_worlded_tools():
+    """Whether this release of the community WorldEd is installed, and the
+    download that puts it in the mapping-tools folder."""
+    if request.method == "GET":
+        with _TOOLS_LOCK:
+            job = dict(_TOOLS_JOB)
+        job["installed"] = _community_tools_installed()
+        job["release"] = COMMUNITY_TOOLS_TAG
+        return jsonify(job)
+    if _community_tools_installed():
+        return jsonify({"installed": True, "state": "done", "release": COMMUNITY_TOOLS_TAG})
+    with _TOOLS_LOCK:
+        if _TOOLS_JOB["state"] == "running":
+            return jsonify({"started": True, "state": "running"})
+        _TOOLS_JOB["state"] = "running"
+        _TOOLS_JOB["error"] = None
+        _TOOLS_JOB["message"] = "Downloading the community world editing tools…"
+    threading.Thread(target=_tools_worker, daemon=True).start()
+    return jsonify({"started": True, "state": "running"})
 
 
 @app.route("/api/worlded", methods=["POST"])

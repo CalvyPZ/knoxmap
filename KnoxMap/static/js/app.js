@@ -1945,17 +1945,42 @@ document.getElementById('buildingsBtn').addEventListener('click', async () => {
   }
 });
 
+async function openWorldEd() {
+  const status = await (await fetch('/api/worlded-tools')).json();
+  if (!status.installed) {
+    const yes = window.confirm(
+      'Install the community world editing tools? They are downloaded once, and this button then opens your map in them.');
+    if (yes) {
+      note('worldedNote', 'Downloading the community world editing tools…');
+      const start = await fetch('/api/worlded-tools', { method: 'POST' });
+      const started = await start.json();
+      if (!start.ok) throw new Error(started.error || 'Could not install the community world editing tools.');
+      for (;;) {
+        await new Promise(r => setTimeout(r, 700));
+        const job = await (await fetch('/api/worlded-tools')).json();
+        if (job.message) note('worldedNote', job.message);
+        if (job.state === 'running') continue;
+        if (job.state === 'error' || job.error) {
+          throw new Error(job.error || 'Could not install the community world editing tools.');
+        }
+        break;
+      }
+    }
+  }
+  const res = await fetch('/api/worlded', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mapName: currentMap }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw apiError(data, res);
+  note('worldedNote', 'WorldEd opened. File > BMP To TMX > All Cells…, then '
+                      + 'File > Generate Lots 8x8 > All Cells… — waiting…');
+  startLotsPoll();
+}
+
 document.getElementById('worldedBtn').addEventListener('click', async () => {
   try {
-    const res = await fetch('/api/worlded', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mapName: currentMap }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw apiError(data, res);
-    note('worldedNote', 'WorldEd opened. File > BMP To TMX > All Cells…, then '
-                        + 'File > Generate Lots 8x8 > All Cells… — waiting…');
-    startLotsPoll();
+    await openWorldEd();
   } catch (err) {
     note('worldedNote', err.message, 'bad');
   }
