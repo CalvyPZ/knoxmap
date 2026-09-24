@@ -203,10 +203,9 @@ const fx = (() => {
         try { localStorage.setItem('knoxmap.base', btn.dataset.base); } catch (_) {}
       });
     });
-    map.on(L.Draw.Event.CREATED, () => $('#map-hint')?.remove());
   }
 
-  // ---- kind of place ----------------------------------------------------------
+  // ---- default population ------------------------------------------------------
   function presetCards() {
     const select = $('#preset');
     document.querySelectorAll('.preset-card').forEach(card => {

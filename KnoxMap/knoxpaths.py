@@ -424,6 +424,30 @@ def save_steam_folders(folders: list[str]) -> None:
     _LIBRARY_CACHE["libraries"] = None
 
 
+def set_game_install(path: str | None) -> None:
+    """Remember a chosen Project Zomboid folder, or forget it so the game is
+    found on its own. A folder inside a Steam library is also remembered as a
+    library, so Workshop mods on that drive are still found."""
+    config = load_config()
+    if path:
+        config["pz_install"] = str(path)
+        parts = list(Path(path).parts)
+        lowered = [p.lower() for p in parts]
+        if "steamapps" in lowered:
+            lib = str(Path(*parts[:lowered.index("steamapps")]))
+            folders = config.get("steam_folders") or []
+            if isinstance(folders, str):
+                folders = [p for p in folders.split(";") if p.strip()]
+            if lib.lower() not in {str(f).lower() for f in folders}:
+                folders.append(lib)
+            config["steam_folders"] = folders
+    else:
+        config.pop("pz_install", None)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    _LIBRARY_CACHE["libraries"] = None
+
+
 def library_of(folder: str | Path) -> list[Path]:
     """The Steam libraries a folder the player named could mean: the library
     itself, one inside it (a drive's SteamLibrary), or the library a path
@@ -627,6 +651,72 @@ def pz_media_dir(game: Path | str | None = None) -> Path | None:
     if game is None:
         game = pz_install_dir()
     return _media_in(Path(game)) if game else None
+
+
+# The game folder is the one that holds this jar. Build 42 ships the 64-bit
+# jar; the other names are older installs of the same game.
+_PZ_JARS = frozenset({"projectzomboid64.jar", "projectzomboid32.jar", "projectzomboid.jar"})
+
+
+def _jar_in(folder: Path) -> Path | None:
+    """A Project Zomboid jar sitting directly in `folder`, if there is one."""
+    if not _is_dir(folder):
+        return None
+    try:
+        for child in folder.iterdir():
+            if child.is_file() and child.name.lower() in _PZ_JARS:
+                return child
+    except OSError:
+        return None
+    return None
+
+
+def pz_jar(install: Path | str | None) -> Path | None:
+    """The Project Zomboid jar for an install folder.
+
+    On Windows and Linux it sits in the game folder. On a Mac it sits inside
+    the application bundle, under Contents/Java.
+    """
+    if not install:
+        return None
+    root = Path(install)
+    return _jar_in(root) or _jar_in(root / "Contents" / "Java")
+
+
+def pz_install_with_jar(answer: Path | str) -> Path | None:
+    """The game folder named by a path, which has to be the folder that
+    contains the Project Zomboid jar (or a folder just around that one).
+
+    The jar is the base of the install: a Steam library, a shortcut, or a
+    media folder is only accepted when it leads to that jar.
+    """
+    raw = str(answer).strip().strip('"').strip("'")
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.suffix.lower() == ".jar" and path.name.lower() in _PZ_JARS and _exists(path):
+        return path.parent
+    tries = [path,
+             path / "ProjectZomboid",
+             path / "Project Zomboid",
+             path / "steamapps" / "common" / "ProjectZomboid",
+             path / "steamapps" / "common" / "Project Zomboid",
+             path / "common" / "ProjectZomboid",
+             path / "common" / "Project Zomboid"]
+    tries += list(path.parents)[:4]
+    for candidate in tries:
+        if _jar_in(candidate):
+            return candidate
+    bundles: list[Path] = [path] if path.suffix == ".app" else []
+    if _is_dir(path):
+        try:
+            bundles += list(path.glob("*.app"))
+        except OSError:
+            pass
+    for bundle in bundles:
+        if _jar_in(bundle / "Contents" / "Java"):
+            return bundle
+    return None
 
 
 def pz_install_from(answer: Path | str) -> Path | None:

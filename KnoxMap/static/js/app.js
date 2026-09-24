@@ -606,47 +606,76 @@ async function checkSetup() {
 }
 checkSetup();
 
-// ---- Steam libraries -------------------------------------------------------------
+// ---- game location ---------------------------------------------------------------
 //
-// Found on their own; a drive that was missed (or that Steam still lists after
-// it is gone) can be named here instead of running Setup again.
+// Either found on its own, or a folder the player picked. The folder has to
+// be the install: the one that contains the Project Zomboid jar.
 
-function showSteamLibraries(data) {
-  document.getElementById('steamList').innerHTML = data.libraries.length
-    ? data.libraries.map(l => `<li class="ok"><span>✓</span>${escapeHtml(l.path)}${
-        l.chosen ? ' <i>(chosen)</i>' : ''}</li>`).join('')
-    : '<li class="missing"><span>✗</span>No Steam library found</li>';
-  const field = document.getElementById('steamFolders');
-  if (document.activeElement !== field) field.value = (data.chosen || []).join('; ');
-  document.getElementById('steamNote').className = 'hint';
-  document.getElementById('steamNote').textContent =
-    data.game ? `Project Zomboid: ${data.game}` : 'Project Zomboid was not found in these.';
+function showGameLocation(data) {
+  const manual = data.mode === 'manual';
+  document.getElementById('gameAuto').checked = !manual;
+  document.getElementById('gameManual').checked = manual;
+  document.getElementById('gameBrowseRow').hidden = !manual;
+  document.getElementById('gamePath').textContent = manual && data.game ? data.game : '';
+  document.getElementById('gameJar').textContent = manual && data.jar ? data.jar : '';
+  const note = document.getElementById('steamNote');
+  note.className = 'hint';
+  if (data.game && data.jar) {
+    note.textContent = manual ? '' : `${data.game} (${data.jar})`;
+  } else {
+    note.className = 'hint bad';
+    note.textContent = data.game
+      ? 'That folder does not contain the Project Zomboid jar. Choose the game folder, the one with ProjectZomboid64.jar in it.'
+      : 'Project Zomboid was not found. Choose the folder that contains the jar.';
+  }
 }
 
-async function loadSteamLibraries() {
-  try {
-    showSteamLibraries(await (await fetch('/api/steam-libraries')).json());
-  } catch (_) { /* optional */ }
+async function saveGameLocation(body) {
+  const res = await fetch('/api/game-location', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw apiError(data, res);
+  if (data.cancelled) {
+    document.getElementById('gameManual').checked = true;
+    document.getElementById('gameBrowseRow').hidden = false;
+    return;
+  }
+  showGameLocation(data);
+  checkSetup();
 }
 
-document.getElementById('steamLibraries').addEventListener('toggle', e => {
-  if (e.target.open) loadSteamLibraries();
-});
-
-document.getElementById('steamSave').addEventListener('click', async () => {
-  const folders = document.getElementById('steamFolders').value
-    .split(';').map(s => s.trim()).filter(Boolean);
+async function loadGameLocation() {
   try {
-    const res = await fetch('/api/steam-libraries', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ folders }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw apiError(data, res);
-    showSteamLibraries(data);
-    checkSetup();
+    showGameLocation(await (await fetch('/api/game-location')).json());
+  } catch (_) { /* the choices are already on the page */ }
+}
+
+loadGameLocation();
+
+document.getElementById('gameAuto').addEventListener('change', async () => {
+  if (!document.getElementById('gameAuto').checked) return;
+  try {
+    await saveGameLocation({ mode: 'auto' });
   } catch (err) {
     note('steamNote', err.message, 'bad');
+  }
+});
+
+document.getElementById('gameManual').addEventListener('change', () => {
+  if (!document.getElementById('gameManual').checked) return;
+  document.getElementById('gameBrowseRow').hidden = false;
+  document.getElementById('gameBrowse').click();
+});
+
+document.getElementById('gameBrowse').addEventListener('click', async () => {
+  try {
+    await saveGameLocation({ mode: 'browse' });
+  } catch (err) {
+    note('steamNote', err.message, 'bad');
+    document.getElementById('gameManual').checked = true;
+    document.getElementById('gameBrowseRow').hidden = false;
   }
 });
 

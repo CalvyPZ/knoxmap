@@ -1400,6 +1400,97 @@ def api_setup_status():
                     "mods_dir": str(knoxpaths.zomboid_user_dir() / "mods")})
 
 
+def _game_location_payload() -> dict:
+    import knoxpaths
+
+    game = knoxpaths.pz_install_dir()
+    jar = knoxpaths.pz_jar(game)
+    return {"mode": "manual" if knoxpaths.load_config().get("pz_install") else "auto",
+            "game": str(game or ""),
+            "jar": jar.name if jar else ""}
+
+
+def _pick_game_folder() -> str | None:
+    """A folder the player picked, '' if they cancelled, or None if no folder
+    window could be opened."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        chosen = filedialog.askdirectory(title="Select the Project Zomboid folder")
+        root.destroy()
+        return chosen or ""
+    except Exception:
+        log.exception("folder window failed")
+    if os.name != "nt":
+        return None
+    import subprocess
+
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+        "$d.Description = 'Select the Project Zomboid folder'; "
+        "$d.ShowNewFolderButton = $false; "
+        "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }"
+    )
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True, text=True, timeout=180, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        log.exception("folder window failed")
+        return None
+    if done.returncode != 0:
+        return None
+    return (done.stdout or "").strip()
+
+
+_JAR_MISSING = ("That folder does not contain the Project Zomboid jar. "
+                "Choose the game folder, the one with ProjectZomboid64.jar in it.")
+
+
+@app.route("/api/game-location", methods=["GET", "POST"])
+def api_game_location():
+    """Where Project Zomboid is installed: found on its own, or a folder the
+    player picked. A picked folder has to contain the game's jar."""
+    import knoxpaths
+
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        mode = body.get("mode")
+        if mode == "auto":
+            knoxpaths.set_game_install(None)
+            log.info("game location: automatic")
+        elif mode == "browse":
+            chosen = _pick_game_folder()
+            if chosen is None:
+                return jsonify({"error": "Could not open a folder window."}), 500
+            if not chosen:
+                payload = _game_location_payload()
+                payload["cancelled"] = True
+                return jsonify(payload)
+            found = knoxpaths.pz_install_with_jar(chosen)
+            if not found:
+                return jsonify({"error": _JAR_MISSING}), 400
+            knoxpaths.set_game_install(str(found))
+            log.info("game location chosen: %s", found)
+        elif mode == "manual":
+            found = knoxpaths.pz_install_with_jar(body.get("path") or "")
+            if not found:
+                return jsonify({"error": _JAR_MISSING}), 400
+            knoxpaths.set_game_install(str(found))
+            log.info("game location chosen: %s", found)
+        else:
+            return jsonify({"error": "Unknown location choice."}), 400
+    return jsonify(_game_location_payload())
+
+
 @app.route("/api/steam-libraries", methods=["GET", "POST"])
 def api_steam_libraries():
     """The Steam libraries KnoxMap looks in for the game and Workshop mods:

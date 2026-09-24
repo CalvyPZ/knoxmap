@@ -297,8 +297,12 @@ input[readonly] { background: var(--bg); color: var(--muted); }
   border-radius: 4px; padding: 5px 0; cursor: pointer; color: var(--text);
 }
 .preset-card.is-on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.location-choice { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.location-option { display: flex; align-items: center; gap: 8px; color: var(--text); cursor: pointer; }
+.location-option input { width: auto; margin: 0; }
+#gameBrowseRow { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+#gameBrowseRow[hidden] { display: none; }
 
-#advanced summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 #advanced-body { margin-top: 8px; }
 .setting { margin-bottom: 10px; }
 .setting-head { display: flex; justify-content: space-between; font-size: 13px; }
