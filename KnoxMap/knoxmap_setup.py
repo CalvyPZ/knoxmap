@@ -3,7 +3,7 @@
 The program file does this itself the first time it opens. A git checkout
 can still run it by hand:
 
-    Setup.bat           (or: python knoxmap_setup.py)
+    Setup.bat           (this folder, or: python knoxmap_setup.py)
 
 Safe to run again at any time; every step checks first and skips what is
 already done. What it does:

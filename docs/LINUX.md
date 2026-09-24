@@ -20,9 +20,11 @@ still downloads the map tools and reads tiles from your own copy of the game.
 Maps and logs appear beside the AppImage. A copy that lives in Applications
 keeps them in a `KnoxMap` folder in your home directory.
 
-A git checkout is the other way in: `./setup.sh` once, `./knoxmap.sh` after
-that, and it needs 64-bit Python 3.10+. If the scripts are not executable:
+A git checkout is the other way in. From the `KnoxMap` folder, `./setup.sh` once
+and `./knoxmap.sh` after that. It needs 64-bit Python 3.10+. If the scripts
+are not executable:
 
+    cd KnoxMap
     chmod +x setup.sh knoxmap.sh
 
 ## What setup does
@@ -57,8 +59,8 @@ If the sandbox cannot start — `chrome-sandbox` is not setuid, which it cannot
 be without root, or AppArmor on Ubuntu 24.04 and newer will not allow a user
 namespace — KnoxMap opens the window once more without the sandbox and says
 so in the log. The page is only this computer's; nothing is loaded from
-anywhere else. `KNOXMAP_BROWSER=1 ./knoxmap.sh` forces the browser on any
-system, and a missing window does that on its own.
+anywhere else. From the `KnoxMap` folder, `KNOXMAP_BROWSER=1 ./knoxmap.sh` forces
+the browser on any system, and a missing window does that on its own.
 
 ## Compile
 
@@ -74,7 +76,7 @@ that plays Project Zomboid through Proton already has in some form:
 
     sudo apt install wine       # or wine64, or your distribution's package
 
-`KNOXMAP_WINE=/path/to/wine ./knoxmap.sh` points KnoxMap at a particular
+From the `KnoxMap` folder, `KNOXMAP_WINE=/path/to/wine ./knoxmap.sh` points KnoxMap at a particular
 build — a Proton runtime's, for instance.
 
 ### If the compiler will not start

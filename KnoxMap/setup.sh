@@ -5,7 +5,7 @@
 # Mapping Tools, the patched map compiler, and the tile artwork from your own
 # copy of the game. The tools are Windows programs; here they run under Wine,
 # which a PC that plays Project Zomboid through Proton already has. See
-# LINUX.md.
+# docs/LINUX.md.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -51,19 +51,20 @@ if [ "$(uname -s)-$(uname -m)" != "Linux-x86_64" ] &&
   echo "Note: wine was not found. Everything works except Compile, which on"
   echo "this system runs the map tools' Windows build. Install wine, or build"
   echo "the tools for this system and put them in vendor/PZMappingTools/bin -"
-  echo "see LINUX.md. (On 64-bit Linux the compiler is fetched for you.)"
+  echo "see docs/LINUX.md. (On 64-bit Linux the compiler is fetched for you.)"
   echo
 fi
 
-if [ "$(uname -s)" != "Darwin" ] &&
-   ! .venv/bin/python -c 'from webview import guilib; guilib.initialize()' >/dev/null 2>&1; then
-  echo
-  echo "Note: no desktop toolkit for a native window, so KnoxMap will open in"
-  echo "your browser instead. That is the whole app - nothing is missing. For"
-  echo "a window of its own, install one of these and run KnoxMap again:"
-  echo "    sudo apt install python3-gi gir1.2-webkit2-4.1 python3-gi-cairo"
-  echo "    .venv/bin/python -m pip install \"pywebview[qt]\""
-  echo
+# The window is Electron. A normal desktop already has the libraries it needs.
+# A very small install may not, and then KnoxMap opens in the browser instead.
+if [ "$(uname -s)" = "Linux" ] && command -v ldconfig >/dev/null 2>&1; then
+  if ! ldconfig -p 2>/dev/null | grep -q 'libnss3\.so'; then
+    echo
+    echo "Note: the window needs the usual desktop libraries (libnss3, libgtk-3,"
+    echo "libasound2). Install them with your package manager if the window does"
+    echo "not open. KnoxMap still opens in your browser without them. See docs/LINUX.md."
+    echo
+  fi
 fi
 
 .venv/bin/python knoxmap_setup.py
