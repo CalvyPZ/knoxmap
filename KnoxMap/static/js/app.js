@@ -853,19 +853,18 @@ function haversineKm(lat1, lon1, lat2, lon2) {
 // Settings appears here on its own, and one whose range changes cannot end up
 // with the page enforcing last week's bounds.
 
+const AREA_SETTING_KEYS = new Set(['seed', 'fill_gaps', 'true_map', 'guaranteed_rifle']);
+let stableSeed = 1;
+
 const SETTING_LABELS = {
   zombies_per_resident:['Zombies per person', 'Each person who lived or worked here becomes this many zombies.'],
   m2_per_person:       ['Living space (m²)', 'Per resident. Lower = more crowded homes = more zombies. ~50 city, 45 town, 60 suburb.'],
   spawn_density:       ['Horde cap', 'Most zombies one 10×10 m spot can hold. Vanilla towns peak at 10.'],
   tree_density:        ['Woodland', 'Scales tree cover. Trees are cover to hide in.'],
-  seed:                ['Seed', 'Same seed and area gives the same town again.'],
-  fill_gaps:           ['Fill gaps from Overture', '1 adds the buildings OpenStreetMap has not got, from Overture Maps - OSM plus machine-detected roofprints, same licence. Worth it where your town is half missing from OSM; elsewhere it adds sheds. Needs DuckDB.'],
-  true_map:            ['True map generation', '1 builds every address as mapped. 0 keeps the real roads, rivers, woods and terrain, but leaves out half the houses and grows the rest into proper homes with yards. Named places are always built, at the game’s size.'],
-  guaranteed_rifle:    ['Guaranteed rifle', '1 leaves one military rifle on the map: in an army building if there is one, else the police station, else a gun shop, else a house on the edge of town. A real town has no checkpoints for one to spawn in.'],
   min_size:            ['Smallest building', 'Buildings narrower than this many tiles are left out.'],
-  align_streets:       ['Straighten streets', '1 turns the map so the main street grid runs along the tiles - no staircase roads. 0 keeps north up.'],
+  align_streets:       ['Straighten streets', 'Turns the map so the main street grid runs along the tiles, with no staircase roads. Off keeps north up.'],
   rotate_degrees:      ['Turn the map', 'Degrees to turn the whole area before it is built, on top of Straighten streets. Use it when the automatic angle picks the wrong grid.'],
-  straight_roads:      ['Knox County roads', '1 lays every road in straight runs along the tiles and on 45-degree diagonals, and stands every building upright beside them, like the game’s own map. 0 draws roads as they are.'],
+  straight_roads:      ['Knox County roads', 'Lays every road in straight runs along the tiles and on 45-degree diagonals, and stands every building upright beside them, like the game\'s own map. Off draws roads as they are.'],
   max_size:            ['Largest building', 'Footprints above this are skipped.'],
   apartment_footprint: ['Flats above', 'An untagged footprint this big reads as flats.'],
   apartment_chance:    ['Flats chance', 'How often such a footprint really becomes flats.'],
@@ -878,55 +877,132 @@ const SETTING_LABELS = {
 };
 
 let settingsMeta = null;
+let savedMapSettings = null;
+
+function isSwitch(key) {
+  const lim = settingsMeta.limits[key];
+  if (!lim || Number(lim[0]) !== 0 || Number(lim[1]) !== 1) return false;
+  // A 0–1 float is still a quantity (how often, how odd). Only an integer
+  // that can be nothing but off or on becomes a switch.
+  const type = settingsMeta.types
+    ? settingsMeta.types[key]
+    : (Number.isInteger(settingsMeta.defaults[key]) ? 'int' : 'float');
+  return type === 'int';
+}
 
 async function loadSettings() {
   const res = await fetch('/api/settings');
   settingsMeta = await res.json();
   buildSettingsForm(settingsMeta.current);
+  applyAreaSettings(settingsMeta.current);
+  if (savedMapSettings) applySavedMapSettings(savedMapSettings);
 }
 
 function buildSettingsForm(values) {
   const body = document.getElementById('advanced-body');
   body.innerHTML = '';
   for (const [key, [label, hint]] of Object.entries(SETTING_LABELS)) {
+    if (AREA_SETTING_KEYS.has(key)) continue;
     if (!(key in settingsMeta.defaults)) continue;   // knob has been removed
     const [lo, hi] = settingsMeta.limits[key];
     const isInt = settingsMeta.types
       ? settingsMeta.types[key] === 'int'
       : Number.isInteger(settingsMeta.defaults[key]);
     const wrap = document.createElement('div');
-    wrap.className = 'setting';
-    // A seed is an identifier, not a quantity: nobody wants to drag a slider
-    // across two billion values to find one, so it gets a box and a dice.
-    const control = key === 'seed'
-      ? `<div class="seed-row"><input type="number" data-key="${key}" min="${lo}"
-           max="${hi}" step="1" value="${values[key]}"><button type="button"
-           class="dice" title="Random seed">random</button></div>`
-      : `<input type="range" data-key="${key}" min="${lo}" max="${hi}"
-           step="${isInt ? 1 : 0.05}" value="${values[key]}">`;
-    wrap.innerHTML = `
-      <div class="setting-head"><span class="setting-name">${label}</span>
-        ${key === 'seed' ? '' : `<output class="setting-val">${values[key]}</output>`}</div>
-      ${control}
-      <span class="setting-hint">${hint}</span>`;
+    if (isSwitch(key)) {
+      wrap.className = 'setting setting-toggle';
+      wrap.innerHTML = `<label class="toggle">
+        <input type="checkbox" data-key="${key}"${Number(values[key]) ? ' checked' : ''}>
+        <span class="toggle-track" aria-hidden="true"></span>
+        <span class="toggle-copy">
+          <span class="toggle-name">${label}</span>
+          <span class="toggle-hint">${hint}</span>
+        </span>
+      </label>`;
+    } else {
+      wrap.className = 'setting';
+      wrap.innerHTML = `
+        <div class="setting-head"><span class="setting-name">${label}</span>
+          <output class="setting-val">${values[key]}</output></div>
+        <input type="range" data-key="${key}" min="${lo}" max="${hi}"
+           step="${isInt ? 1 : 0.05}" value="${values[key]}">
+        <span class="setting-hint">${hint}</span>`;
+    }
     body.appendChild(wrap);
   }
   fx.wireSettings(body);
 }
 
+function controlValue(el) {
+  if (el.type === 'checkbox') return el.checked ? 1 : 0;
+  if (el.value.trim() === '') return null;
+  const n = parseFloat(el.value);
+  return Number.isNaN(n) ? null : n;
+}
+
 function readSettings() {
   const out = { preset: document.getElementById('preset').value };
-  for (const el of document.querySelectorAll('#advanced-body input[data-key]')) {
+  for (const el of document.querySelectorAll('#advanced-body input[data-key], #tabPanelArea input[data-key]')) {
     // Blank means "whatever the preset says" rather than zero.
-    if (el.value.trim() !== '') out[el.dataset.key] = parseFloat(el.value);
+    const value = controlValue(el);
+    if (value !== null) out[el.dataset.key] = value;
   }
   return out;
 }
 
+function applyAreaSettings(values) {
+  if (!values) return;
+  const seedEl = document.getElementById('areaSeed');
+  if (settingsMeta && settingsMeta.limits && settingsMeta.limits.seed && seedEl) {
+    seedEl.min = settingsMeta.limits.seed[0];
+    seedEl.max = settingsMeta.limits.seed[1];
+  }
+  if ('seed' in values && seedEl && !document.getElementById('seedRandom').checked) {
+    stableSeed = Number(values.seed);
+    seedEl.value = String(stableSeed);
+  } else if ('seed' in values) {
+    stableSeed = Number(values.seed);
+  }
+  for (const key of ['fill_gaps', 'true_map', 'guaranteed_rifle']) {
+    const el = document.querySelector(`#tabPanelArea input[data-key="${key}"]`);
+    if (el && key in values) el.checked = Number(values[key]) === 1;
+  }
+}
+
+// Opening a saved map keeps its seed (and the other knobs it was built with).
+// Randomise stays off, so the hidden seed field is that saved value rather
+// than a new one. A map with no seed of its own still uses 1.
+function applySavedMapSettings(settings) {
+  if (!settings) return;
+  savedMapSettings = settings;
+  if (!settingsMeta) return;
+  const random = document.getElementById('seedRandom');
+  if (random) random.checked = false;
+  const field = document.getElementById('seedField');
+  if (field) field.hidden = true;
+  buildSettingsForm(settings);
+  applyAreaSettings(settings);
+}
+
+document.getElementById('seedRandom').addEventListener('change', () => {
+  const on = document.getElementById('seedRandom').checked;
+  const field = document.getElementById('seedField');
+  const input = document.getElementById('areaSeed');
+  if (on) {
+    input.value = String(Math.floor(Math.random() * 999999) + 1);
+    field.hidden = false;
+  } else {
+    input.value = String(stableSeed);
+    field.hidden = true;
+  }
+});
+
 document.getElementById('preset').addEventListener('change', () => {
   if (!settingsMeta) return;
   const preset = settingsMeta.presets[document.getElementById('preset').value];
-  if (preset) buildSettingsForm(preset);
+  if (!preset) return;
+  buildSettingsForm(preset);
+  applyAreaSettings(preset);
 });
 
 document.getElementById('resetSettings').addEventListener('click', () => {
@@ -1566,11 +1642,8 @@ function renderResults(data) {
   ul.innerHTML = entries.map(([label, href]) =>
     `<li>→ <a href="${href}" target="_blank" download>${label}</a></li>`
   ).join('');
-  ul.querySelectorAll('a').forEach((link, i) => {
-    const href = entries[i][1];
-    wireDownload(link, href.split('/').pop(), entries[i][0]);
-  });
   setupPipeline(data);
+  if (data.settings) applySavedMapSettings(data.settings);
   section.scrollIntoView({ behavior: 'smooth' });
 }
 
