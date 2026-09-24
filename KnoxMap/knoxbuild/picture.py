@@ -24,7 +24,8 @@ from pathlib import Path
 
 from PIL import Image
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+_packed = getattr(sys, "_MEIPASS", None)
+BASE_DIR = Path(_packed) if _packed else Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 

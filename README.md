@@ -93,38 +93,38 @@ actually lived, and installs the result as a mod.
 
 <p align="center">
   <img src="docs/images/roads_ingame_tiles.jpg" alt="Streets drawn with the game's own tiles: kerbs, pavements and a centre line" width="100%"/>
-  <br/><sub>Streets as KnoxMap lays them, drawn with the game's own tiles by <code>tools/render_ground.py</code>
+  <br/><sub>Streets as KnoxMap lays them, drawn with the game's own tiles by <code>KnoxMap/tools/render_ground.py</code>
   (not an in-game screenshot). Tile artwork © The Indie Stone.</sub>
 </p>
 
 ## Quick start
 
-**You need:** Windows 10 or 11 · **Project Zomboid Build 42** installed through
-Steam · an internet connection. Python is optional: if your PC doesn't have it,
-setup downloads a private copy into the KnoxMap folder.
+**You need:** Windows 10 or 11, or Linux, or macOS · **Project Zomboid Build 42**
+installed through Steam · an internet connection the first time. Python is
+already inside the download.
 
-**On Linux or macOS** it is `./setup.sh` once and `./knoxmap.sh` after that,
-and you need your own 64-bit Python 3.10+. Everything works; Compile runs the
-map tools through Wine, which a PC playing Project Zomboid through Proton
-already has. See [LINUX.md](LINUX.md).
+**From a git checkout** it is still `Setup.bat` / `./setup.sh` once. After that,
+start it from the `KnoxMap` folder with `.venv\Scripts\pythonw.exe knoxmap.py`
+on Windows, or `./knoxmap.sh` on Linux and macOS. Linux and macOS checkouts need
+64-bit Python 3.10+. See [LINUX.md](LINUX.md).
 
 1. **Download KnoxMap** from
    [Releases](https://github.com/spytheeuclidean-a11y/knoxmap/releases/latest) —
-   `KnoxMap-v…-windows.zip` on Windows, `…-linux.tar.gz` or `…-macos.tar.gz`
-   elsewhere — and unpack it anywhere. (Or `git clone` it for the latest
-   changes.)
-2. **Double-click `KnoxMap.exe`.** The first time, it runs setup for you, which:
-   - uses your Python 3.10+ if you have one, or downloads the official python.org
-     build (checked against its fingerprint) into the folder if not,
-   - creates a private Python environment inside the KnoxMap folder,
+   `KnoxMap-v…-windows.exe` on Windows, `…-linux.AppImage` on Linux,
+   `…-macos.dmg` on macOS. That file is the whole program. (Or `git clone`
+   it for the latest changes.)
+2. **Open that file.** On Linux, `chmod +x` the AppImage if it does not offer
+   to run. On macOS, open the dmg and drag KnoxMap to Applications.
+   The first time, KnoxMap:
    - downloads the free [PZ Mapping Tools](https://github.com/Unjammer/PZ_Mapping_Tools),
    - downloads the map compiler from this repository's releases and checks its fingerprint,
    - finds your Project Zomboid install and copies the tile artwork the map tools
      need **from your own copy of the game** (games or Workshop mods on another
-     drive: name it when setup asks, or later under *Settings > Steam libraries*),
+     drive: name it under Steam libraries on the Setup tab),
    - adds the rules for kerbs, road markings and Build 42 trees to the map tools.
 
-   It takes a few minutes, once. After that `KnoxMap.exe` opens straight away.
+   It takes a few minutes, once. After that the same file opens straight away.
+   Maps and logs appear in the folder beside it.
 3. **Make a map** in the window that opens:
    1. **Choose an area** (see below). Start small, a few streets, while you get a
       feel for it.
@@ -135,8 +135,7 @@ already has. See [LINUX.md](LINUX.md).
    saves never pick up new maps.
 
 If anything is missing, a *Setup incomplete* panel in the app says exactly what
-and how to fix it. You can run `Setup.bat` again at any time; it only does what
-is still needed.
+and how to fix it. Run that again at any time; it only does what is still needed.
 
 ## Choosing an area
 
@@ -266,14 +265,13 @@ playing. Help is very welcome here, especially screenshots from the game.
 
 | Problem | Fix |
 |---|---|
-| Setup fails | The whole run is written to `logs/setup.log`. Run `Setup.bat` again; if it fails the same way, post that file. |
-| Setup cannot find Project Zomboid | It asks for the folder: paste the `ProjectZomboid` folder from your Steam library. |
-| Setup says the game looks like Build 41 | In Steam: right-click Project Zomboid → **Properties → Betas** → pick the Build 42 branch, then run `Setup.bat` again. |
+| Setup fails | The whole run is written to `logs/setup.log`. Open KnoxMap again; if it fails the same way, post that file. |
+| Setup cannot find Project Zomboid | On the Setup tab, under Steam libraries, name the drive or the `ProjectZomboid` folder and look again. |
+| Setup says the game looks like Build 41 | In Steam: right-click Project Zomboid → **Properties → Betas** → pick the Build 42 branch, then open KnoxMap again. |
 | *OSM query failed* | The free OpenStreetMap servers are busy. Wait a minute and try again, or choose a smaller area. |
 | The map is not in the game | Enable it under **Mods**, then start a **new** game. |
-| The window is blank | Install the [Microsoft Edge WebView2 runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (built into Windows 11). |
-| It opened in my browser instead of a window (Linux) | That is the whole app — nothing is missing. For a window of its own, install a desktop toolkit; see [LINUX.md](LINUX.md). |
-| KnoxMap closes straight away | It shows a message and writes the error to `logs/knoxmap.log`. Running `Setup.bat` again fixes most causes. |
+| The window did not open | The download is the window. From a git checkout, `cd desktop` and `npm install`, then start KnoxMap again, and look at `logs/knoxmap.log`. `KNOXMAP_BROWSER=1` opens KnoxMap in the browser instead. On Linux see [LINUX.md](LINUX.md). |
+| KnoxMap closes straight away | It shows a message and writes the error to `logs/knoxmap.log`. Open it again; most causes are in that file. |
 
 ### Reporting a problem
 
@@ -294,7 +292,8 @@ When something fails, the message in the app carries an id such as
 
 ## For tinkerers
 
-Everything the app does also works from the command line inside `.venv`:
+Everything the app does also works from the command line inside `KnoxMap\.venv`
+(run these from the `KnoxMap` directory):
 
 ```bat
 .venv\Scripts\python -m knoxbuild output\mytown --preset city --set max_levels=12
@@ -303,13 +302,19 @@ Everything the app does also works from the command line inside `.venv`:
 .venv\Scripts\python tools\audit_layouts.py 400
 ```
 
+The window is a small Electron app in `desktop/`. The release file packs it
+together with Python. To work on the window from a checkout: `cd desktop`,
+`npm install`, then start KnoxMap from the `KnoxMap` folder with
+`.venv\Scripts\pythonw.exe knoxmap.py`, or `./knoxmap.sh` from the repository
+root. `KNOXMAP_ELECTRON` can point at a different Electron binary.
+
 - [KNOXBUILD.md](KNOXBUILD.md): how buildings, rooms, lifts, fences, streets and
   the population model work, and the measurements behind them.
-- [worlded/README.md](worlded/README.md): the map compiler patch and how to build
+- [worlded/README.md](KnoxMap/worlded/README.md): the map compiler patch and how to build
   it yourself.
-- `tools/render_ground.py` draws a map's ground from the real tiles the way the
-  compiler lays them; `tools/audit_layouts.py` stress-tests floor plans for
-  sealed rooms, blocked stairs, bad roofs and lifts; `tools/validate_tbx.py`
+- `KnoxMap/tools/render_ground.py` draws a map's ground from the real tiles the way the
+  compiler lays them; `KnoxMap/tools/audit_layouts.py` stress-tests floor plans for
+  sealed rooms, blocked stairs, bad roofs and lifts; `KnoxMap/tools/validate_tbx.py`
   checks buildings against the editor's own rules.
 
 ## Disclaimers
@@ -359,7 +364,7 @@ under their usage policies: the [tile server](https://operations.osmfoundation.o
 for the background map, [Nominatim](https://operations.osmfoundation.org/policies/nominatim/)
 for place search, and the [Overpass API](https://dev.overpass-api.de/overpass-doc/en/preface/commons.html)
 for map data. KnoxMap identifies itself, caches tiles, searches and downloads,
-searches only when you press Enter, and paces its requests. Please do not modify
+searches after a short pause as you type, and paces its requests. Please do not modify
 it to get around those limits; for heavy use, run your own servers.
 
 **Privacy.** KnoxMap has no accounts, telemetry or analytics. The servers it
@@ -391,7 +396,7 @@ for any damage or loss from using KnoxMap or its maps.
 - Thuztor's *Mapping Guide v0.2* for the terrain colour conventions.
 
 The code here is under different terms depending on where it came from: work
-added in this fork is MIT, the compiler patch in `worlded/` and its prebuilt
+added in this fork is MIT, the compiler patch in `KnoxMap/worlded/` and its prebuilt
 binary are GPL, and files from the original Knoxify have no published licence.
 See **[LICENSES.md](LICENSES.md)** for the details, and
 **[docs/LEGAL.md](docs/LEGAL.md)** for every licence and policy KnoxMap follows

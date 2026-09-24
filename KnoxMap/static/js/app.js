@@ -422,15 +422,14 @@ async function checkSetup() {
     const res = await fetch('/api/setup-status');
     const data = await res.json();
     const card = document.getElementById('setupCard');
-    // Named after the script this PC actually has: Setup.bat on Windows,
-    // ./setup.sh on Linux and macOS.
-    const script = document.getElementById('setupScript');
-    if (script && data.setupCommand) script.textContent = data.setupCommand;
+    const lead = document.getElementById('setupLead');
     if (data.ready) { card.hidden = true; return; }
+    if (lead) lead.hidden = !data.busy;
     document.getElementById('setupList').innerHTML = data.checks.map(c =>
       `<li class="${c.ok ? 'ok' : 'missing'}"><span>${c.ok ? '✓' : '✗'}</span>
         <b>${escapeHtml(c.label)}</b>${c.ok ? '' : ` — ${escapeHtml(c.fix)}`}</li>`).join('');
     card.hidden = false;
+    if (data.busy) setTimeout(checkSetup, 2000);
   } catch (_) { /* the page still works without the check */ }
 }
 checkSetup();
@@ -808,6 +807,18 @@ document.addEventListener('click', ev => {
   if (ev.target.closest('[data-stop]')) requestStop();
 });
 
+// Electron asks this before the window closes. A generate, a build or a
+// compile keeps WorldEd and the request alive; closing without asking used
+// to leave them running. The line is in lang/english.txt, like the rest.
+window.knoxmapBeforeClose = async () => {
+  if (!runningMap) return true;
+  const line = 'A map is still being made. Stop it and close KnoxMap?';
+  const shown = (typeof i18n !== 'undefined' && i18n.say && i18n.say(line)) || line;
+  if (!window.confirm(shown)) return false;
+  await requestStop();
+  return true;
+};
+
 // A reply the server sends when a step was stopped on purpose. Not an error:
 // no red, no problem report, and the area stays drawn.
 function wasStopped(data, res) {
@@ -851,35 +862,6 @@ function startProgress(mapName) {
 function stopProgress() {
   clearInterval(progressTimer);
   progressTimer = null;
-}
-
-// In the app window a download link does nothing: it is a WebView, with
-// nowhere to put a file. Everything is on disk already, so there the links
-// ask the server to save the file and show it in Explorer instead.
-const IN_WINDOW = document.body.dataset.inWindow === '1';
-
-async function saveFile(name, label) {
-  const note = document.getElementById('saveNote');
-  if (note) { note.className = 'hint'; note.textContent = `Saving ${label}…`; }
-  try {
-    const res = await fetch('/api/save', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mapName: currentMap, name }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw apiError(data, res);
-    if (note) note.textContent = `Saved ${data.name} in ${data.folder} (shown in Explorer).`;
-  } catch (err) {
-    if (note) { note.className = 'hint bad'; note.textContent = err.message; }
-    fx.toast('bad', 'Could not save that file', err.message, 8000);
-  }
-}
-
-function wireDownload(link, name, label) {
-  if (!IN_WINDOW) return;
-  link.removeAttribute('download');
-  link.href = '#';
-  link.addEventListener('click', e => { e.preventDefault(); saveFile(name, label); });
 }
 
 function renderResults(data) {

@@ -8,25 +8,26 @@ Tools. On 64-bit Linux, Setup fetches a build of the map compiler made for
 this system, so that needs no help either; anywhere else it is a Windows
 program and runs through Wine.
 
-Download `KnoxMap-v…-linux.tar.gz` (or `…-macos.tar.gz`) from
-[Releases](https://github.com/spytheeuclidean-a11y/knoxmap/releases/latest),
-unpack it, and:
+Download `KnoxMap-v…-linux.AppImage` (or `…-macos.dmg`) from
+[Releases](https://github.com/spytheeuclidean-a11y/knoxmap/releases/latest).
+That file is the whole program. Python is already inside.
 
-    tar -xzf KnoxMap-v1.3.7-linux.tar.gz
-    cd KnoxMap
-    ./setup.sh        once
-    ./knoxmap.sh      every time
+    chmod +x KnoxMap-v1.5-linux.AppImage
+    ./KnoxMap-v1.5-linux.AppImage
 
-The tarball keeps the executable bit; a zip does not, which is why the
-downloads are per system.
+On macOS, open the dmg and drag KnoxMap to Applications. The first launch
+still downloads the map tools and reads tiles from your own copy of the game.
+Maps and logs appear beside the AppImage. A copy that lives in Applications
+keeps them in a `KnoxMap` folder in your home directory.
 
-If the scripts are not executable after a `git clone` or an unzip:
+A git checkout is the other way in: `./setup.sh` once, `./knoxmap.sh` after
+that, and it needs 64-bit Python 3.10+. If the scripts are not executable:
 
     chmod +x setup.sh knoxmap.sh
 
 ## What setup does
 
-The same as `Setup.bat`: a private Python environment in `.venv`, the PZ
+The same as `Setup.bat`: a private Python environment in `KnoxMap/.venv`, the PZ
 Mapping Tools into `vendor/`, the patched map compiler, and the tile artwork
 extracted from **your own copy of the game** — never downloaded.
 
@@ -39,18 +40,25 @@ It needs 64-bit Python 3.10 or newer. A 32-bit one can only address about
 
 ## The window
 
-On Windows KnoxMap opens in a native window (Edge WebView2) and on macOS in
-a WKWebView one. On Linux pywebview needs a system toolkit behind it that pip
-cannot install, so if there is none KnoxMap **opens in your browser instead**
-and prints the address it is serving on. That is the whole app; nothing is
-missing from it.
+The window is Electron, the same one on Windows, Linux and macOS, and it is
+inside the AppImage or the app. It does not need the GTK or Qt libraries
+Python used to need for a window of its own. A checkout uses the Electron
+binary from `desktop/` after `npm install`.
 
-For a real window, install one of the toolkits first and KnoxMap will use it:
+It does need the ordinary desktop libraries, which a normal desktop already
+has. If the window will not open and `logs/knoxmap.log` names one of them,
+install the set your distribution ships:
 
-    sudo apt install python3-gi gir1.2-webkit2-4.1 python3-gi-cairo   # GTK
-    .venv/bin/python -m pip install "pywebview[qt]"                   # or Qt
+    sudo apt install libnss3 libgtk-3-0 libasound2       # Debian, Ubuntu
+    sudo pacman -S nss gtk3 alsa-lib                      # Arch
+    sudo dnf install nss gtk3 alsa-lib                    # Fedora
 
-`KNOXMAP_BROWSER=1 ./knoxmap.sh` forces the browser on any system.
+If the sandbox cannot start — `chrome-sandbox` is not setuid, which it cannot
+be without root, or AppArmor on Ubuntu 24.04 and newer will not allow a user
+namespace — KnoxMap opens the window once more without the sandbox and says
+so in the log. The page is only this computer's; nothing is loaded from
+anywhere else. `KNOXMAP_BROWSER=1 ./knoxmap.sh` forces the browser on any
+system, and a missing window does that on its own.
 
 ## Compile
 
@@ -94,8 +102,8 @@ With neither, every step except Compile works, and the window says so under
 WorldEd** and run *BMP To TMX → All Cells* and *Generate Lots → All Cells*
 yourself, then **Install**.
 
-If you build the tools natively (see `worlded/README.md`), drop the
-binaries in `vendor/PZMappingTools/bin/` **without** the `.exe` — KnoxMap
+If you build the tools natively (see `KnoxMap/worlded/README.md`), drop the
+binaries in `KnoxMap/vendor/PZMappingTools/bin/` **without** the `.exe` — KnoxMap
 finds `PZWorldEd_cli` as readily as `PZWorldEd_cli.exe`, runs it directly,
 and setup leaves it alone.
 

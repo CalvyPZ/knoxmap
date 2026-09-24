@@ -1,6 +1,6 @@
 # knoxbuild — furnished buildings for Knoxify maps
 
-> **Just want the map?** Double-click `KnoxMap.bat`. It wraps everything below
+> **Just want the map?** Open the KnoxMap program file. It wraps everything below
 > in one window: search a place, build terrain and buildings, compile them with
 > the patched WorldEd, and install the result into `~/Zomboid/mods`. The rest of this file is what it does underneath, and how to
 > drive each piece by hand.
@@ -10,6 +10,9 @@ paints each building as a dirt placeholder and leaves you to drop `.tbx` lots on
 top by hand. `knoxbuild` fills that gap — it generates a real, furnished PZ
 building for every footprint and writes a WorldEd project with all of them
 already placed.
+
+The commands below are run from the `KnoxMap` directory. `Setup.bat` and
+`./setup.sh` create `.venv` there.
 
 ```bash
 # 1. make a map with Knoxify (web UI, or the API directly)
@@ -227,7 +230,7 @@ the same `BuildingTemplates.txt`, `BuildingFurniture.txt` and `RoomNames.txt`
 that BuildingEd itself loads:
 
 ```bash
-python tools/make_catalog.py ../PZMappingTools/config knoxbuild/catalog.py
+python tools/make_catalog.py ../../PZMappingTools/config knoxbuild/catalog.py
 ```
 
 Entries are selected by tile **name**, and a missing anchor is a hard error. An
@@ -241,8 +244,8 @@ Picking an anchor by name proves nothing about what it *looks* like, so
 into a labelled contact sheet:
 
 ```bash
-python tools/preview_catalog.py ../PZMappingTools/Tiles/2x \
-    ../PZMappingTools/config/Tilesets.txt catalog.png
+python tools/preview_catalog.py ../../PZMappingTools/Tiles/2x \
+    ../../PZMappingTools/config/Tilesets.txt catalog.png
 ```
 
 That check earned its keep immediately - four anchors were wrong: an armchair
@@ -380,9 +383,8 @@ the second pass writes sheets out and frees them as they complete.
 
 ## The app (knoxmap.py)
 
-`KnoxMap.bat` launches `knoxmap.py`, which is deliberately thin: it starts the
-Flask app on a loopback port and shows it in a native window through pywebview
-(Edge WebView2). The window therefore gets the real Leaflet map — rectangle
+`knoxmap.py` is deliberately thin: it starts the Flask app on a loopback port
+and shows it in the Electron window. The window therefore gets the real Leaflet map — rectangle
 tool, place search, landmark lookup — instead of a second UI that would drift
 from the web one. There is one front end, used two ways.
 

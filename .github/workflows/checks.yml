@@ -22,24 +22,23 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # Everything but pywebview: the desktop window is not needed to
-      # generate maps, and it pulls in GUI toolkits a server does not have.
       - name: Install dependencies
-        run: |
-          grep -v -i pywebview requirements.txt > requirements-ci.txt
-          pip install -r requirements-ci.txt
+        run: pip install -r KnoxMap/requirements.txt
 
       - name: Python parses
-        run: python -m compileall -q app.py knoxmap.py knoxmap_setup.py knoxpaths.py generator knoxbuild tools worlded
+        run: python -m compileall -q KnoxMap/app.py KnoxMap/knoxmap.py KnoxMap/knoxmap_cli.py KnoxMap/knoxmap_setup.py KnoxMap/knoxpaths.py KnoxMap/knoxlog.py KnoxMap/knoxstop.py KnoxMap/updater.py KnoxMap/generator KnoxMap/knoxbuild KnoxMap/tools KnoxMap/worlded tools
 
       - name: JavaScript parses
         run: |
-          for f in static/js/*.js; do
+          for f in KnoxMap/static/js/*.js; do
             node -e "new Function(require('fs').readFileSync('$f', 'utf8'))" && echo "ok $f"
+          done
+          for f in desktop/main.js desktop/build.mjs desktop/make-icons.mjs; do
+            node --check "$f" && echo "ok $f"
           done
 
       - name: Whole pipeline on a made-up town (offline)
-        run: python tools/selftest.py
+        run: python KnoxMap/tools/selftest.py
 
       - name: Floor plans (sealed rooms, stairs, roofs, lifts)
-        run: python tools/audit_layouts.py 200
+        run: python KnoxMap/tools/audit_layouts.py 200

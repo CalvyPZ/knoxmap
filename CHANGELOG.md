@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.5
+
+- **KnoxMap is one file.** Windows gets `KnoxMap.exe`, Linux an AppImage,
+  macOS a dmg. Python and the libraries are already inside. Put the file
+  anywhere and open it. Maps, logs and the first-run downloads sit in the
+  folder beside it (on a Mac that lives in Applications, they sit in a
+  `KnoxMap` folder in your home directory). The map tools and the game's
+  tiles are still fetched the first time, from the tools' own release and
+  from your own copy of Project Zomboid — they are not inside the file. That
+  first-run setup happens inside the program. There is no setup script to run.
+
+  The window is the same Electron window on every system. The page is
+  unchanged — the map, the search, the pipeline — and Python still serves it
+  and still does the work. A source checkout opens that window from `desktop/`
+  after `npm install`, or the browser when `KNOXMAP_BROWSER=1`.
+  On Windows, start that checkout from the `KnoxMap` folder with
+  `.venv\Scripts\pythonw.exe knoxmap.py`. On Linux and macOS, `./knoxmap.sh`.
+
+  The small Windows launcher and the separately downloaded window are gone.
+  Players are not handed a folder of scripts. Downloads ask where to save.
+  Closing KnoxMap while a map is being made asks first, and a compile in
+  progress is stopped so the map compiler is not left running.
+
+  On Linux the window no longer needs GTK or Qt installed for Python. It does
+  need the ordinary desktop libraries, which a desktop already has. If the
+  sandbox cannot start — the helper is not setuid, or AppArmor will not allow
+  a user namespace — KnoxMap opens it once more without the sandbox. The page
+  is only this computer's.
+
 ## 1.4
 
 - **KnoxMap.exe is built the way Windows software is built.** The launcher is
@@ -12,9 +41,8 @@
   tiny binary with every symbol taken out of it reads as something with
   something to hide, and 30 KB was not worth that.
 
-  `win/build_launcher.sh` still builds the identical launcher with mingw-w64
-  on Linux, and CI still checks that it does, so what ships can be reproduced
-  without Visual Studio.
+  The same source also built with mingw-w64 on Linux, and CI checked that
+  it did, so what shipped could be reproduced without Visual Studio.
 
   None of this is a substitute for a code signing certificate, which is the
   only real answer to "Windows protected your PC" - but it is free, and it
@@ -258,7 +286,7 @@
 
 *A macOS-only release. Windows and Linux are unchanged and stay on 1.3.9.*
 
-- **A tutorial in the download.** `tutorial.txt` walks through it start to
+- **A tutorial in the download.** It walks through setup start to
   finish: what to have installed, running Setup, finding the game when it
   asks, choosing an area that will not blow the limit, the four buttons and
   what each one does, and what to do when a step will not run.
@@ -355,10 +383,8 @@
   instead of a batch file: it works in its own folder, runs setup the first
   time in a console you can watch, starts the window and gets out of the way.
   It carries KnoxMap's icon and version, and it exits as soon as the window
-  is up so that an update is free to replace it. `KnoxMap.bat` is still
-  there and still works, for anyone who would rather read what they are
-  running. Windows will warn about an unsigned program the first time:
-  **More info** then **Run anyway**.
+  is up so that an update is free to replace it. Windows will warn about an
+  unsigned program the first time: **More info** then **Run anyway**.
 
   It is built with mingw-w64 and then *run* on a Windows runner before any
   release goes out - a folder with no environment must run Setup, and one

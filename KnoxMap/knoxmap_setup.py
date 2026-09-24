@@ -1,5 +1,8 @@
 """KnoxMap setup: everything a fresh PC needs, in one go.
 
+The program file does this itself the first time it opens. A git checkout
+can still run it by hand:
+
     Setup.bat           (or: python knoxmap_setup.py)
 
 Safe to run again at any time; every step checks first and skips what is
@@ -26,7 +29,9 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 
@@ -34,6 +39,14 @@ BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
 import knoxpaths  # noqa: E402
+
+_busy = False
+_busy_lock = threading.Lock()
+
+
+def busy() -> bool:
+    """True while the program file is doing setup in the background."""
+    return _busy
 
 # The exact PZ Mapping Tools release the patched compiler was built from. The
 # compiler links against this release's Qt and editor libraries, so the two
@@ -218,7 +231,7 @@ def ensure_patched_cli(tools: Path) -> bool:
     except Exception as exc:     # noqa: BLE001 - any failure means "build it yourself"
         say(f"      could not download it: {exc}")
         say("      You can still use KnoxMap: compile with 'Open in WorldEd' instead,")
-        say("      or build the compiler yourself - see worlded/README.md.")
+        say("      or build the compiler yourself - see KnoxMap/worlded/README.md.")
         return False
     if hashlib.sha256(data).hexdigest() != CLI_SHA256:
         say("      the download does not match the expected fingerprint - not installed.")
@@ -238,7 +251,7 @@ def _warn_if_not_build42(game: Path) -> None:
     say("      !! This looks like Build 41. KnoxMap makes Build 42 maps, which")
     say("         Build 41 cannot load. In Steam: right-click Project Zomboid >")
     say("         Properties > Betas, choose the Build 42 (unstable) branch, let")
-    say("         it update, then run Setup.bat again.")
+    say("         it update, then open KnoxMap again.")
     say("")
 
 
@@ -342,7 +355,7 @@ def configure_tools(tools: Path, game: Path | None) -> None:
     say("      editor paths written")
 
     if game is None:
-        say("      skipped tile extraction - no game folder. Run Setup again once it is installed.")
+        say("      skipped tile extraction - no game folder. Open KnoxMap again once it is installed.")
         return
     from tools import extract_tiles, prune_tilesets
 
@@ -392,10 +405,38 @@ def configure_tools(tools: Path, game: Path | None) -> None:
 
     for script, what in (("patch_rules_b42_trees.py", "Build 42 trees and flowers"),
                          ("patch_rules_roads.py", "Kerbs and road markings")):
-        rules = subprocess.run([sys.executable, str(BASE_DIR / "worlded" / script), str(tools)],
-                               capture_output=True, text=True, check=False)
+        code, detail = _run_worlded_script(script, tools)
         say(f"      {what} " +
-            ("set up" if rules.returncode == 0 else f"not set up: {rules.stderr.strip()[-200:]}"))
+            ("set up" if code == 0 else f"not set up: {detail.strip()[-200:]}"))
+
+
+def _run_worlded_script(script: str, tools: Path) -> tuple[int, str]:
+    """Run one worlded rule script. The packed program has no Python to exec."""
+    path = str(BASE_DIR / "worlded" / script)
+    if getattr(sys, "frozen", False):
+        import contextlib
+        import io
+        import runpy
+
+        buf = io.StringIO()
+        old = sys.argv
+        try:
+            sys.argv = [path, str(tools)]
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                try:
+                    runpy.run_path(path, run_name="__main__")
+                    code = 0
+                except SystemExit as exc:
+                    code = exc.code if isinstance(exc.code, int) else (0 if not exc.code else 1)
+                except Exception as exc:  # noqa: BLE001 - reported the same way a failed process is
+                    code = 1
+                    buf.write(str(exc))
+        finally:
+            sys.argv = old
+        return code, buf.getvalue()
+    rules = subprocess.run([sys.executable, path, str(tools)],
+                           capture_output=True, text=True, check=False)
+    return rules.returncode, rules.stderr or rules.stdout or ""
 
 
 def add_erikas_tiles(tools: Path, tilesets: Path, two_x: Path) -> None:
@@ -436,7 +477,35 @@ def finish(tools: Path, game: Path | None, cli_ok: bool) -> None:
     say(f"      maps will be installed into {zomboid / 'mods'}")
     say()
     say("Setup complete." if game and cli_ok else "Setup finished with notes above.")
-    say("Start KnoxMap by double-clicking KnoxMap.bat.")
+    if os.environ.get("KNOXMAP_SERVE") == "1" or getattr(sys, "frozen", False):
+        say("The KnoxMap window is ready to use.")
+    elif os.name == "nt":
+        say("Start KnoxMap with .venv\\Scripts\\pythonw.exe knoxmap.py")
+    else:
+        say("Start KnoxMap with ./knoxmap.sh.")
+
+
+def start_in_background() -> None:
+    """The program file does setup itself. Nobody has to run a script first."""
+    threading.Thread(target=_run_for_program, name="knoxmap-setup", daemon=True).start()
+
+
+def _run_for_program() -> None:
+    global _busy
+    with _busy_lock:
+        if _busy:
+            return
+        _busy = True
+    os.environ["KNOXMAP_UNATTENDED"] = "1"
+    os.environ["KNOXMAP_NO_PAUSE"] = "1"
+    try:
+        _log_to_file()
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    finally:
+        _busy = False
 
 
 def main() -> int:
@@ -454,8 +523,7 @@ def main() -> int:
         say("")
         say("      !! This is a 32-bit Python. It can only use about 2 GB of memory,")
         say("         so maps of more than a few square kilometres will fail with")
-        say("         'MemoryError'. Close this, run Setup.bat again, and KnoxMap")
-        say("         will fetch a 64-bit Python for itself.")
+        say("         'MemoryError'. KnoxMap needs 64-bit Python.")
         say("")
     tools = ensure_mapping_tools()
     cli_ok = ensure_patched_cli(tools)
@@ -490,7 +558,7 @@ class _Tee:
 def _log_to_file() -> None:
     import time
 
-    logs = Path(__file__).resolve().parent / "logs"
+    logs = knoxpaths.BASE_DIR / "logs"
     try:
         logs.mkdir(exist_ok=True)
         setup_log = open(logs / "setup.log", "a", encoding="utf-8", errors="replace")
@@ -516,6 +584,5 @@ if __name__ == "__main__":
         raise
     except BaseException:  # noqa: BLE001
         traceback.print_exc()
-        print("\nSetup failed. The details are in logs/setup.log - post that file in "
-              "#bug-reports on the KnoxMap Discord if running Setup.bat again does not help.")
+        print("\nSetup failed. The details are in logs/setup.log.")
         raise SystemExit(1)

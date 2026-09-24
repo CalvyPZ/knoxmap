@@ -38,10 +38,13 @@ _ATTR = re.compile(r'(\w+)="([^"]*)"')
 
 
 def _check_building(path: Path) -> list[str]:
-    tools = Path(__file__).resolve().parent.parent / "tools"
-    if str(tools) not in sys.path:
-        sys.path.insert(0, str(tools))
-    import validate_tbx
+    try:
+        from tools import validate_tbx
+    except ImportError:
+        tools = Path(__file__).resolve().parent.parent / "tools"
+        if str(tools) not in sys.path:
+            sys.path.insert(0, str(tools))
+        import validate_tbx
     return validate_tbx.check(str(path))
 
 

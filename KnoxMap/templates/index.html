@@ -11,11 +11,9 @@
 <link rel="stylesheet" href="/static/vendor/leaflet-draw/leaflet.draw.css"/>
 <link rel="stylesheet" href="/static/css/app.css"/>
 </head>
-<body data-in-window="{{ 1 if in_window else 0 }}">
+<body data-in-window="{{ 1 if in_window else 0 }}" data-shell="{{ shell }}">
 
 <header class="topbar">
-  <img src="/static/logo.svg" alt="" class="logo"/>
-  <h1>KnoxMap</h1>
   <span class="version-wrap">
     <button type="button" class="version" id="appVersion" aria-haspopup="true" aria-expanded="false"
             title="The KnoxMap version you are running. Click to choose another"

@@ -9,10 +9,10 @@ KnoxMap is a fork of [arytek/knoxify](https://github.com/arytek/knoxify).
 That project has not published a licence, so its author keeps all rights to
 it. These files come from it (most have since been modified here):
 
-`README.md` · `app.py` · `generator/__init__.py` · `generator/osm.py` ·
-`generator/pz_colors.py` · `generator/renderer.py` · `requirements.txt` ·
-`static/css/app.css` · `static/js/app.js` ·
-`templates/index.html` · `test_pipeline.py` · `.gitignore`
+`README.md` · `KnoxMap/app.py` · `KnoxMap/generator/__init__.py` · `KnoxMap/generator/osm.py` ·
+`KnoxMap/generator/pz_colors.py` · `KnoxMap/generator/renderer.py` · `KnoxMap/requirements.txt` ·
+`KnoxMap/static/css/app.css` · `KnoxMap/static/js/app.js` ·
+`KnoxMap/templates/index.html` · `.gitignore`
 
 The KnoxMap logo and cover (`branding/*`, `static/logo.svg`) are new to this
 fork and replace Knoxify's own artwork; they are under the MIT licence below.
@@ -25,21 +25,26 @@ these files beyond that, ask arytek.
 See [LICENSE-MIT.txt](LICENSE-MIT.txt). Everything not listed in the other
 two sections, including:
 
-`knoxbuild/` · `tools/` · `knoxmap.py` · `knoxmap_setup.py` · `knoxpaths.py` ·
-`KnoxMap.bat` · `Setup.bat` · `generator/places.py` · `static/js/fx.js` ·
-`KNOXBUILD.md` · `LICENSES.md` · `CHANGELOG.md` ·
+`KnoxMap/knoxbuild/` · `KnoxMap/tools/` · `KnoxMap/knoxmap.py` · `KnoxMap/knoxmap_setup.py` · `KnoxMap/knoxpaths.py` ·
+`Setup.bat` · `KnoxMap/generator/places.py` · `KnoxMap/static/js/fx.js` ·
+`desktop/` · `KNOXBUILD.md` · `LICENSES.md` · `CHANGELOG.md` ·
 `CONTRIBUTING.md` · `.github/` · `docs/`
+
+The program file is [Electron](https://www.electronjs.org/), which is MIT,
+built on Chromium, with CPython and the Python libraries packed inside.
+Electron's own licence and Chromium's `LICENSES.chromium.html` ship in that
+file. They are not copied into this repository.
 
 ## The map compiler patch — GPL-2.0-or-later
 
-Everything in [`worlded/`](worlded/), and the prebuilt `PZWorldEd_cli.exe` in
+Everything in [`KnoxMap/worlded/`](KnoxMap/worlded/), and the prebuilt `PZWorldEd_cli.exe` in
 this repository's releases, modifies
 [PZ Mapping Tools](https://github.com/Unjammer/PZ_Mapping_Tools) (Alree /
 Unjammer, built on Tim Baker's TileZed and WorldEd) and is distributed under
 the GNU General Public License version 2 or later. Each compiler release
 carries the binary's complete corresponding source (`PZWorldEd_cli-source.zip`,
-made by `worlded/make_release.py`), the licence text and a written source
-offer. See [worlded/README.md](worlded/README.md) and
+made by `KnoxMap/worlded/make_release.py`), the licence text and a written source
+offer. See [worlded/README.md](KnoxMap/worlded/README.md) and
 [docs/LEGAL.md](docs/LEGAL.md#the-map-compiler-gnu-gpl-version-2).
 
 ## Things this repository does not contain
@@ -54,7 +59,7 @@ offer. See [worlded/README.md](worlded/README.md) and
   Workshop.
 
 Some pictures in `docs/images/` (`roads_ingame_tiles.jpg`) are drawn from
-Project Zomboid's tile artwork by `tools/render_ground.py`. That artwork is
+Project Zomboid's tile artwork by `KnoxMap/tools/render_ground.py`. That artwork is
 © The Indie Stone and is shown only to illustrate what KnoxMap produces; it is
 not covered by this repository's licences. Pictures made from map data
 (`nyc_midtown.png`, `shape_circle.png`, `app.jpg`) contain OpenStreetMap data

@@ -41,14 +41,28 @@ import time
 import zipfile
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+def _packaged() -> bool:
+    """The single program file, whether packed by PyInstaller or as a Python tree."""
+    return getattr(sys, "frozen", False) or os.environ.get("KNOXMAP_SERVE") == "1"
+
+
+def _data_dir() -> Path:
+    """The folder the player can write. A packaged program sets KNOXMAP_HOME."""
+    home = os.environ.get("KNOXMAP_HOME")
+    if home:
+        return Path(home)
+    return Path(__file__).resolve().parent
+
+
+BASE_DIR = _data_dir()
 REPO = "spytheeuclidean-a11y/knoxmap"
 API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 API_RELEASES = f"https://api.github.com/repos/{REPO}/releases?per_page=50"
-# A release carries one file per system: a zip for Windows, where the zip
-# format is native and nobody has tar, and tarballs for Linux and macOS,
-# which keep the executable bit on setup.sh and knoxmap.sh. Releases up to
-# 1.3.6 had one KnoxMap-v1.3.6.zip for everyone, and that still installs.
+# A release carries one file per system. Current releases are a single
+# program: KnoxMap-v1.5-windows.exe, KnoxMap-v1.5-linux.AppImage,
+# KnoxMap-v1.5-macos.dmg. Older releases are a zip (Windows) or a tarball
+# (Linux and macOS). Releases up to 1.3.6 had one KnoxMap-v1.3.6.zip for
+# everyone, and that still installs on a source checkout.
 def _platform_tag() -> str:
     if os.name == "nt":
         return "windows"
@@ -59,8 +73,10 @@ def _platform_tag() -> str:
 # KnoxMap-v1.3.9-rnd-windows.zip. The name must not swallow the system,
 # or a Linux PC is handed the Windows zip, so it cannot be one of them.
 ASSET_NAME = re.compile(
-    r"KnoxMap-v[\w.]+(?:-(?!windows|linux|macos)[a-z]+\d*)?"
-    r"(-(?P<system>windows|linux|macos))?\.(?P<kind>zip|tar\.gz)")
+    r"KnoxMap(?:-v[\w.]+(?:-(?!windows|linux|macos)[a-z]+\d*)?)?"
+    r"(?:-(?P<system>windows|linux|macos))?"
+    r"\.(?P<kind>zip|tar\.gz|exe|AppImage|dmg)")
+_PROGRAM = {"windows": "exe", "linux": "AppImage", "macos": "dmg"}
 UPDATE_DIR = BASE_DIR / "update"
 STAGED = UPDATE_DIR / "staged.json"
 MANIFEST = BASE_DIR / ".knoxmap_files.json"
@@ -110,8 +126,15 @@ def is_newer(latest: str, current: str) -> bool:
 
 def managed() -> bool:
     """Whether this copy may replace its own files: not a git checkout, and
-    not told to leave itself alone."""
-    return os.environ.get("KNOXMAP_NO_UPDATE") != "1" and not (BASE_DIR / ".git").exists()
+    not told to leave itself alone.
+
+    A checkout keeps .git in the folder above KnoxMap/, next to desktop/.
+    """
+    if os.environ.get("KNOXMAP_NO_UPDATE") == "1":
+        return False
+    if (BASE_DIR / ".git").exists():
+        return False
+    return not ((BASE_DIR / "knoxmap.py").is_file() and (BASE_DIR.parent / ".git").exists())
 
 
 def enabled() -> bool:
@@ -276,16 +299,20 @@ def _asset(release: dict) -> dict | None:
     built separately, and is for everybody.
     """
     want = _platform_tag()
-    mine, shared = None, None
+    want_kind = _PROGRAM[want]
+    mine, program, shared = None, None, None
     for a in release.get("assets", []):
         m = ASSET_NAME.fullmatch(a.get("name", ""))
         if not m:
             continue
-        if m.group("system") == want:
+        system, kind = m.group("system"), m.group("kind")
+        if system == want:
             mine = a
-        elif m.group("system") is None:
+        elif system is None and kind == want_kind:
+            program = a
+        elif system is None and kind in ("zip", "tar.gz"):
             shared = a
-    return mine or shared
+    return mine or program or shared
 
 
 def _stage(release: dict, chosen: bool) -> None:
@@ -297,7 +324,7 @@ def _stage(release: dict, chosen: bool) -> None:
     notes = release.get("body") or ""
     asset = _asset(release)
     if asset is None:
-        raise RuntimeError(f"release {version} has no KnoxMap zip")
+        raise RuntimeError(f"release {version} has no KnoxMap download")
     _set(state="downloading", latest=version, notes=notes)
     _log().info("update: downloading KnoxMap %s (this is %s)%s", version, current_version(),
                 ", chosen in the window" if chosen else "")
@@ -316,16 +343,22 @@ def _stage(release: dict, chosen: bool) -> None:
     if digest.startswith("sha256:") and digest.split(":", 1)[1] != h.hexdigest():
         partial.unlink(missing_ok=True)
         raise RuntimeError("the download does not match GitHub's fingerprint")
-    with _open_release(partial) as bundle:
-        if "KnoxMap/knoxmap.py" not in bundle.names():
-            raise RuntimeError("the download is not a KnoxMap release")
+    matched = ASSET_NAME.fullmatch(asset["name"])
+    kind = matched.group("kind") if matched else ""
+    program = kind in ("exe", "AppImage", "dmg")
+    if not program:
+        with _open_release(partial) as bundle:
+            if "KnoxMap/knoxmap.py" not in bundle.names():
+                partial.unlink(missing_ok=True)
+                raise RuntimeError("the download is not a KnoxMap release")
     partial.replace(target)
     STAGED.write_text(json.dumps({"version": version, "zip": str(target), "notes": notes,
-                                  "sha256": h.hexdigest(), "chosen": chosen}),
+                                  "sha256": h.hexdigest(), "chosen": chosen, "exe": program}),
                       encoding="utf-8")
-    for old in UPDATE_DIR.glob("KnoxMap-v*"):
-        if old != target:
-            old.unlink(missing_ok=True)
+    for old in list(UPDATE_DIR.iterdir()):
+        if old == target or not old.name.startswith("KnoxMap"):
+            continue
+        old.unlink(missing_ok=True)
     _log().info("update: KnoxMap %s is ready and applies on the next start", version)
     _set(state="ready", latest=version, notes=notes)
 
@@ -434,6 +467,10 @@ def apply_staged() -> bool:
     staged = _read_staged()
     if not staged or not managed():
         return False
+    # A single program file is swapped by the window after this process exits.
+    # Unpacking it over the data folder would replace maps with an executable.
+    if _packaged() or staged.get("exe"):
+        return False
     chosen = bool(staged.get("chosen"))
     if not chosen and not enabled():
         return False
@@ -518,6 +555,32 @@ def _run(cmd: list[str], what: str, env: dict | None = None) -> None:
         log.warning("%s failed: %s", what, exc)
 
 
+# The window has to be closed before a new one starts. Electron keeps its
+# files open, and a second copy is told the first one is still running and
+# exits. knoxmap.py registers the closer; restart() calls it on the thread
+# that asked, then starts the new process. The main thread is blocked in
+# the window the whole time, and unblocks the moment that window exits, so
+# it waits on _restart_done rather than ending the process out from under
+# the relaunch.
+_before_restart = None
+_restarting = False
+_restart_done = threading.Event()
+
+
+def set_before_restart(fn) -> None:
+    global _before_restart
+    _before_restart = fn
+
+
+def restarting() -> bool:
+    return _restarting
+
+
+def wait_restart(timeout: float = 30.0) -> bool:
+    """Block until restart() has launched the new process."""
+    return _restart_done.wait(timeout)
+
+
 def relaunch() -> None:
     """Start a fresh KnoxMap window, on whatever code is on disk now.
 
@@ -538,8 +601,29 @@ def relaunch() -> None:
 
 
 def restart() -> None:
-    """End this window and open a new one, which applies the staged update."""
+    """End this window and open a new one, which applies the staged update.
+
+    The current window is closed first, when one was registered. The new
+    process is started before this one ends, and the main thread is told
+    (wait_restart) so it does not exit in between the two.
+    """
+    global _restarting
+    _restarting = True
     _log().info("update: restarting")
+    if _packaged():
+        # The window owns the program file. It replaces that file after we
+        # exit, then starts it again. An empty path is a plain restart.
+        staged = _read_staged() or {}
+        src = staged.get("zip") or "" if staged.get("exe") else ""
+        print(f"KNOXMAP_RESTART {src}", flush=True)
+        _restart_done.set()
+        return
+    if _before_restart is not None:
+        try:
+            _before_restart()
+        except Exception as exc:  # noqa: BLE001 - still start the new window
+            _log().warning("update: could not close the window first: %s", exc)
     relaunch()
+    _restart_done.set()
     threading.Timer(0.5, lambda: os._exit(0)).start()
 

@@ -444,9 +444,6 @@ def check_portable(check) -> None:
     check(all("\\" not in name for name in knoxpaths._LIBRARY_NAMES) if not windows
           else True,
           "and library folder names use this system's separator")
-    check(knoxpaths.setup_command() == ("Setup.bat" if windows else "./setup.sh"),
-          f"the window names the right setup script ({knoxpaths.setup_command()})")
-
     # macOS keeps the game inside an application bundle, so <game>/media is
     # not there and a Mac install was found and then turned away for having no
     # artwork in it. Every way somebody might name that install has to work.
@@ -1248,8 +1245,7 @@ def check_memory_guard(check) -> None:
             small = knoxapp._too_big_for_memory(1200, 1200)
         finally:
             knoxapp.sys = was
-        import knoxpaths as _kp
-        check(big and "32-bit" in big and _kp.setup_command() in big and not small,
+        check(big and "32-bit" in big and not small,
               "a map too big for a 32-bit Python is warned about, with a way out")
         knoxlog.memory_status = lambda: (15_000_000_000, 900_000_000, 140_000_000_000)
         tight = knoxapp._too_big_for_memory(5400, 6000)
@@ -1779,9 +1775,6 @@ def main(argv: list[str]) -> int:
         check(f"v{_kl.version()}" in page.get_data(as_text=True) and _kl.version() != "unknown",
               f"the window shows the version ({_kl.version()})")
 
-        # In the app window a download link does nothing - there is no browser
-        # to put a file anywhere - so the page is told, and saves through the
-        # server instead. See /api/save.
         was_window = os.environ.get("KNOXMAP_WINDOW")
         os.environ["KNOXMAP_WINDOW"] = "1"
         try:
@@ -1822,27 +1815,6 @@ def main(argv: list[str]) -> int:
               and missing.status_code == 404,
               "a language file in lang/ is offered and read")
 
-        import zipfile as _zip
-
-        revealed = []
-        was_open = _kl.open_folder
-        was_output = knoxmap_app.OUTPUT_DIR
-        _kl.open_folder = lambda p=None: revealed.append(str(p)) or True
-        knoxmap_app.OUTPUT_DIR = Path(out).parent      # where this map really is
-        try:
-            saved = client.post("/api/save", json={"mapName": "selftest", "name": "zip"}).get_json()
-            one = client.post("/api/save", json={"mapName": "selftest",
-                                                 "name": "selftest_preview.png"}).get_json()
-            escape = client.post("/api/save", json={"mapName": "selftest",
-                                                    "name": "../../secrets.txt"})
-        finally:
-            _kl.open_folder = was_open
-            knoxmap_app.OUTPUT_DIR = was_output
-        zip_path = Path(out) / "selftest.zip"
-        check(saved and zip_path.exists() and _zip.ZipFile(zip_path).namelist()
-              and one and one.get("name") == "selftest_preview.png"
-              and escape.status_code == 400 and len(revealed) == 2,
-              "saving a map's files writes them and shows them in Explorer")
         check(not re.search(r'(?:src="|<link[^>]*href=")https?://', page.get_data(as_text=True)),
               "page loads nothing from other sites")
 

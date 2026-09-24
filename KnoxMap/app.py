@@ -36,11 +36,14 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(errors="replace")
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = knoxpaths.BASE_DIR
+CODE_DIR = knoxpaths.BUNDLE_DIR
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-app = Flask(__name__, template_folder="templates", static_folder="static")
+app = Flask(__name__,
+             template_folder=str(CODE_DIR / "templates"),
+             static_folder=str(CODE_DIR / "static"))
 
 # Only this PC may talk to the app. The server listens on 127.0.0.1, but a web
 # page in any browser on the PC can still point a hostname of its own at that
@@ -203,7 +206,7 @@ def api_update_restart():
 # the top - no code, no rebuild. tools/make_lang_template.py writes the English
 # one from the page itself.
 
-LANG_DIR = BASE_DIR / "lang"
+LANG_DIR = CODE_DIR / "lang"
 
 
 def _language_strings(path: Path) -> dict:
@@ -265,6 +268,12 @@ def _only_local():
     host = (request.host or "").rsplit(":", 1)[0] if not (request.host or "").startswith("[")         else (request.host or "").split("]")[0] + "]"
     if host not in LOCAL_HOSTS:
         return ("KnoxMap only answers requests from this computer.", 403)
+    # The Electron window sends this on every request. A browser tab pointed
+    # at the same port does not have it, so it cannot drive the pipeline
+    # while the window is the one KnoxMap opened. Browser mode sets no token.
+    token = os.environ.get("KNOXMAP_TOKEN")
+    if token and _shell() == "electron" and request.headers.get("X-KnoxMap-Token") != token:
+        return ("KnoxMap only answers its own window.", 403)
 
 
 # Where a map stops being an easy one. None of these refuses anything: they
@@ -306,6 +315,35 @@ COMPILE_BATCH = 4
 _PROGRESS: dict[str, dict] = {}
 _COMPILE: dict[str, dict] = {}
 _PROGRESS_LOCK = threading.Lock()
+# Compile (and anything else that outlives the request) so closing the window
+# can wait for PZWorldEd_cli to be killed instead of leaving it running.
+_JOB_THREADS: list[threading.Thread] = []
+
+
+def shutdown(timeout: float = 10.0) -> None:
+    """Stop every map still being made, and wait for the compiler to exit.
+
+    Closing the window used to leave PZWorldEd_cli running. The compile
+    thread notices the stop between batches and kills that process; this
+    waits for it, up to a few seconds.
+    """
+    with _PROGRESS_LOCK:
+        names = list(dict.fromkeys([*_PROGRESS, *_COMPILE]))
+        for name in names:
+            _STOPPING.add(name)
+            if _COMPILE.get(name, {}).get("state") == "running":
+                _COMPILE[name] = {**_COMPILE[name], "state": "stopping"}
+    deadline = time.time() + timeout
+    for thread in list(_JOB_THREADS):
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        thread.join(left)
+
+
+def _shell() -> str:
+    shell = os.environ.get("KNOXMAP_SHELL", "browser")
+    return shell if shell in ("electron", "browser") else "browser"
 
 
 def _set_progress(map_name: str, **fields) -> None:
@@ -367,11 +405,9 @@ def api_progress():
 
 @app.route("/")
 def index():
-    # The app window cannot download a file the way a browser does - clicking
-    # a download link there did nothing at all - so the page asks the server
-    # to save it and show it in Explorer instead. See /api/save.
     return render_template("index.html", version=knoxlog.version(),
-                           in_window=os.environ.get("KNOXMAP_WINDOW") == "1")
+                           in_window=os.environ.get("KNOXMAP_WINDOW") == "1",
+                           shell=_shell())
 
 
 # ---- map tiles, fetched the way the OSM tile policy asks -------------------------
@@ -655,7 +691,6 @@ def _too_big_for_memory(tiles_w: float, tiles_h: float) -> str | None:
     of a few square kilometres needs more: it used to get halfway through and
     fail with "MemoryError".
     """
-    import knoxpaths
     needed = tiles_w * tiles_h * BYTES_PER_TILE + BASE_BYTES
     status = knoxlog.memory_status()
     if not status:
@@ -665,9 +700,7 @@ def _too_big_for_memory(tiles_w: float, tiles_h: float) -> str | None:
     if sys.maxsize <= 2 ** 32 and needed > room * 0.8:
         return (f"This map needs about {needed / 1e9:.1f} GB of memory, and KnoxMap is "
                 f"running 32-bit Python, which can only use about 2 GB however much this "
-                f"PC has. Close KnoxMap and run {knoxpaths.setup_command()} again: it "
-                f"fetches a 64-bit "
-                f"Python and makes its environment again. " + smaller)
+                f"PC has. " + smaller)
     if needed > min(free, room) * 0.8:
         return (f"This map needs about {needed / 1e9:.1f} GB of memory and only "
                 f"{min(free, room) / 1e9:.1f} GB is free. Close a few things and try "
@@ -1244,7 +1277,6 @@ def api_worlded():
     map_dir = _map_dir(data.get("mapName", ""))
     if map_dir is None:
         return jsonify({"error": "Unknown map."}), 404
-    import knoxpaths
 
     exe = _worlded_exe()
     if exe is None:
@@ -1296,23 +1328,24 @@ def api_setup_status():
     tools = knoxpaths.mapping_tools_dir()
     cli = knoxpaths.worlded_cli()
     game = knoxpaths.pz_install_dir()
-    setup = knoxpaths.setup_command()
+    import knoxmap_setup
     tiles = 0
     if tools and (tools / "Tiles" / "2x").is_dir():
         tiles = sum(1 for _ in (tools / "Tiles" / "2x").glob("*.png"))
     checks = [
         {"id": "tools", "ok": bool(tools), "label": "PZ Mapping Tools",
-         "fix": f"Run {setup} to download them."},
+         "fix": "KnoxMap downloads these the first time it opens. If this stays "
+                "missing, the details are in logs/setup.log."},
         {"id": "compiler", "ok": bool(cli), "label": "Patched map compiler",
-         "fix": f"Run {setup}, or compile by hand with Open in WorldEd."},
-        {"id": "game", "ok": bool(game), "label": "Project Zomboid install",
-         "fix": ("Put the folder your Steam games are in under Steam libraries "
-                 f"above - the game's own folder works too - or run {setup} and "
-                 "paste the path when it asks."
-                 + (" On a Mac the game lives inside ProjectZomboid.app; that "
-                    "path is fine, and so is anything above it."
-                    if sys.platform == "darwin" else "")
-                 + f" If it is not installed yet, install it and run {setup} again.")},
+         "fix": "KnoxMap downloads this the first time it opens. You can also "
+                "compile by hand with Open in WorldEd."},
+        {"id": "game", "ok": bool(game) and bool(knoxpaths.pz_jar(game)),
+         "label": "Project Zomboid install",
+         "fix": ("Choose the game folder under Game location, the one that "
+                 "contains the Project Zomboid jar."
+                 + (" On a Mac that is ProjectZomboid.app."
+                    if sys.platform == "darwin" else " It is usually named ProjectZomboid and holds ProjectZomboid64.jar.")
+                 + " If it is not installed yet, install it and open KnoxMap again.")},
         {"id": "build42", "ok": knoxpaths.is_build42(game),
          "label": "Project Zomboid Build 42",
          "fix": "Your game looks like Build 41. In Steam choose the Build 42 "
@@ -1321,14 +1354,13 @@ def api_setup_status():
         # more: it fails part-way through with "MemoryError".
         {"id": "python64", "ok": sys.maxsize > 2 ** 32, "label": "64-bit Python",
          "fix": "KnoxMap is running 32-bit Python, which can only use about 2 GB of "
-                "memory, so anything past a few square kilometres fails. Close KnoxMap "
-                f"and run {setup} again: it fetches a 64-bit Python."},
+                "memory, so anything past a few square kilometres fails."},
         {"id": "tiles", "ok": tiles >= 400, "label": "Tile artwork from your game",
-         "fix": f"Run {setup} to extract it from your install."},
+         "fix": "KnoxMap copies these from your game the first time it opens."},
         # Added to the tools after KnoxMap 1.0's first setups: without them a
         # compile still works but lays no kerbs or road markings, silently.
         {"id": "road_rules", "ok": _has_road_rules(tools), "label": "Kerbs and road markings",
-         "fix": f"Run {setup} again to add them to the map tools."},
+         "fix": "KnoxMap adds these the first time it opens."},
     ]
     # Off Windows the compiler is either one built for this system - what
     # Setup fetches on Linux, and nothing else is needed for it - or the
@@ -1339,7 +1371,7 @@ def api_setup_status():
         checks.append(
             {"id": "wine", "ok": knoxpaths.tools_runnable(),
              "label": "A map compiler that runs here",
-             "fix": f"Run {setup} again to fetch the compiler built for this system. "
+             "fix": "KnoxMap fetches the compiler built for this system the first time it opens. "
                     "If there is none for it, the map tools' Windows build needs Wine: "
                     "install it with your package manager (apt install wine, pacman -S "
                     "wine, dnf install wine), or set KNOXMAP_WINE to the build you want "
@@ -1359,12 +1391,12 @@ def api_setup_status():
                 "where your town is half missing from OSM; nothing else needs it."},
         {"id": "erikas_tiles", "ok": knoxpaths.erikas_tiles_ready(),
          "label": "Erika's Tiles (optional)",
-         "fix": f"Subscribe to it on the Steam Workshop and run {setup} again for glass shop "
+         "fix": "Subscribe to it on the Steam Workshop and open KnoxMap again for glass shop "
                 "fronts and signs, street signs, and far more varied pictures, posters and "
                 "plants. Maps made with it require it."},
     ]
     return jsonify({"ready": all(c["ok"] for c in checks), "checks": checks,
-                    "optional": optional, "setupCommand": setup,
+                    "optional": optional, "busy": knoxmap_setup.busy(),
                     "mods_dir": str(knoxpaths.zomboid_user_dir() / "mods")})
 
 
@@ -1722,40 +1754,6 @@ Notes
     # Japanese Windows cannot write in its own, and the whole generate request
     # failed on them after the map was already drawn.
     (map_dir / "README.txt").write_text(text, encoding="utf-8")
-
-
-@app.route("/api/save", methods=["POST"])
-def api_save():
-    """Save a map's file where the player can find it and show it in Explorer.
-
-    A download link does nothing in the app window: it is a WebView, not a
-    browser, with nowhere to put a file. Everything is already on disk in the
-    map's own folder, so "downloading" here means making the zip when that is
-    what was asked for, and opening Explorer with the file selected.
-    """
-    data = _json_body()
-    map_dir = _map_dir(data.get("mapName", ""))
-    if map_dir is None:
-        return failed("Unknown map.", 404)
-    name = str(data.get("name", "")).strip()
-    if name in ("", "zip"):
-        target = map_dir / f"{map_dir.name}.zip"
-        try:
-            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
-                for path in sorted(map_dir.rglob("*")):
-                    if not path.is_file() or path.suffix.lower() == ".zip":
-                        continue
-                    zf.write(path, arcname=str(Path(map_dir.name) / path.relative_to(map_dir)))
-        except OSError as exc:
-            return failed(f"Could not write the zip: {exc}", 500, exc)
-    else:
-        target = (map_dir / name).resolve()
-        if not str(target).startswith(str(map_dir.resolve())) or not target.is_file():
-            return failed("That file is not in this map's folder.", 400)
-    knoxlog.open_folder(target)
-    log.info("saved %s for %s", target.name, map_dir.name)
-    return jsonify({"path": str(target), "name": target.name,
-                    "folder": str(target.parent)})
 
 
 @app.route("/download/<map_name>.zip")

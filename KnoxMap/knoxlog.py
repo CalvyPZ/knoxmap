@@ -33,7 +33,25 @@ import traceback
 import zipfile
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+def _code_dir() -> Path:
+    packed = getattr(sys, "_MEIPASS", None)
+    if packed:
+        return Path(packed)
+    return Path(__file__).resolve().parent
+
+
+def _data_dir() -> Path:
+    home = os.environ.get("KNOXMAP_HOME")
+    if home:
+        return Path(home)
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+# CODE_DIR is the program (CHANGELOG). BASE_DIR is the writable folder.
+CODE_DIR = _code_dir()
+BASE_DIR = _data_dir()
 # KNOXMAP_LOG_DIR moves them, so the self-test does not write into a real log.
 LOG_DIR = Path(os.environ.get("KNOXMAP_LOG_DIR") or BASE_DIR / "logs")
 MAIN_LOG = LOG_DIR / "knoxmap.log"
@@ -126,9 +144,21 @@ def _short(value, limit: int = 300) -> str:
 
 # --- the PC this is running on ---------------------------------------------
 
+def _changelog() -> Path:
+    """CHANGELOG.md beside the code, or one folder up in a source checkout.
+
+    The packaged program carries it next to the code. A checkout keeps it at
+    the repository root, above KnoxMap/.
+    """
+    beside = CODE_DIR / "CHANGELOG.md"
+    if beside.is_file():
+        return beside
+    return CODE_DIR.parent / "CHANGELOG.md"
+
+
 def version() -> str:
     try:
-        for line in (BASE_DIR / "CHANGELOG.md").read_text(encoding="utf-8").splitlines():
+        for line in _changelog().read_text(encoding="utf-8").splitlines():
             # "1.3.9", and also "1.3.9 mc1" - a release for one system only,
             # which carries the platform and its number after the version.
             m = re.match(r"##\s+(\d[\w.]*(?:\s+[a-z]+\d*)?)", line)

@@ -17,7 +17,30 @@ import signal
 import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+def _bundle_dir() -> Path:
+    """Read-only code: this folder, or the copy packed inside the program."""
+    packed = getattr(sys, "_MEIPASS", None)
+    if packed:
+        return Path(packed)
+    return Path(__file__).resolve().parent
+
+
+def _data_dir() -> Path:
+    """Where maps, logs and setup downloads are written.
+
+    A packaged program sets KNOXMAP_HOME to the folder beside the file the
+    player launched. A source checkout keeps those next to the code.
+    """
+    home = os.environ.get("KNOXMAP_HOME")
+    if home:
+        return Path(home)
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+BUNDLE_DIR = _bundle_dir()
+BASE_DIR = _data_dir()
 CONFIG_PATH = BASE_DIR / "knoxmap_config.json"
 VENDOR_DIR = BASE_DIR / "vendor"
 
@@ -76,6 +99,66 @@ def worlded_cli() -> Path | None:
 
 def worlded_gui() -> Path | None:
     return _tool("PZWorldEd", "PZWORLDED")
+
+
+def electron_shell() -> list[str] | None:
+    """The command that opens KnoxMap's window, or None when there is no
+    Electron build to run.
+
+    KNOXMAP_ELECTRON names one, otherwise the development build under
+    desktop/node_modules. The program file players download already contains
+    its window and does not come through here. The stock electron binary
+    used while developing needs the desktop/ folder handed to it.
+    """
+    override = os.environ.get("KNOXMAP_ELECTRON")
+    if override and _exists(Path(override)):
+        return _electron_command(Path(override))
+    dev = _dev_electron()
+    if dev:
+        return _electron_command(dev)
+    return None
+
+
+def _checkout_root() -> Path:
+    """The folder that holds desktop/, when this file lives in KnoxMap/.
+
+    A packed program has no checkout beside it and keeps this folder.
+    """
+    here = Path(__file__).resolve().parent
+    parent = here.parent
+    if (parent / "desktop" / "main.js").is_file():
+        return parent
+    return here
+
+
+def _dev_electron() -> Path | None:
+    root = _checkout_root()
+    dist = root / "desktop" / "node_modules" / "electron" / "dist"
+    if os.name == "nt":
+        exe = dist / "electron.exe"
+    elif sys.platform == "darwin":
+        exe = dist / "Electron.app" / "Contents" / "MacOS" / "Electron"
+    else:
+        exe = dist / "electron"
+    if _exists(exe) and (root / "desktop" / "main.js").is_file():
+        return exe
+    return None
+
+
+def _electron_command(exe: Path) -> list[str]:
+    cmd = [str(exe)]
+    packaged = (
+        exe.parent / "resources" / "app.asar",
+        exe.parent / "resources" / "app",
+        exe.parent.parent / "Resources" / "app.asar",
+        exe.parent.parent / "Resources" / "app",
+    )
+    if any(_exists(path) or _is_dir(path) for path in packaged):
+        return cmd
+    app_dir = _checkout_root() / "desktop"
+    if (app_dir / "main.js").is_file():
+        cmd.append(str(app_dir))
+    return cmd
 
 
 def command_for(program: Path | str) -> list[str]:
@@ -292,11 +375,6 @@ def wine_path(path: Path | str) -> str:
         converted = "Z:" + os.path.abspath(text).replace("/", "\\")
     _WINE_PATHS[text] = converted
     return converted
-
-
-def setup_command() -> str:
-    """What to tell the player to run: the setup script this PC has."""
-    return "Setup.bat" if os.name == "nt" else "./setup.sh"
 
 
 def wine() -> str | None:

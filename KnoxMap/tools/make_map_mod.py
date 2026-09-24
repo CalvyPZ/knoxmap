@@ -26,16 +26,24 @@ EXTRA_FILES = ("spawnpoints.lua", "objects.lua", "roomtones.lua",
                "worldmap.xml", "streets.xml", "worldmap-annotations.lua")
 
 
+def _repo_root() -> str:
+    """The code folder, including the copy packed inside the program."""
+    packed = getattr(sys, "_MEIPASS", None)
+    if packed:
+        return packed
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def default_mods_dir() -> str:
     # knoxpaths knows about a Zomboid folder moved elsewhere (ZOMBOID_DIR or
     # the setup config); ~/Zomboid otherwise.
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, _repo_root())
     import knoxpaths
     return str(knoxpaths.zomboid_user_dir() / "mods")
 
 
 def knoxpaths_module():
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, _repo_root())
     import knoxpaths
     return knoxpaths
 
@@ -256,8 +264,7 @@ def write_reset_loot(mod_root: str) -> bool:
     save. knoxbuild/lua/resetloot.lua puts it back, building by building. Every
     KnoxMap map carries the same file and the first one loaded claims it.
     """
-    source = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "knoxbuild", "lua", "resetloot.lua")
+    source = os.path.join(_repo_root(), "knoxbuild", "lua", "resetloot.lua")
     if not os.path.exists(source):
         return False
     lua_dir = os.path.join(mod_root, "common", "media", "lua", "client", "KnoxMap")
@@ -291,8 +298,7 @@ def write_gun_cache(project_dir: str, mod_root: str, mod_id: str) -> dict | None
     except (OSError, ValueError):
         return None
 
-    handler = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "knoxbuild", "lua", "guncache.lua")
+    handler = os.path.join(_repo_root(), "knoxbuild", "lua", "guncache.lua")
     if not os.path.exists(handler):
         return None
     lua_dir = os.path.join(mod_root, "common", "media", "lua", "server", "KnoxMap")
