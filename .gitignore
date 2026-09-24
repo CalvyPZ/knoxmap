@@ -1,25 +1,42 @@
-# The Windows launcher, built by .github/workflows/launcher.yml and put in
-# the Windows download. A binary does not belong in the repository.
+# A program file built in the repo root. The ones players download are
+# written to release/ by build_releases.bat.
 /KnoxMap.exe
+
+# The Electron window's dependencies and packager scratch (desktop/).
+# The named downloads are copied to release/.
+desktop/node_modules/
+desktop/out/
+desktop/pybuild/
+
+# Local builds of the player downloads (build_releases.bat).
+/release/*
+!/release/.gitkeep
+/released/
 
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .venv/
 venv/
+*.egg-info/
+
+# Generated packaging trees (pyinstaller, setuptools, and similar)
+dist/
+build/
 
 # Generated maps, OpenStreetMap downloads and compiled lots. Large, and built
-# from OSM data rather than source. The folder itself is kept.
-output/*
-!output/.gitkeep
+# from OSM data rather than source.
+KnoxMap/output/*
 
 # Setup installs the map tools here and writes local paths here.
 /vendor/
+KnoxMap/vendor/
 knoxmap_config.json
 
 # Building the patched compiler yourself
-worlded/src/
-worlded/build/
+KnoxMap/worlded/src/
+KnoxMap/worlded/build/
 
 # Never commit Project Zomboid game artwork. Setup extracts it from each
 # player's own install; it is The Indie Stone's and not ours to share.
