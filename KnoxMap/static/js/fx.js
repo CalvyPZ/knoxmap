@@ -8,9 +8,7 @@ const fx = (() => {
   const $ = (sel, root = document) => root.querySelector(sel);
 
   // Steps used to light up in a header bar; the panels now say it themselves.
-  function step(key, state) {
-    if (key === 'area' && state === 'done') $('#map-hint')?.remove();
-  }
+  function step() {}
   function resetFrom() {}
 
   // ---- messages -----------------------------------------------------------
@@ -473,11 +471,28 @@ const fx = (() => {
     });
   }
 
+  function creditsMenu() {
+    const badge = $('#creditsBtn');
+    const menu = $('#creditsMenu');
+    if (!badge || !menu) return;
+    const close = () => { menu.hidden = true; badge.setAttribute('aria-expanded', 'false'); };
+    badge.addEventListener('click', () => {
+      if (!menu.hidden) { close(); return; }
+      menu.hidden = false;
+      badge.setAttribute('aria-expanded', 'true');
+    });
+    menu.querySelector('.version-menu-close').addEventListener('click', close);
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+    document.addEventListener('click', e => {
+      if (!menu.hidden && !menu.contains(e.target) && e.target !== badge) close();
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     versionMenu();
+    creditsMenu();
     setTimeout(watchUpdates, 8000);
     presetCards();
-    $('.hint-close')?.addEventListener('click', () => $('#map-hint')?.remove());
     $('#reportLink')?.addEventListener('click', e => { e.preventDefault(); saveReport(); });
   });
   window.addEventListener('load', mapExtras);

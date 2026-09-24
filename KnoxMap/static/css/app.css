@@ -39,13 +39,14 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
   display: flex; align-items: center; gap: 10px;
   padding: 8px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
 }
-.topbar .logo { width: 26px; height: 26px; border-radius: 5px; }
-.topbar h1 { font-size: 17px; }
 .byline { color: var(--muted); font-size: 13px; }
 .version { font-family: var(--mono); font-size: 12px; color: var(--muted); border: 1px solid var(--line-strong);
   border-radius: 4px; padding: 1px 6px; }
 .byline a { color: var(--accent); text-decoration: none; }
 .byline a:hover { text-decoration: underline; }
+a.discord { display: inline-flex; align-items: center; vertical-align: middle; line-height: 0; }
+a.discord:hover { text-decoration: none; }
+a.discord svg { display: block; height: 20px; width: auto; }
 
 /* ---- layout ------------------------------------------------------------------ */
 main {
@@ -460,9 +461,12 @@ input[readonly] { background: var(--bg); color: var(--muted); }
 .update-note button:disabled { opacity: .6; cursor: default; }
 
 /* ---- version menu ------------------------------------------------------------ */
-.version-wrap { position: relative; }
+.version-wrap, .credits-wrap { position: relative; }
 button.version { background: transparent; cursor: pointer; font: inherit; font-family: var(--mono); font-size: 12px; }
 button.version:hover, button.version[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+button.credits { background: transparent; cursor: pointer; font: inherit; font-size: 13px; color: var(--muted);
+  border: 1px solid var(--line-strong); border-radius: 4px; padding: 1px 6px; }
+button.credits:hover, button.credits[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
 .version-menu { position: absolute; top: calc(100% + 8px); left: 0; z-index: 2100; width: min(380px, calc(100vw - 32px));
   max-height: min(520px, calc(100vh - 80px)); overflow: auto; background: var(--panel);
   border: 1px solid var(--line-strong); border-radius: 6px; padding: 10px 12px;
@@ -472,6 +476,8 @@ button.version:hover, button.version[aria-expanded="true"] { color: var(--accent
 .version-menu-close { background: none; border: 0; color: var(--muted); font-size: 20px; line-height: 1; cursor: pointer; }
 .version-menu .hint { margin: 4px 0 8px; }
 .version-list { list-style: none; margin: 0; padding: 0; }
+.credits-list a { color: var(--accent); text-decoration: none; }
+.credits-list a:hover { text-decoration: underline; }
 .version-list > li { border-top: 1px solid var(--line); padding: 7px 0; }
 .version-row { display: flex; align-items: center; gap: 8px; }
 .version-row .v { font-family: var(--mono); font-weight: 600; }
@@ -512,9 +518,38 @@ summary .count { color: var(--muted); font-size: 12px; font-weight: 400; }
 
 .hint.bad { color: var(--bad); }
 
-.language { font: inherit; font-size: 12px; color: var(--muted); background: var(--panel);
-  border: 1px solid var(--line-strong); border-radius: 4px; padding: 2px 6px; }
+.language { position: relative; flex: 0 0 auto; width: 118px; }
 .language[hidden] { display: none; }
+.language-btn {
+  display: flex; align-items: center; gap: 6px; width: 100%; height: 30px;
+  padding: 0 8px; font: inherit; font-size: 12px; color: var(--muted);
+  background: var(--panel); border: 1px solid var(--line-strong); border-radius: 4px;
+  cursor: pointer; text-align: left;
+}
+.language-btn::after {
+  content: ""; margin-left: auto; flex: none;
+  border: 4px solid transparent; border-top-color: var(--muted); border-bottom: 0;
+}
+.language-btn:hover, .language-btn[aria-expanded="true"] { border-color: var(--accent); color: var(--text); }
+.language-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.language-flag {
+  width: 18px; height: 12px; flex: none; display: block; overflow: hidden;
+  border-radius: 1px; box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
+}
+.language-flag svg { display: block; width: 18px; height: 12px; }
+.language-list {
+  position: absolute; z-index: 2100; top: calc(100% + 4px); left: 0; width: 100%;
+  margin: 0; padding: 4px; list-style: none; background: var(--panel);
+  border: 1px solid var(--line-strong); border-radius: 4px; box-shadow: var(--shadow);
+}
+.language-list[hidden] { display: none; }
+.language-list button {
+  display: flex; align-items: center; gap: 6px; width: 100%; min-height: 32px;
+  padding: 6px; font: inherit; font-size: 12px; color: var(--text);
+  background: transparent; border: 0; border-radius: 3px; cursor: pointer; text-align: left;
+}
+.language-list button:hover { background: var(--hover); }
+.language-list button[aria-selected="true"] { background: var(--accent-soft); }
 
 /* Pictures of a finished map, drawn from the compiled cells. */
 .shots { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
