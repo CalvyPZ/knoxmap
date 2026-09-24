@@ -376,10 +376,34 @@
 
 <div id="toasts" aria-live="polite"></div>
 
+<div id="tutorial" class="tutorial" hidden>
+  <svg id="tutorialDim" class="tutorial-dim" aria-hidden="true"></svg>
+  <div id="tutorialRings" class="tutorial-rings" aria-hidden="true"></div>
+  <div class="tutorial-card" role="dialog" aria-modal="true" aria-labelledby="tutorialTitle">
+    <h2 id="tutorialTitle" hidden></h2>
+    <p id="tutorialBody"></p>
+    <p id="tutorialLink" class="tutorial-link" hidden></p>
+    <div class="tutorial-bar">
+      <button type="button" id="tutorialSkip" class="tutorial-skip" hidden>Skip</button>
+      <div id="tutorialAsk" class="tutorial-ask">
+        <button type="button" id="tutorialNo" class="btn">No</button>
+        <button type="button" id="tutorialYes" class="btn tutorial-yes">Yes</button>
+      </div>
+      <div id="tutorialNav" class="tutorial-nav" hidden>
+        <button type="button" id="tutorialBack" class="btn tutorial-arrow" aria-label="Back">&lt;</button>
+        <span id="tutorialCount" class="tutorial-count"></span>
+        <button type="button" id="tutorialNext" class="btn tutorial-arrow" aria-label="Next">&gt;</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="/static/vendor/leaflet/leaflet.js"></script>
 <script src="/static/vendor/leaflet-draw/leaflet.draw.js"></script>
+<script src="/static/js/clip.js"></script>
 <script src="/static/js/fx.js"></script>
 <script src="/static/js/app.js"></script>
+<script src="/static/js/tutorial.js"></script>
 <script src="/static/js/i18n.js"></script>
 </body>
 </html>

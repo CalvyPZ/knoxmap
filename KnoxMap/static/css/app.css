@@ -557,3 +557,46 @@ summary .count { color: var(--muted); font-size: 12px; font-weight: 400; }
            border: 1px solid var(--line, #2a2f26); background: #14180f; }
 .shots img { display: block; width: 100%; height: auto; }
 .shots a:hover { border-color: var(--accent, #8ce65a); }
+
+/* ---- first-run tutorial ---------------------------------------------------- */
+.tutorial { position: fixed; inset: 0; z-index: 4000; }
+.tutorial[hidden] { display: none; }
+.tutorial-dim { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.tutorial-rings { position: absolute; inset: 0; pointer-events: none; z-index: 1; }
+.tutorial-ring {
+  position: absolute; border: 2px solid var(--accent); border-radius: 8px;
+  box-shadow: 0 0 0 4px rgba(165, 226, 102, 0.18); pointer-events: none;
+}
+.tutorial-card {
+  position: absolute; z-index: 2; width: min(400px, calc(100vw - 32px));
+  background: var(--panel); border: 1px solid var(--line-strong); border-radius: 6px;
+  padding: 14px 16px 12px; box-shadow: 0 10px 30px rgba(0, 0, 0, .45);
+}
+.tutorial-card h2 { font-size: 15px; margin-bottom: 6px; }
+.tutorial-card h2[hidden] { display: none; }
+.tutorial-card p { margin: 0; }
+.tutorial-card .tutorial-link { margin-top: 8px; }
+.tutorial-link[hidden] { display: none; }
+.tutorial-link a { word-break: break-all; }
+.tutorial-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-top: 14px;
+}
+.tutorial-ask, .tutorial-nav { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.tutorial-ask[hidden], .tutorial-nav[hidden] { display: none; }
+.tutorial-skip {
+  background: none; border: 0; padding: 0; color: var(--muted);
+  font: inherit; font-size: 13px; cursor: pointer;
+}
+.tutorial-skip:hover { color: var(--text); }
+.tutorial-skip[hidden] { display: none; }
+.tutorial-yes, #tutorialNext {
+  background: var(--accent); color: var(--accent-ink);
+  border-color: var(--accent); font-weight: 600;
+}
+.tutorial-yes:hover, #tutorialNext:hover { background: #b7ea80; }
+.tutorial-arrow { width: 34px; padding-left: 0; padding-right: 0; font-weight: 600; }
+.tutorial-count {
+  min-width: 3.2em; text-align: center; color: var(--muted);
+  font-variant-numeric: tabular-nums; font-size: 13px;
+}
