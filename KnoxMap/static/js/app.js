@@ -1,6 +1,7 @@
 // Knoxify — frontend.
 //
 // - Leaflet map with leaflet-draw for selecting the bbox.
+// - The eraser uses those same shape tools to cut a piece out.
 // - Area stats update live as the rectangle is drawn/edited.
 // - POSTs to /api/generate and renders results.
 
@@ -58,29 +59,88 @@ L.tileLayer('/tiles/{z}/{x}/{y}.png', {
 
 const drawnItems = new L.FeatureGroup().addTo(map);
 const SEL_STYLE = { color: '#a5e266', weight: 2, fillOpacity: 0.1, className: 'sel-rect' };
+const ERASE_STYLE = { color: '#e06a62', weight: 2, fillColor: '#e06a62', fillOpacity: 0.16, dashArray: '4 4' };
+function drawToolOptions(style) {
+  return {
+    rectangle: { shapeOptions: style },
+    // Any outline, clicked point by point: a neighbourhood, a stretch of
+    // coast, the blocks either side of a high street.
+    polygon: { allowIntersection: false, showArea: true, shapeOptions: style },
+    circle: { shapeOptions: style, showRadius: true, metric: true },
+  };
+}
 const drawControl = new L.Control.Draw({
   draw: {
     polyline: false, marker: false, circlemarker: false,
-    rectangle: { shapeOptions: SEL_STYLE },
-    // Any outline, clicked point by point: a neighbourhood, a stretch of
-    // coast, the blocks either side of a high street.
-    polygon: { allowIntersection: false, showArea: true, shapeOptions: SEL_STYLE },
-    circle: { shapeOptions: SEL_STYLE, showRadius: true, metric: true },
+    ...drawToolOptions(SEL_STYLE),
   },
   edit: { featureGroup: drawnItems, remove: true },
 });
 map.addControl(drawControl);
 
 let currentRect = null;
+let eraseMode = false;
+let lassoButton = null;
+const LASSO_ADD = 'Draw freehand: drag round the area you want';
+const LASSO_CUT = 'Eraser: drag round the area to cut out';
 
+function setEraseMode(on) {
+  eraseMode = on;
+  const btn = document.querySelector('#map .eraser-btn');
+  if (btn) {
+    btn.classList.toggle('is-on', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  if (lassoButton) lassoButton.title = on ? LASSO_CUT : LASSO_ADD;
+  drawControl.setDrawingOptions(drawToolOptions(on ? ERASE_STYLE : SEL_STYLE));
+  const tips = [
+    ['rectangle', 'Click and drag to draw rectangle.', 'Click and drag to erase a rectangle.'],
+    ['circle', 'Click and drag to draw circle.', 'Click and drag to erase a circle.'],
+    ['polygon', 'Click to start drawing shape.', 'Click to start the shape to erase.'],
+  ];
+  for (const [kind, add, cut] of tips) {
+    L.drawLocal.draw.handlers[kind].tooltip.start = on ? cut : add;
+  }
+  map.getContainer().classList.toggle('erase-mode', on);
+}
+
+// A rectangle is one layer. A cut that leaves several pieces is a group of
+// polygons; the edit tool needs each piece directly in drawnItems.
 function setSelection(layer) {
   drawnItems.clearLayers();
   currentRect = layer;
-  drawnItems.addLayer(currentRect);
+  if (layer instanceof L.FeatureGroup && !(layer instanceof L.Path)) {
+    layer.eachLayer(part => drawnItems.addLayer(part));
+  } else {
+    drawnItems.addLayer(layer);
+  }
   updateBboxFields();
 }
 
-map.on(L.Draw.Event.CREATED, (e) => setSelection(e.layer));
+function clearSelection() {
+  drawnItems.clearLayers();
+  currentRect = null;
+  clearBboxFields();
+}
+
+// A new shape adds an area. With the eraser on, the same shape is cut out
+// of the area already drawn.
+function applyDrawn(layer) {
+  if (!eraseMode) {
+    setSelection(layer);
+    return;
+  }
+  if (!currentRect) {
+    fx.toast('', 'Nothing to erase', 'Draw an area first, then cut a shape out of it.');
+    return;
+  }
+  cutSelection(layer);
+}
+
+map.on(L.Draw.Event.CREATED, (e) => {
+  if (e.lasso) return;
+  applyDrawn(e.layer);
+});
 
 // ---- freehand lasso ---------------------------------------------------------------
 // Drag round what you want. The traced line is thinned to a polygon, so the
@@ -91,9 +151,20 @@ const LassoControl = L.Control.extend({
     const bar = L.DomUtil.create('div', 'leaflet-bar leaflet-control lasso-control');
     const a = L.DomUtil.create('a', 'lasso-btn', bar);
     a.href = '#';
-    a.title = 'Draw freehand: drag round the area you want';
+    a.title = LASSO_ADD;
     a.innerHTML = '&#9998;';
+    lassoButton = a;
     L.DomEvent.on(a, 'click', (ev) => { L.DomEvent.stop(ev); startLasso(a); });
+    const eraser = L.DomUtil.create('a', 'eraser-btn', bar);
+    eraser.href = '#';
+    eraser.title = 'Eraser: draw a shape to cut it out of the selection';
+    eraser.setAttribute('role', 'button');
+    eraser.setAttribute('aria-pressed', 'false');
+    eraser.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M9.1 1.7a1.4 1.4 0 0 1 2 0l3.2 3.2a1.4 1.4 0 0 1 0 2L8.2 13H4.7L1.8 10.1a1.4 1.4 0 0 1 0-2L9.1 1.7z"/><path stroke="currentColor" stroke-width="1.4" d="M2 14.2h12"/></svg>';
+    L.DomEvent.on(eraser, 'click', (ev) => {
+      L.DomEvent.stop(ev);
+      setEraseMode(!eraseMode);
+    });
     return bar;
   },
 });
@@ -108,7 +179,8 @@ function startLasso(button) {
   let trail = null;
   const down = (e) => {
     points = [e.latlng];
-    trail = L.polyline(points, { color: '#a5e266', weight: 2, dashArray: '4 4' }).addTo(map);
+    const color = eraseMode ? ERASE_STYLE.color : SEL_STYLE.color;
+    trail = L.polyline(points, { color, weight: 2, dashArray: '4 4' }).addTo(map);
     map.on('mousemove', move);
   };
   const move = (e) => { points.push(e.latlng); trail.setLatLngs(points); };
@@ -120,8 +192,10 @@ function startLasso(button) {
     if (trail) map.removeLayer(trail);
     const thin = simplifyLatLngs(points, 8);
     if (thin.length >= 3) {
-      setSelection(L.polygon(thin, SEL_STYLE));
-      map.fire(L.Draw.Event.CREATED, { layer: currentRect, layerType: 'polygon', lasso: true });
+      const layer = L.polygon(thin, eraseMode ? ERASE_STYLE : SEL_STYLE);
+      if (!eraseMode) layer._knoxKind = 'freehand';
+      applyDrawn(layer);
+      map.fire(L.Draw.Event.CREATED, { layer, layerType: 'polygon', lasso: true });
     }
   };
   map.on('mousedown', down);
@@ -147,28 +221,116 @@ function simplifyLatLngs(latlngs, tolerancePx) {
   return latlngs.filter((_, i) => keep[i]);
 }
 
+function circleRing(circle) {
+  const c = circle.getLatLng();
+  const r = circle.getRadius();
+  const ring = [];
+  for (let i = 0; i < 64; i++) {
+    const a = (i / 64) * 2 * Math.PI;
+    const dLat = (r * Math.cos(a)) / 111320;
+    const dLon = (r * Math.sin(a)) / (111320 * Math.cos(c.lat * Math.PI / 180));
+    ring.push([wrapLon(c.lng + dLon), c.lat + dLat]);
+  }
+  ring.push(ring[0]);
+  return ring;
+}
+
+function rectRing(rect) {
+  const b = rect.getBounds();
+  const w = wrapLon(b.getWest());
+  const e = wrapLon(b.getEast());
+  return [[w, b.getSouth()], [e, b.getSouth()], [e, b.getNorth()], [w, b.getNorth()], [w, b.getSouth()]];
+}
+
+// GeoJSON Polygon or MultiPolygon for a layer. A rectangle is included here
+// so the eraser can cut it; selectionShape drops it again, because a plain
+// rectangle means "build the whole box".
+function outlineGeometry(layer) {
+  if (!layer) return null;
+  if (layer instanceof L.FeatureGroup && !(layer instanceof L.Path)) {
+    const polys = [];
+    layer.eachLayer(part => {
+      const geo = outlineGeometry(part);
+      if (!geo) return;
+      if (geo.type === 'Polygon') polys.push(geo.coordinates);
+      else polys.push(...geo.coordinates);
+    });
+    if (!polys.length) return null;
+    if (polys.length === 1) return { type: 'Polygon', coordinates: polys[0] };
+    return { type: 'MultiPolygon', coordinates: polys };
+  }
+  if (layer instanceof L.Circle) return { type: 'Polygon', coordinates: [circleRing(layer)] };
+  if (layer instanceof L.Rectangle) return { type: 'Polygon', coordinates: [rectRing(layer)] };
+  const raw = layer.toGeoJSON && layer.toGeoJSON();
+  const geo = raw && (raw.geometry || raw);
+  const fold = coords => coords.map(ring => ring.map(([lon, lat]) => [wrapLon(lon), lat]));
+  if (geo && geo.type === 'Polygon') return { type: 'Polygon', coordinates: fold(geo.coordinates) };
+  if (geo && geo.type === 'MultiPolygon') return { type: 'MultiPolygon', coordinates: geo.coordinates.map(fold) };
+  return null;
+}
+
+function layerPolygons(layer) {
+  const geo = outlineGeometry(layer);
+  if (!geo) return [];
+  return geo.type === 'Polygon' ? [geo.coordinates] : geo.coordinates;
+}
+
 // The selection as GeoJSON for the server, or null for a plain rectangle.
 function selectionShape() {
   if (!currentRect || currentRect instanceof L.Rectangle) return null;
-  let rings;
-  if (currentRect instanceof L.Circle) {
-    const c = currentRect.getLatLng();
-    const r = currentRect.getRadius();
-    const ring = [];
-    for (let i = 0; i < 64; i++) {
-      const a = (i / 64) * 2 * Math.PI;
-      const dLat = (r * Math.cos(a)) / 111320;
-      const dLon = (r * Math.sin(a)) / (111320 * Math.cos(c.lat * Math.PI / 180));
-      ring.push([wrapLon(c.lng + dLon), c.lat + dLat]);
+  return outlineGeometry(currentRect);
+}
+
+// Cut `layer` out of the current selection. A miss leaves the selection as it
+// was, so a circle stays a circle. Cutting the whole thing clears it.
+function cutSelection(layer) {
+  const subject = layerPolygons(currentRect);
+  const clip = layerPolygons(layer);
+  if (!subject.length || !clip.length) return;
+  let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity;
+  const take = polys => {
+    for (const rings of polys) {
+      for (const ring of rings) {
+        for (const [lon, lat] of ring) {
+          if (lon < minLon) minLon = lon;
+          if (lon > maxLon) maxLon = lon;
+          if (lat < minLat) minLat = lat;
+          if (lat > maxLat) maxLat = lat;
+        }
+      }
     }
-    ring.push(ring[0]);
-    return { type: 'Polygon', coordinates: [ring] };
+  };
+  take(subject);
+  take(clip);
+  const lon0 = (minLon + maxLon) / 2;
+  const lat0 = (minLat + maxLat) / 2;
+  const cos = Math.cos(lat0 * Math.PI / 180);
+  const toXY = polys => polys.map(rings => rings.map(ring => ring.map(([lon, lat]) => [
+    (lon - lon0) * 111320 * cos,
+    (lat - lat0) * 111320,
+  ])));
+  const diff = knoxClip.difference(toXY(subject), toXY(clip));
+  if (!diff.changed) return;
+  if (!diff.polygons.length) {
+    clearSelection();
+    return;
   }
-  const geo = currentRect.toGeoJSON().geometry;
-  const fold = coords => coords.map(ring => ring.map(([lon, lat]) => [wrapLon(lon), lat]));
-  if (geo.type === 'Polygon') return { type: 'Polygon', coordinates: fold(geo.coordinates) };
-  if (geo.type === 'MultiPolygon') return { type: 'MultiPolygon', coordinates: geo.coordinates.map(fold) };
-  return null;
+  const back = diff.polygons.map(rings => rings.map(ring => ring.map(([x, y]) => [
+    wrapLon(lon0 + x / (111320 * cos)),
+    lat0 + y / 111320,
+  ])));
+  const parts = [];
+  for (const rings of back) {
+    const latlngs = rings.map(ring => {
+      const pts = ring.slice();
+      const a = pts[0], b = pts[pts.length - 1];
+      if (pts.length > 1 && a[0] === b[0] && a[1] === b[1]) pts.pop();
+      return pts.map(([lon, lat]) => [lat, lon]);
+    }).filter(ring => ring.length >= 3);
+    if (latlngs.length) parts.push(L.polygon(latlngs, SEL_STYLE));
+  }
+  if (!parts.length) clearSelection();
+  else setSelection(parts.length === 1 ? parts[0] : L.featureGroup(parts));
 }
 
 // Area inside the selection in km², on a local flat projection: plenty for
@@ -193,9 +355,19 @@ function selectionAreaKm2() {
   return total;
 }
 map.on(L.Draw.Event.EDITED, () => updateBboxFields());
-map.on(L.Draw.Event.DELETED, () => {
-  currentRect = null;
-  clearBboxFields();
+map.on(L.Draw.Event.DELETED, (e) => {
+  const removed = [];
+  e.layers.eachLayer(l => removed.push(l));
+  if (currentRect instanceof L.FeatureGroup && !(currentRect instanceof L.Path)) {
+    removed.forEach(l => { if (currentRect.hasLayer(l)) currentRect.removeLayer(l); });
+    const left = currentRect.getLayers();
+    if (left.length === 1) currentRect = left[0];
+    else if (!left.length) currentRect = null;
+  } else if (!drawnItems.getLayers().length || removed.includes(currentRect)) {
+    currentRect = null;
+  }
+  if (!currentRect) clearBboxFields();
+  else updateBboxFields();
 });
 
 // Leaflet reports coordinates *unwrapped* once the map has been panned across
