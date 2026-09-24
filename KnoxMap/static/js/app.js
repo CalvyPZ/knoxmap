@@ -650,6 +650,110 @@ document.getElementById('steamSave').addEventListener('click', async () => {
   }
 });
 
+const sideSub = { setup: 'game', map: 'area', build: 'generate' };
+
+document.querySelector('.side-tabs').addEventListener('click', e => {
+  const tab = e.target.closest('.side-tab');
+  if (tab) showMaster(tab.dataset.master);
+});
+document.querySelector('.side-tabs').addEventListener('keydown', e => moveTab(e, '.side-tab', tab => {
+  showMaster(tab.dataset.master);
+}));
+
+for (const row of document.querySelectorAll('.side-subtabs')) {
+  row.addEventListener('click', e => {
+    const tab = e.target.closest('.side-subtab');
+    if (!tab) return;
+    sideSub[row.dataset.master] = tab.dataset.tab;
+    showMaster(row.dataset.master);
+  });
+  row.addEventListener('keydown', e => moveTab(e, '.side-subtab', tab => {
+    sideSub[row.dataset.master] = tab.dataset.tab;
+    showMaster(row.dataset.master);
+  }));
+}
+
+function moveTab(e, selector, choose) {
+  const tabs = [...e.currentTarget.querySelectorAll(selector)];
+  const i = tabs.indexOf(document.activeElement);
+  if (i < 0) return;
+  let next = null;
+  if (e.key === 'ArrowRight') next = tabs[(i + 1) % tabs.length];
+  else if (e.key === 'ArrowLeft') next = tabs[(i - 1 + tabs.length) % tabs.length];
+  else if (e.key === 'Home') next = tabs[0];
+  else if (e.key === 'End') next = tabs[tabs.length - 1];
+  if (!next) return;
+  e.preventDefault();
+  next.focus();
+  choose(next);
+}
+
+function showMaster(master) {
+  for (const tab of document.querySelectorAll('.side-tab')) {
+    const on = tab.dataset.master === master;
+    tab.classList.toggle('is-on', on);
+    tab.setAttribute('aria-selected', on ? 'true' : 'false');
+    tab.tabIndex = on ? 0 : -1;
+  }
+  for (const row of document.querySelectorAll('.side-subtabs')) {
+    row.hidden = row.dataset.master !== master;
+  }
+  const sub = sideSub[master];
+  const row = document.querySelector(`.side-subtabs[data-master="${master}"]`);
+  if (row && sub) {
+    for (const tab of row.querySelectorAll('.side-subtab')) {
+      const on = tab.dataset.tab === sub;
+      tab.classList.toggle('is-on', on);
+      tab.setAttribute('aria-selected', on ? 'true' : 'false');
+      tab.tabIndex = on ? 0 : -1;
+    }
+  }
+  for (const panel of document.querySelectorAll('.side-panel')) {
+    const show = panel.dataset.master === master && (!panel.dataset.tab || panel.dataset.tab === sub);
+    panel.hidden = !show;
+  }
+  const shell = document.querySelector('.side-shell');
+  if (shell) shell.classList.toggle('has-sub', !!document.querySelector(`.side-subtabs[data-master="${master}"]`));
+  syncSideSteps();
+}
+
+function sideSteps() {
+  const steps = [];
+  for (const tab of document.querySelectorAll('.side-tab')) {
+    const master = tab.dataset.master;
+    const row = document.querySelector(`.side-subtabs[data-master="${master}"]`);
+    if (!row) { steps.push({ master, sub: null }); continue; }
+    for (const sub of row.querySelectorAll('.side-subtab')) {
+      steps.push({ master, sub: sub.dataset.tab });
+    }
+  }
+  return steps;
+}
+
+function currentSideStep() {
+  const master = document.querySelector('.side-tab.is-on')?.dataset.master;
+  const sub = sideSub[master] || null;
+  return sideSteps().findIndex(s => s.master === master && s.sub === sub);
+}
+
+function syncSideSteps() {
+  const i = currentSideStep();
+  const last = sideSteps().length - 1;
+  document.getElementById('sidePrev').disabled = i <= 0;
+  document.getElementById('sideNext').disabled = i < 0 || i >= last;
+}
+
+function stepSide(dir) {
+  const step = sideSteps()[currentSideStep() + dir];
+  if (!step) return;
+  if (step.sub) sideSub[step.master] = step.sub;
+  showMaster(step.master);
+}
+
+document.getElementById('sidePrev').addEventListener('click', () => stepSide(-1));
+document.getElementById('sideNext').addEventListener('click', () => stepSide(1));
+syncSideSteps();
+
 loadSettings().catch(() => {
   document.getElementById('advanced-body').textContent =
     'Could not load the settings list.';

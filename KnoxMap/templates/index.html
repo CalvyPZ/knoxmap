@@ -47,9 +47,11 @@
       <ul id="search-results" hidden></ul>
     </div>
 
-    <div id="basemaps" role="radiogroup" aria-label="Basemap">
-      <button type="button" data-base="dark" class="is-on">Dark</button>
-      <button type="button" data-base="streets">Light</button>
+    <div id="map-tools">
+      <div id="basemaps" role="radiogroup" aria-label="Basemap">
+        <button type="button" data-base="dark" class="is-on">Dark</button>
+        <button type="button" data-base="streets">Light</button>
+      </div>
     </div>
 
     <div id="map"></div>
@@ -73,96 +75,275 @@
   </section>
 
   <aside id="controls">
-    <section class="panel setup-card" id="setupCard" hidden>
-      <h2>Setup isn't finished</h2>
-      <p>You can make terrain and buildings already. To compile maps for the game,
-        run <b id="setupScript">Setup.bat</b> once:</p>
-      <ul class="setup-list" id="setupList"></ul>
-    </section>
+    <div class="side-step">
+      <button type="button" id="sidePrev" class="btn" disabled>Previous</button>
+      <button type="button" id="sideNext" class="btn">Next</button>
+    </div>
+    <div class="side-shell has-sub">
+    <div class="side-tabs" role="tablist" aria-label="Sidebar">
+      <button type="button" class="side-tab is-on" role="tab" id="tabSetup"
+              data-master="setup" aria-selected="true" aria-controls="subSetup">Setup</button>
+      <button type="button" class="side-tab" role="tab" id="tabMap"
+              data-master="map" aria-selected="false" aria-controls="subMap" tabindex="-1">Map</button>
+      <button type="button" class="side-tab" role="tab" id="tabBuild"
+              data-master="build" aria-selected="false" aria-controls="subBuild" tabindex="-1">Build</button>
+    </div>
 
-    <section class="panel" id="mapsCard" hidden>
-      <details id="mapsPanel">
-        <summary>Your maps <span class="count" id="mapsCount"></span></summary>
-        <p class="hint">Maps already in this folder. Open one to build, compile or install
-          it again without drawing it afresh.</p>
-        <ul class="map-list" id="mapList"></ul>
-      </details>
-    </section>
+    <div class="side-subtabs" role="tablist" id="subSetup" data-master="setup" aria-label="Setup">
+      <button type="button" class="side-subtab is-on" role="tab" data-tab="game"
+              aria-selected="true" aria-controls="tabPanelGame">Game</button>
+      <button type="button" class="side-subtab" role="tab" data-tab="mod"
+              aria-selected="false" aria-controls="tabPanelMod" tabindex="-1">Mod</button>
+    </div>
+    <div class="side-subtabs" role="tablist" id="subMap" data-master="map" aria-label="Map" hidden>
+      <button type="button" class="side-subtab is-on" role="tab" data-tab="area"
+              aria-selected="true" aria-controls="tabPanelArea">Area</button>
+      <button type="button" class="side-subtab" role="tab" data-tab="advanced"
+              aria-selected="false" aria-controls="tabPanelAdvanced" tabindex="-1">Advanced</button>
+    </div>
+    <div class="side-subtabs" role="tablist" id="subBuild" data-master="build" aria-label="Build" hidden>
+      <button type="button" class="side-subtab is-on" role="tab" data-tab="generate"
+              aria-selected="true" aria-controls="tabPanelGenerate">Generate</button>
+      <button type="button" class="side-subtab" role="tab" data-tab="build"
+              aria-selected="false" aria-controls="tabPanelBuild" tabindex="-1">Build</button>
+      <button type="button" class="side-subtab" role="tab" data-tab="edit"
+              aria-selected="false" aria-controls="tabPanelEdit" tabindex="-1">Edit</button>
+      <button type="button" class="side-subtab" role="tab" data-tab="export"
+              aria-selected="false" aria-controls="tabPanelExport" tabindex="-1">Export</button>
+    </div>
 
-    <section class="panel" data-card="area">
-      <h2>1. Area</h2>
-      <div class="coords">
-        <label>S <input type="number" step="0.000001" id="south" readonly></label>
-        <label>W <input type="number" step="0.000001" id="west"  readonly></label>
-        <label>N <input type="number" step="0.000001" id="north" readonly></label>
-        <label>E <input type="number" step="0.000001" id="east"  readonly></label>
+    <div class="side-scroll">
+      <div class="side-panel" role="tabpanel" id="tabPanelGame" data-master="setup" data-tab="game">
+        <section class="setup-card" id="setupCard" hidden>
+          <h2>Setup isn't finished</h2>
+          <p id="setupLead" hidden>Getting the map compiler ready. This happens once.</p>
+          <ul class="setup-list" id="setupList"></ul>
+        </section>
+
+        <section id="steamLibraries">
+          <h2>Game location</h2>
+          <p class="hint">The install is the folder that contains the Project Zomboid jar.</p>
+          <div class="location-choice" role="radiogroup" aria-label="Game location">
+            <label class="location-option">
+              <input type="radio" name="gameLocation" id="gameAuto" value="auto" checked>
+              Detect automatically
+            </label>
+            <label class="location-option">
+              <input type="radio" name="gameLocation" id="gameManual" value="manual">
+              Choose a folder
+            </label>
+          </div>
+          <div id="gameBrowseRow" hidden>
+            <button type="button" id="gameBrowse" class="btn">Browse…</button>
+            <div id="gamePath" class="hint"></div>
+            <div id="gameJar" class="hint"></div>
+          </div>
+          <div id="steamNote" class="hint"></div>
+        </section>
       </div>
-      <div id="area-stats" class="empty">
-        <div class="empty-state">Nothing selected yet.</div>
-      </div>
-      <div id="landmark-panel">
-        <button id="landmarksBtn" class="btn" disabled>List named places in the area</button>
-        <div id="landmark-results"></div>
-      </div>
-    </section>
 
-    <section class="panel" data-card="style">
-      <h2>2. Settings</h2>
-      <label class="field">Map name
-        <input type="text" id="mapName" value="" placeholder="leave blank for an automatic name"/>
-      </label>
-      <label class="field">Scale
-        <select id="metersPerTile">
-          <option value="0.5">0.5 m per tile (small areas)</option>
-          <option value="1.0" selected>1 m per tile (recommended)</option>
-          <option value="2.0">2 m per tile</option>
-          <option value="3.0">3 m per tile</option>
-          <option value="4.0">4 m per tile</option>
-          <option value="6.0">6 m per tile</option>
-          <option value="8.0">8 m per tile (whole regions)</option>
-        </select>
-      </label>
+      <div class="side-panel" role="tabpanel" id="tabPanelMod" data-master="setup" data-tab="mod" hidden>
+        <section id="mapsCard" hidden>
+          <details id="mapsPanel">
+            <summary>Your maps <span class="count" id="mapsCount"></span></summary>
+            <p class="hint">Maps already in this folder. Open one to build, compile or install
+              it again without drawing it afresh.</p>
+            <ul class="map-list" id="mapList"></ul>
+          </details>
+        </section>
 
-      <div class="field-label">Kind of place</div>
-      <div class="preset-cards" id="presetCards" role="radiogroup" aria-label="Kind of place">
-        <button type="button" class="preset-card is-on" data-preset="town" role="radio" aria-checked="true">Town</button>
-        <button type="button" class="preset-card" data-preset="suburb" role="radio" aria-checked="false">Suburb</button>
-        <button type="button" class="preset-card" data-preset="city" role="radio" aria-checked="false">City</button>
-        <button type="button" class="preset-card" data-preset="rural" role="radio" aria-checked="false">Rural</button>
+        <section>
+          <h2>Settings</h2>
+          <label class="field">Map name
+            <input type="text" id="mapName" value="" placeholder="leave blank for an automatic name"/>
+          </label>
+          <label class="field">Scale per tile
+            <select id="metersPerTile">
+              <option value="0.5">0.5 m per tile (small areas)</option>
+              <option value="1.0" selected>1 m per tile (recommended)</option>
+              <option value="2.0">2 m per tile</option>
+              <option value="3.0">3 m per tile</option>
+              <option value="4.0">4 m per tile</option>
+              <option value="6.0">6 m per tile</option>
+              <option value="8.0">8 m per tile (whole regions)</option>
+            </select>
+          </label>
+
+          <div class="field-label">Default Population</div>
+          <div class="preset-cards" id="presetCards" role="radiogroup" aria-label="Default Population">
+            <button type="button" class="preset-card is-on" data-preset="town" role="radio" aria-checked="true">Town</button>
+            <button type="button" class="preset-card" data-preset="suburb" role="radio" aria-checked="false">Suburb</button>
+            <button type="button" class="preset-card" data-preset="city" role="radio" aria-checked="false">City</button>
+            <button type="button" class="preset-card" data-preset="rural" role="radio" aria-checked="false">Rural</button>
+          </div>
+          <select id="preset" hidden>
+            <option value="town" selected>Town</option>
+            <option value="suburb">Suburb</option>
+            <option value="city">City</option>
+            <option value="rural">Rural</option>
+          </select>
+        </section>
       </div>
-      <select id="preset" hidden>
-        <option value="town" selected>Town</option>
-        <option value="suburb">Suburb</option>
-        <option value="city">City</option>
-        <option value="rural">Rural</option>
-      </select>
 
-      <details id="advanced">
-        <summary>More settings</summary>
-        <div id="advanced-body">
-          <!-- Filled from /api/settings so the page never holds a second,
-               drifting copy of the limits. -->
+      <div class="side-panel" role="tabpanel" id="tabPanelArea" data-master="map" data-tab="area" hidden>
+        <section>
+          <button type="button" id="vanillaOverlayBtn" class="btn" aria-pressed="false"
+                  title="Show the base game's Knox County map, centred on this view, so you can judge how big an area to draw. It follows the scale setting. Drag it to move it.">Overlay Vanilla Map</button>
+          <div id="vanillaNote" class="hint"></div>
+          <div class="coords" hidden>
+            <label>S <input type="number" step="0.000001" id="south" readonly></label>
+            <label>W <input type="number" step="0.000001" id="west"  readonly></label>
+            <label>N <input type="number" step="0.000001" id="north" readonly></label>
+            <label>E <input type="number" step="0.000001" id="east"  readonly></label>
+          </div>
+          <div id="area-layers">
+            <div class="empty-state">Nothing selected yet.</div>
+          </div>
+          <div id="area-stats" hidden></div>
+          <div class="area-toggles">
+            <label class="toggle">
+              <input type="checkbox" id="fillGaps" data-key="fill_gaps">
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Add missing buildings</span>
+                <span class="toggle-hint">Fills in buildings that were not drawn on the source map. Useful where a town is only half mapped. Where the map is already complete it mostly adds sheds. Optional, and slower.</span>
+              </span>
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="seedRandom">
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Randomise seed</span>
+                <span class="toggle-hint">Same seed and area gives the same town again.</span>
+              </span>
+            </label>
+            <label class="field" id="seedField" hidden>Seed
+              <input type="number" id="areaSeed" data-key="seed" min="0" max="2147483647" step="1" value="1">
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="trueMap" data-key="true_map" checked>
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">True map generation</span>
+                <span class="toggle-hint">Builds every address as mapped. Off keeps the real roads, rivers, woods and terrain, leaves out half the houses, and grows the rest into proper homes with yards. Named places are always built, at the game's size.</span>
+              </span>
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="guaranteedRifle" data-key="guaranteed_rifle" checked>
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Guaranteed rifle</span>
+                <span class="toggle-hint">Leaves one military rifle on the map: in an army building if there is one, otherwise the police station, a gun shop, or a house on the edge of town. A real town has no checkpoints for one to spawn in.</span>
+              </span>
+            </label>
+          </div>
+          <div id="landmark-panel">
+            <button id="landmarksBtn" class="btn" disabled>List named places in the area</button>
+            <div id="landmark-results"></div>
+          </div>
+        </section>
+      </div>
+
+      <div class="side-panel" role="tabpanel" id="tabPanelAdvanced" data-master="map" data-tab="advanced" hidden>
+        <section id="advanced">
+          <div class="advanced-head">
+            <h2>More settings</h2>
+            <button type="button" id="resetSettings" class="icon-btn" title="Reset" aria-label="Reset">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                      d="M13.2 8a5.2 5.2 0 1 1-1.5-3.6"/>
+                <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                      d="M13.2 2.6V5.4H10.4"/>
+              </svg>
+            </button>
+          </div>
+          <div id="advanced-body">
+            <!-- Filled from /api/settings so the page never holds a second,
+                 drifting copy of the limits. -->
+          </div>
+        </section>
+      </div>
+
+      <div class="side-panel" role="tabpanel" id="tabPanelGenerate" data-master="build" data-tab="generate" hidden>
+        <section>
+          <button id="generateBtn" class="btn btn-primary" disabled>Generate map</button>
+          <div id="status"></div>
+          <p id="downloadEmpty" class="hint">Nothing to download yet. Generate a map first.</p>
+          <div id="downloadReady" hidden>
+            <a id="downloadAll" class="btn" download>Download everything (.zip)</a>
+            <div id="saveNote" class="hint"></div>
+            <button id="makePictures" class="btn" type="button" hidden>Draw a picture of it</button>
+            <div id="pictureNote" class="hint"></div>
+            <div id="pictureShots" class="shots" hidden></div>
+            <details id="downloads-details">
+              <summary>Single files</summary>
+              <ul id="downloads"></ul>
+            </details>
+          </div>
+        </section>
+      </div>
+
+      <div class="side-panel" role="tabpanel" id="tabPanelBuild" data-master="build" data-tab="build" hidden>
+        <div class="pipe-card" data-step="buildings">
+          <div class="pipe-body">
+            <div class="pipe-title">Buildings</div>
+            <span id="buildingsNote" class="step-note">Makes a furnished building for every footprint.</span>
+            <div class="bar bar-indet"><div class="bar-fill"></div></div>
+            <div id="census" class="census" hidden>
+              <div class="census-head">Population</div>
+              <div class="tiles census-tiles" id="censusTiles"></div>
+              <div class="census-official" id="censusOfficial"></div>
+              <div class="census-actions">
+                <button id="recountBtn" class="btn btn-small" type="button">Recount</button>
+                <span id="censusNote" class="step-note">Change the zombie settings under Advanced,
+                  then recount. No need to rebuild.</span>
+              </div>
+            </div>
+          </div>
+          <button id="buildingsBtn" class="btn">Build</button>
+          <button class="btn btn-small btn-stop" data-stop hidden>Stop</button>
         </div>
-        <button type="button" id="resetSettings" class="linkish">Reset to the defaults for this kind of place</button>
-      </details>
+      </div>
 
-      <details id="steamLibraries">
-        <summary>Steam libraries</summary>
-        <p class="hint">Where KnoxMap looks for the game and Workshop mods. They are found on
-          their own; if yours are on a drive that was missed, name it here.</p>
-        <ul class="setup-list" id="steamList"></ul>
-        <label class="field">Other drives or folders (separated by ;)
-          <input type="text" id="steamFolders" placeholder="E: or E:\Games\Steam"/>
-        </label>
-        <button type="button" id="steamSave" class="btn">Save and look again</button>
-        <div id="steamNote" class="hint"></div>
-      </details>
-    </section>
+      <div class="side-panel" role="tabpanel" id="tabPanelEdit" data-master="build" data-tab="edit" hidden>
+        <section>
+          <p class="hint">Editing tools will go here.</p>
+        </section>
+      </div>
 
-    <section class="panel" data-card="generate">
-      <button id="generateBtn" class="btn btn-primary" disabled>Generate map</button>
-      <div id="status"></div>
-    </section>
+      <div class="side-panel" role="tabpanel" id="tabPanelExport" data-master="build" data-tab="export" hidden>
+        <div class="pipe-card" data-step="compile">
+          <div class="pipe-body">
+            <div class="pipe-title">Compile</div>
+            <span id="compileNote" class="step-note">Turns the map into the game's files with WorldEd.
+              Takes a few minutes.</span>
+            <div class="bar"><div id="compileBar" class="bar-fill"></div></div>
+            <button id="retryCellsBtn" class="btn btn-small" hidden>Compile the cells that failed</button>
+            <details class="manual-fallback">
+              <summary>Or do it yourself in WorldEd</summary>
+              <button id="worldedBtn" class="btn btn-small" disabled>Open in WorldEd</button>
+              <span id="worldedNote" class="step-note">Then
+                <b>File → BMP To TMX → All Cells…</b> and
+                <b>File → Generate Lots 8x8 → All Cells…</b></span>
+            </details>
+          </div>
+          <button id="compileBtn" class="btn" disabled>Compile</button>
+          <button class="btn btn-small btn-stop" data-stop hidden>Stop</button>
+        </div>
+        <div class="pipe-card" data-step="install">
+          <div class="pipe-body">
+            <div class="pipe-title">Install</div>
+            <div class="install-row">
+              <label>Name in game <input type="text" id="mapTitle"/></label>
+              <label>Mod id <input type="text" id="modId"/></label>
+            </div>
+            <span id="installNote" class="step-note">Copies the map into your Zomboid mods folder.</span>
+          </div>
+          <button id="installBtn" class="btn" disabled>Install</button>
+        </div>
+      </div>
+    </div>
+    </div>
   </aside>
 </main>
 
