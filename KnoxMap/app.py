@@ -24,9 +24,10 @@ from flask import (Flask, jsonify, render_template, request, send_file,
                    send_from_directory)
 
 import knoxlog
+import knoxpaths
 import knoxstop
-from generator import osm, places, renderer
-from knoxbuild import mapstate
+from generator import localosm, osm, places, renderer
+from knoxbuild import mapstate, modgrid
 from knoxbuild.settings import PRESETS, Settings
 
 # Builds print place names in any script; a console on a legacy code page
@@ -748,113 +749,148 @@ def generate():
     settings = Settings.from_dict(data.get("settings"))
     _save_settings(map_dir, settings)
 
-    # What to download. A map turned to its street grid (see
-    # renderer.dominant_road_angle) reaches past the drawn box at its corners,
-    # and the angle is only known once the streets are in. This used to fetch
-    # the box, measure the angle, then fetch the turned map's bounds as well -
-    # the same town twice over, about 2.4 times the data. Now one download
-    # covers the map at any angle: the circle round it, as a box.
+    # The daily extracts have to cover the map at any turn, because the street
+    # angle is only known once the roads are in. One regional file serves
+    # every mod cut from this selection.
     turned = bool(settings.align_streets) or bool(settings.rotate_degrees)
-    if turned:
-        fetch_box = renderer.cover_bbox(south, west, north, east, meters_per_tile)
-        cache = osm.cache_path(str(map_dir), f"{map_name}_turned")
-    else:
-        fetch_box = bbox
-        cache = osm.cache_path(str(map_dir), map_name)
+    fetch_box = (renderer.cover_bbox(south, west, north, east, meters_per_tile)
+                 if turned else bbox)
+    _set_progress(map_name, stage="regions", done=0, total=1,
+                  message="Checking daily map extracts")
 
-    # Regenerating the same area is the common case - it is how a map gets
-    # re-rendered after the ground or road rules change - and a town's worth of
-    # Overpass tiles takes minutes to download every time. The reply is kept on
-    # disk and reused whenever the bbox matches to the metre.
-    features = osm.load_cache(cache, fetch_box)
-    if features is None:
-        _set_progress(map_name, stage="osm", done=0, total=1)
-        def _progress(i, total):
-            _set_progress(map_name, stage="osm", done=i - 1, total=total)
-
-        try:
-            # Always through the tiled path, even for a small area: with one
-            # tile it is the same single request, and it brings the retry that
-            # quarters a bbox the servers call too heavy.
-            features = osm.fetch_features_tiled(
-                *fetch_box, max_tile_km2=OVERPASS_TILE_KM2, progress=_progress,
-                should_stop=_stopper(map_name))
-        except knoxstop.Stopped:
-            return _stopped(map_name, "generate")
-        except Exception as exc:  # Overpass can be flaky — surface that clearly
-            _set_progress(map_name, stage="error", message=str(exc))
-            return failed(f"OSM query failed: {exc}", 502, exc)
-        try:
-            osm.save_cache(cache, fetch_box, features)
-        except OSError:
-            pass  # a map that cannot be cached still renders
-
-    # Buildings Overture has and OpenStreetMap has not, before anything is
-    # measured from them: they are ordinary building features from here on,
-    # so the street angle, the ground, the gardens and the .tbx all see them
-    # exactly as they see a mapped one (generator/overture.py).
-    gaps = {"added": 0}
-    if settings.fill_gaps:
-        from generator import overture
-        _set_progress(map_name, stage="overture", done=0, total=1)
-        try:
-            features, gaps = overture.add_missing(
-                features, fetch_box, str(map_dir), map_name,
-                should_stop=_stopper(map_name))
-        except knoxstop.Stopped:
-            return _stopped(map_name, "generate")
-        except Exception as exc:  # noqa: BLE001 - OSM alone still makes a map
-            log.warning("overture %s: %s", map_name, exc)
-            gaps = {"added": 0, "error": str(exc)}
-        if gaps.get("added"):
-            log.info("overture %s: %d buildings OSM had not got, from %d fetched",
-                     map_name, gaps["added"], gaps.get("fetched", 0))
-
-    rotation = 0.0
-    if settings.align_streets:
-        angle, strength = renderer.dominant_road_angle(features, *bbox)
-        if strength >= renderer.ALIGN_MIN_STRENGTH and abs(angle) >= 0.5:
-            rotation = -angle
-    # And whatever turn the mapper asked for on top of that.
-    rotation += float(settings.rotate_degrees)
-    osm_cache_name = Path(cache).name
-    osm_bbox = fetch_box
-
-    osm_time = time.time() - t0
-    _set_progress(map_name, stage="render", features=len(features))
+    def _region_progress(name, index, total):
+        _set_progress(map_name, stage="regions", done=index - 1, total=total,
+                      message="Checking daily map extracts", detail=name)
 
     try:
-        result = renderer.render(
-            features, south, west, north, east,
-            meters_per_tile=meters_per_tile,
-            output_dir=str(map_dir),
-            map_name=map_name,
-            spawn_density=settings.spawn_density,
-            tree_density=settings.tree_density,
-            rotation=rotation,
-            osm_cache=osm_cache_name,
-            osm_bbox=osm_bbox,
-            shape=shape,
-            straight_roads=bool(settings.straight_roads),
-            should_stop=_stopper(map_name),
-        )
+        regions = localosm.ensure_regions(
+            str(BASE_DIR), *fetch_box, progress=_region_progress,
+            should_stop=_stopper(map_name))
+    except knoxstop.Stopped:
+        return _stopped(map_name, "generate")
+    except Exception as exc:
+        _set_progress(map_name, stage="error", message=str(exc))
+        return failed(f"OSM query failed: {exc}", 502, exc)
+
+    rotation = float(settings.rotate_degrees)
+    if settings.align_streets:
+        try:
+            highways = localosm.features_for_bbox(
+                str(BASE_DIR), regions, *bbox, highways_only=True,
+                should_stop=_stopper(map_name))
+        except knoxstop.Stopped:
+            return _stopped(map_name, "generate")
+        except Exception as exc:
+            _set_progress(map_name, stage="error", message=str(exc))
+            return failed(f"OSM query failed: {exc}", 502, exc)
+        angle, strength = renderer.dominant_road_angle(highways, *bbox)
+        if strength >= renderer.ALIGN_MIN_STRENGTH and abs(angle) >= 0.5:
+            rotation = -angle + float(settings.rotate_degrees)
+        del highways
+
+    from knoxbuild.world import CELL_SIZE, choose_origin
+    parent = renderer.Projector.build(
+        south, west, north, east, meters_per_tile, rotation)
+    tiles = modgrid.plan(parent.width, parent.height)
+    cells_x, cells_y = parent.cell_grid()
+    pack_origin = choose_origin(str(map_dir), cells_x, cells_y)
+    step = modgrid.mod_side_tiles() // CELL_SIZE
+    planned = []
+    for tile in tiles:
+        planned.append({
+            "name": modgrid.mod_name(map_name, tile.row, tile.col),
+            "row": tile.row, "col": tile.col,
+            "world_origin": [pack_origin[0] + tile.col * step,
+                             pack_origin[1] + tile.row * step],
+        })
+    old = modgrid.read_pack(str(map_dir)) or {}
+    keep = {item["name"] for item in planned}
+    for item in old.get("mods") or []:
+        stale = item.get("name")
+        if isinstance(stale, str) and stale not in keep:
+            leftover = OUTPUT_DIR / stale
+            if leftover.is_dir():
+                import shutil
+                shutil.rmtree(leftover, ignore_errors=True)
+    modgrid.write_pack(str(map_dir / "pack.json"), map_name, pack_origin,
+                       cells_x, cells_y, planned)
+
+    gaps = {"added": 0}
+    feature_total = 0
+    result = None
+    shown_result = None
+    shown = planned[0]["name"]
+    osm_time = time.time() - t0
+    try:
+        for index, (tile, record) in enumerate(zip(tiles, planned), start=1):
+            knoxstop.check(_stopper(map_name), "the download")
+            _set_progress(map_name, stage="mod", done=index - 1, total=len(tiles),
+                          message="Drawing a map piece",
+                          detail=f"{record['name']} ({index} of {len(tiles)})")
+            window = parent.window(tile.x0, tile.y0, tile.tiles_w, tile.tiles_h)
+            piece = window.latlon_bbox()
+            features = localosm.features_for_bbox(
+                str(BASE_DIR), regions, *piece, should_stop=_stopper(map_name))
+            piece_gaps = {"added": 0}
+            if settings.fill_gaps:
+                from generator import overture
+                _set_progress(map_name, stage="overture", done=index - 1,
+                              total=len(tiles))
+                try:
+                    features, piece_gaps = overture.add_missing(
+                        features, piece, str(OUTPUT_DIR / record["name"]), record["name"],
+                        should_stop=_stopper(map_name))
+                except knoxstop.Stopped:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - OSM alone still makes a map
+                    log.warning("overture %s: %s", record["name"], exc)
+                    piece_gaps = {"added": 0, "error": str(exc)}
+            gaps["added"] = gaps.get("added", 0) + piece_gaps.get("added", 0)
+            if piece_gaps.get("error") and not gaps.get("error"):
+                gaps["error"] = piece_gaps["error"]
+            feature_total += len(features)
+            mod_dir = OUTPUT_DIR / record["name"]
+            mod_dir.mkdir(parents=True, exist_ok=True)
+            _save_settings(mod_dir, settings)
+            result = renderer.render(
+                features, piece[0], piece[1], piece[2], piece[3],
+                meters_per_tile=meters_per_tile,
+                output_dir=str(mod_dir),
+                map_name=record["name"],
+                spawn_density=settings.spawn_density,
+                tree_density=settings.tree_density,
+                rotation=rotation,
+                osm_bbox=fetch_box,
+                shape=shape,
+                straight_roads=bool(settings.straight_roads),
+                should_stop=_stopper(map_name),
+                proj=window,
+            )
+            _stamp_mod(mod_dir, record, map_name)
+            _write_readme(mod_dir, record["name"], result)
+            if shown_result is None:
+                shown_result = result
+            del features
     except knoxstop.Stopped:
         return _stopped(map_name, "generate")
     except MemoryError:
-        # Nothing refuses a big map any more, so this is where one that really
-        # was too big lands. Say what it would have taken rather than a
-        # traceback: the numbers are the ones the window already showed.
-        need = approx_w * approx_h * BYTES_PER_TILE + BASE_BYTES
+        need = modgrid.mod_side_tiles() ** 2 * BYTES_PER_TILE + BASE_BYTES
         _set_progress(map_name, stage="error", message="ran out of memory")
         return failed(
-            f"The map ran out of memory while it was being drawn. It needs about "
-            f"{need / 1e9:.1f} GB for the ground and the greenery alone, at "
-            f"{int(approx_w)}x{int(approx_h)} tiles. Close a few things and try "
-            f"again, or draw it at a larger scale - 2 m a tile is a quarter of "
-            f"the memory of 1 m. Everything downloaded is kept, so a second run "
-            f"starts from the OpenStreetMap data already on disk.", 507)
+            f"A map piece ran out of memory while it was being drawn. One piece "
+            f"needs about {need / 1e9:.1f} GB. Close a few things and try again. "
+            f"The daily extracts stay on disk, so the next run does not download "
+            f"them again.", 507)
+    except Exception as exc:
+        log.exception("generate %s", map_name)
+        _set_progress(map_name, stage="error", message=str(exc))
+        return failed(str(exc), 500, exc)
 
-    _write_readme(map_dir, map_name, result)
+    _write_parent_info(map_dir, map_name, parent, rotation, planned, regions,
+                       bbox, shape, meters_per_tile, feature_total, gaps)
+    if shown_result is not None:
+        result = shown_result
+        _write_readme(map_dir, map_name, result)
     _set_progress(map_name, stage="done")
     mapstate.stamp(str(map_dir), "generate")
     from_addresses = 0
@@ -863,18 +899,24 @@ def generate():
             from_addresses = json.load(f).get("houses_from_addresses", 0)
     except (OSError, ValueError):
         pass
-    log.info("generate %s: done, %d features, %dx%d tiles, rotation %.1f, "
-             "%d houses from addresses, %d from Overture, %.1fs (download %.1fs)",
-             map_name, len(features), result.width, result.height, rotation,
-             from_addresses, gaps.get("added", 0), time.time() - t0, osm_time)
+    log.info("generate %s: done, %d features, %d mods, %dx%d tiles each, "
+             "rotation %.1f, %d houses from addresses, %d from Overture, "
+             "%.1fs (download %.1fs)",
+             map_name, feature_total, len(planned), result.width, result.height,
+             rotation, from_addresses, gaps.get("added", 0),
+             time.time() - t0, osm_time)
 
     return jsonify({
         "mapName": map_name,
         "width": result.width,
         "height": result.height,
-        "cellsX": result.cells_x,
-        "cellsY": result.cells_y,
-        "featureCount": len(features),
+        "cellsX": cells_x,
+        "cellsY": cells_y,
+        "featureCount": feature_total,
+        "modCount": len(planned),
+        "modTiles": modgrid.mod_side_tiles(),
+        "modCells": modgrid.MOD_CELLS,
+        "regions": [region.name for region in regions],
         "rotation": round(rotation, 1),
         "osmSeconds": round(osm_time, 2),
         # What Overture put in that OpenStreetMap had not got, so the window
@@ -885,16 +927,57 @@ def generate():
         "fromOverture": gaps.get("added", 0),
         "overtureError": gaps.get("error") or gaps.get("why") or "",
         "files": {
-            "landscape": f"/output/{map_name}/{Path(result.landscape_path).name}",
-            "vegetation": f"/output/{map_name}/{Path(result.vegetation_path).name}",
-            "spawn": f"/output/{map_name}/{Path(result.spawn_map_path).name}",
-            "preview": f"/output/{map_name}/{Path(result.preview_path).name}",
-            "buildings": f"/output/{map_name}/{Path(result.buildings_geojson_path).name}",
-            "meta": f"/output/{map_name}/{Path(result.meta_path).name}",
+            "landscape": f"/output/{shown}/{Path(result.landscape_path).name}",
+            "vegetation": f"/output/{shown}/{Path(result.vegetation_path).name}",
+            "spawn": f"/output/{shown}/{Path(result.spawn_map_path).name}",
+            "preview": f"/output/{shown}/{Path(result.preview_path).name}",
+            "buildings": f"/output/{shown}/{Path(result.buildings_geojson_path).name}",
+            "meta": f"/output/{map_name}/{map_name}_info.json",
             "zip": f"/download/{map_name}.zip",
             "readme": f"/output/{map_name}/README.txt",
         },
     })
+
+
+def _stamp_mod(mod_dir: Path, record: dict, parent: str) -> None:
+    """Remember which pack this piece belongs to, and the cell it occupies."""
+    path = mod_dir / f"{record['name']}_info.json"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            info = json.load(fh)
+    except (OSError, ValueError):
+        return
+    info["role"] = "mod"
+    info["pack"] = parent
+    info["world_origin"] = record["world_origin"]
+    info["mod_row"] = record["row"]
+    info["mod_col"] = record["col"]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(info, fh, indent=2)
+
+
+def _write_parent_info(map_dir: Path, map_name: str, parent, rotation: float,
+                       planned: list[dict], regions, box, shape,
+                       meters_per_tile: float, feature_total: int, gaps: dict) -> None:
+    cells_x, cells_y = parent.cell_grid()
+    info = {
+        "map_name": map_name,
+        "role": "pack",
+        "bbox": {"south": box[0], "west": box[1], "north": box[2], "east": box[3]},
+        "rotation": rotation,
+        "shape": shape,
+        "meters_per_tile": meters_per_tile,
+        "width_tiles": parent.width,
+        "height_tiles": parent.height,
+        "cells_x": cells_x,
+        "cells_y": cells_y,
+        "feature_count": feature_total,
+        "from_overture": gaps.get("added", 0),
+        "regions": [region.name for region in regions],
+        "mods": planned,
+    }
+    with open(map_dir / f"{map_name}_info.json", "w", encoding="utf-8") as fh:
+        json.dump(info, fh, indent=2)
 
 
 def _map_summary(map_dir: Path) -> dict:
@@ -930,16 +1013,27 @@ def _map_summary(map_dir: Path) -> dict:
         "stages": {k: v.get("version") for k, v in stages.items()},
         "needs": needs,
         "needsLabels": [mapstate.LABELS[s] for s in needs],
-        "files": {
-            "landscape": f"/output/{map_dir.name}/{map_dir.name}.bmp",
-            "vegetation": f"/output/{map_dir.name}/{map_dir.name}_veg.bmp",
-            "spawn": f"/output/{map_dir.name}/{map_dir.name}_ZombieSpawnMap.bmp",
-            "preview": f"/output/{map_dir.name}/{map_dir.name}_preview.png",
-            "buildings": f"/output/{map_dir.name}/{map_dir.name}_buildings.geojson",
-            "meta": f"/output/{map_dir.name}/{map_dir.name}_info.json",
-            "zip": f"/download/{map_dir.name}.zip",
-            "readme": f"/output/{map_dir.name}/README.txt",
-        },
+        "role": info.get("role") or "",
+        "modCount": len(info.get("mods") or []),
+        "regions": info.get("regions") or [],
+        "files": _summary_files(map_dir, info),
+    }
+
+
+def _summary_files(map_dir: Path, info: dict) -> dict:
+    """File URLs for a map. A pack shows its first piece; the meta stays
+    with the pack."""
+    mods = info.get("mods") or []
+    shown = mods[0]["name"] if mods and isinstance(mods[0], dict) else map_dir.name
+    return {
+        "landscape": f"/output/{shown}/{shown}.bmp",
+        "vegetation": f"/output/{shown}/{shown}_veg.bmp",
+        "spawn": f"/output/{shown}/{shown}_ZombieSpawnMap.bmp",
+        "preview": f"/output/{shown}/{shown}_preview.png",
+        "buildings": f"/output/{shown}/{shown}_buildings.geojson",
+        "meta": f"/output/{map_dir.name}/{map_dir.name}_info.json",
+        "zip": f"/download/{map_dir.name}.zip",
+        "readme": f"/output/{map_dir.name}/README.txt",
     }
 
 
@@ -1036,6 +1130,23 @@ def _worlded_exe(cli: bool = False) -> Path | None:
     return knoxpaths.worlded_cli() if cli else knoxpaths.worlded_gui()
 
 
+def _pack_mod_dirs(map_dir: Path) -> list[Path]:
+    """The pieces of a pack, in the order they were drawn. Empty for a map
+    that is already a single piece."""
+    data = modgrid.read_pack(str(map_dir))
+    if not data:
+        return []
+    found = []
+    for item in data.get("mods") or []:
+        name = item.get("name") if isinstance(item, dict) else None
+        if not isinstance(name, str):
+            continue
+        path = (OUTPUT_DIR / name).resolve()
+        if str(path).startswith(str(OUTPUT_DIR.resolve())) and path.is_dir():
+            found.append(path)
+    return found
+
+
 def _map_dir(map_name: str) -> Path | None:
     # A page sends null here before any map exists; that is "no such map",
     # not a crash.
@@ -1059,28 +1170,34 @@ def api_buildings():
         return jsonify({"error": "Unknown map."}), 404
     settings = Settings.from_dict(data.get("settings"))         if data.get("settings") else _load_settings(map_dir)
     _save_settings(map_dir, settings)
-    log.info("buildings %s: started", map_dir.name)
+    targets = _pack_mod_dirs(map_dir) or [map_dir]
+    log.info("buildings %s: started (%d piece%s)", map_dir.name, len(targets),
+             "" if len(targets) == 1 else "s")
     t0 = time.time()
     out = io.StringIO()
+    total = 0
     try:
         from contextlib import redirect_stdout
-        with redirect_stdout(out):
-            build_buildings(str(map_dir), settings=settings,
-                            should_stop=_stopper(map_dir.name))
+        for target in targets:
+            _save_settings(target, settings)
+            with redirect_stdout(out):
+                build_buildings(str(target), settings=settings,
+                                should_stop=_stopper(map_dir.name))
+            total += len(list((target / "buildings").glob("*.tbx")))
+            mapstate.stamp(str(target), "build")
     except knoxstop.Stopped:
         return _stopped(map_dir.name, "buildings")
     except Exception as exc:
         log.info("buildings %s output before the error:\n%s", map_dir.name,
                  out.getvalue()[-4000:])
         return failed(f"Building generation failed: {exc}", 500, exc)
-    tbx = sorted((map_dir / "buildings").glob("*.tbx"))
     mapstate.stamp(str(map_dir), "build")
-    log.info("buildings %s: %d files in %.1fs\n%s", map_dir.name, len(tbx),
+    log.info("buildings %s: %d files in %.1fs\n%s", map_dir.name, total,
              time.time() - t0, out.getvalue()[-3000:])
-    return jsonify({"count": len(tbx),
-                    "pzw": f"{map_dir.name}.pzw",
+    return jsonify({"count": total,
+                    "pzw": f"{targets[-1].name}.pzw",
                     "settings": settings.to_dict(),
-                    "population": _population(map_dir)})
+                    "population": _population(targets[-1])})
 
 
 def _population(map_dir: Path) -> dict | None:
@@ -1348,16 +1465,27 @@ def api_compile_status():
         return jsonify({"error": "Unknown map."}), 404
     with _PROGRESS_LOCK:
         state = dict(_COMPILE.get(map_dir.name, {"state": "idle"}))
-    lots = map_dir / "lots"
-    state["cells"] = len(list(lots.glob("*.lotheader"))) if lots.is_dir() else 0
+    pieces = _pack_mod_dirs(map_dir) or [map_dir]
+    cells = 0
+    tmx = 0
+    failed = []
+    from tools.compile_map import failed_cells
+    for piece in pieces:
+        lots = piece / "lots"
+        if lots.is_dir():
+            cells += len(list(lots.glob("*.lotheader")))
+        tmx_dir = piece / "tmx"
+        if tmx_dir.is_dir():
+            tmx += len(list(tmx_dir.glob("*.tmx")))
+        for item in failed_cells(piece):
+            failed.append({**item, "mod": piece.name})
+    state["cells"] = cells
     state["expected"] = _expected_cells(map_dir)
-    state["tmx"] = len(list((map_dir / "tmx").glob("*.tmx"))) \
-        if (map_dir / "tmx").is_dir() else 0
+    state["tmx"] = tmx
     # Cells the last compile tried three times and could not do. It steps over
     # them rather than throwing away the hours already spent, so this is how
     # the window knows to offer them again instead of saying "done".
-    from tools.compile_map import failed_cells
-    state["failed"] = failed_cells(map_dir)
+    state["failed"] = failed
     return jsonify(state)
 
 
@@ -1380,8 +1508,8 @@ def api_compile():
         return jsonify({"error": "Patched PZWorldEd_cli.exe not found — use "
                                  "Open in WorldEd and run the two menu "
                                  "commands instead."}), 400
-    pzw = map_dir / f"{map_dir.name}.pzw"
-    if not pzw.exists():
+    targets = _pack_mod_dirs(map_dir) or [map_dir]
+    if any(not (piece / f"{piece.name}.pzw").exists() for piece in targets):
         return jsonify({"error": "No .pzw yet — generate the buildings first."}), 400
 
     # "Compile the cells that failed" rather than the whole town again. A full
@@ -1389,12 +1517,13 @@ def api_compile():
     # one of them to find that out, and on a big map that is minutes before it
     # reaches the handful that matter.
     from tools.compile_map import failed_cells
-    only = [f["cells"] for f in failed_cells(map_dir)] if data.get("onlyFailed") else None
-    if data.get("onlyFailed") and not only:
+    only_failed = bool(data.get("onlyFailed"))
+    if only_failed and not any(failed_cells(piece) for piece in targets):
         return jsonify({"error": "Nothing is recorded as failed."}), 400
 
-    (map_dir / "tmx").mkdir(exist_ok=True)
-    (map_dir / "lots").mkdir(exist_ok=True)
+    for piece in targets:
+        (piece / "tmx").mkdir(exist_ok=True)
+        (piece / "lots").mkdir(exist_ok=True)
 
     name = map_dir.name
     with _PROGRESS_LOCK:
@@ -1421,13 +1550,21 @@ def api_compile():
                 _COMPILE[name] = {"state": "running", "error": None,
                                   "batch": done, "batches": total}
 
-        log.info("compile %s: started", name)
+        log.info("compile %s: started (%d piece%s)", name, len(targets),
+                 "" if len(targets) == 1 else "s")
         t0 = time.time()
         try:
-            produced = compiler.compile_map(str(map_dir), batch=COMPILE_BATCH,
-                                            exe=str(exe), on_progress=note,
-                                            should_stop=_stopper(name),
-                                            only_cells=only)
+            produced = 0
+            for piece in targets:
+                only = ([item["cells"] for item in compiler.failed_cells(piece)]
+                        if only_failed else None)
+                if only_failed and not only:
+                    continue
+                produced += compiler.compile_map(str(piece), batch=COMPILE_BATCH,
+                                                exe=str(exe), on_progress=note,
+                                                should_stop=_stopper(name),
+                                                only_cells=only)
+                mapstate.stamp(str(piece), "compile")
             if not produced:
                 eid = knoxlog.record(None, f"compile {name}: produced no cells")
                 with _PROGRESS_LOCK:
@@ -1438,7 +1575,9 @@ def api_compile():
             # A compile that stepped over a batch is finished but not whole:
             # installing it gives a map with a hole in it, so the window is
             # told what is missing rather than a plain "done".
-            left = compiler.failed_cells(str(map_dir))
+            left = []
+            for piece in targets:
+                left.extend(compiler.failed_cells(str(piece)))
             with _PROGRESS_LOCK:
                 mapstate.stamp(str(map_dir), "compile")
                 _COMPILE[name] = {"state": "done", "error": None, "failed": left}
@@ -1458,7 +1597,9 @@ def api_compile():
             with _PROGRESS_LOCK:
                 _COMPILE[name] = {"state": "error", "errorId": eid, "error": str(exc)}
 
-    threading.Thread(target=worker, daemon=True).start()
+    thread = threading.Thread(target=worker, daemon=True)
+    _JOB_THREADS.append(thread)
+    thread.start()
     return jsonify({"started": True, "expected": _expected_cells(map_dir)})
 
 
@@ -1468,9 +1609,13 @@ def api_lots():
     map_dir = _map_dir(request.args.get("map", ""))
     if map_dir is None:
         return jsonify({"error": "Unknown map."}), 404
-    lots = map_dir / "lots"
-    cells = sorted(lots.glob("*.lotheader")) if lots.is_dir() else []
-    return jsonify({"compiled": bool(cells), "cells": len(cells)})
+    pieces = _pack_mod_dirs(map_dir) or [map_dir]
+    cells = 0
+    for piece in pieces:
+        lots = piece / "lots"
+        if lots.is_dir():
+            cells += len(list(lots.glob("*.lotheader")))
+    return jsonify({"compiled": bool(cells), "cells": cells})
 
 
 @app.route("/api/install", methods=["POST"])
@@ -1489,17 +1634,30 @@ def api_install():
              else map_dir.name).strip()[:80]
     mod_id = SAFE_NAME.sub("_", raw_id if isinstance(raw_id, str) and raw_id.strip()
                            else map_dir.name).strip("_")[:60] or map_dir.name[:60]
+    targets = _pack_mod_dirs(map_dir) or [map_dir]
+    installed = []
+    n_cells = 0
+    extras: list = []
     try:
-        mod_root, n_cells, extras = make_map_mod.package(
-            str(map_dir), title, mod_id)
+        for index, piece in enumerate(targets):
+            piece_title = title if len(targets) == 1 else f"{title} {index + 1}"
+            piece_id = mod_id if len(targets) == 1 else f"{mod_id}_{index + 1}"
+            mod_root, cells, piece_extras = make_map_mod.package(
+                str(piece), piece_title, piece_id)
+            installed.append(str(mod_root))
+            n_cells += cells
+            extras.extend(piece_extras or [])
+            mapstate.stamp(str(piece), "install")
     except FileNotFoundError as exc:
         return failed(str(exc), 400, exc)
     except Exception as exc:
         return failed(f"Install failed: {exc}", 500, exc)
     mapstate.stamp(str(map_dir), "install")
-    log.info("install %s: %d cells as %s, extras %s", map_dir.name, n_cells, mod_id, extras)
-    return jsonify({"modRoot": str(mod_root), "cells": n_cells,
-                    "extras": extras, "modId": mod_id, "title": title})
+    log.info("install %s: %d cells across %d mods as %s, extras %s",
+             map_dir.name, n_cells, len(installed), mod_id, extras)
+    return jsonify({"modRoot": installed[-1], "cells": n_cells,
+                    "extras": extras, "modId": mod_id, "title": title,
+                    "mods": len(installed)})
 
 
 def _bbox_area_km2(south: float, west: float, north: float, east: float) -> float:

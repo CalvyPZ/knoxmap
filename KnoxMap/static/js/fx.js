@@ -94,7 +94,7 @@ const fx = (() => {
       const el = $('#gen-overlay');
       el.hidden = false;
       $('.gen-kicker', el).textContent = 'Generating terrain';
-      $('#gen-stage').textContent = 'Contacting OpenStreetMap…';
+      $('#gen-stage').textContent = 'Checking daily map extracts…';
       $('#gen-detail').textContent = '';
       $('#gen-bar').style.width = '4%';
       started = Date.now();
@@ -105,12 +105,18 @@ const fx = (() => {
       }, 500);
     },
     update(p) {
-      if (p.stage === 'osm') {
+      if (p.stage === 'osm' || p.stage === 'regions') {
         const total = p.total || 1;
         const done = p.done || 0;
-        $('#gen-stage').textContent = 'Downloading map data';
-        $('#gen-detail').textContent = total > 1 ? `Part ${done + 1} of ${total}` : '';
-        $('#gen-bar').style.width = `${Math.max(6, Math.round(8 + 62 * done / total))}%`;
+        $('#gen-stage').textContent = p.message || 'Checking daily map extracts';
+        $('#gen-detail').textContent = p.detail || (total > 1 ? `Part ${done + 1} of ${total}` : '');
+        $('#gen-bar').style.width = `${Math.max(6, Math.round(8 + 40 * done / total))}%`;
+      } else if (p.stage === 'mod') {
+        const total = p.total || 1;
+        const done = p.done || 0;
+        $('#gen-stage').textContent = 'Drawing a map piece';
+        $('#gen-detail').textContent = p.detail || `Piece ${done + 1} of ${total}`;
+        $('#gen-bar').style.width = `${Math.max(48, Math.round(48 + 34 * done / total))}%`;
       } else if (p.stage === 'render') {
         $('#gen-stage').textContent = 'Drawing the terrain';
         $('#gen-detail').textContent = `${(p.features || 0).toLocaleString()} features`;

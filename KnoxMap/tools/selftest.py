@@ -1281,9 +1281,9 @@ def check_no_size_wall(check, work: str) -> None:
         raise Reached("got as far as the download")
 
     client = knoxapp.app.test_client()
-    was_fetch = knoxapp.osm.fetch_features_tiled
+    was_fetch = knoxapp.localosm.ensure_regions
     was_out = knoxapp.OUTPUT_DIR
-    knoxapp.osm.fetch_features_tiled = no_download
+    knoxapp.localosm.ensure_regions = no_download
     knoxapp.OUTPUT_DIR = Path(work) / "huge-maps"
     knoxapp.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -1305,7 +1305,7 @@ def check_no_size_wall(check, work: str) -> None:
         else:
             check(True, "but a scale of zero, a negative one or a silly one is not")
     finally:
-        knoxapp.osm.fetch_features_tiled = was_fetch
+        knoxapp.localosm.ensure_regions = was_fetch
         knoxapp.OUTPUT_DIR = was_out
 
     check(knoxapp.BIG_AREA_KM2 > 0 and knoxapp.BIG_TILES_PER_SIDE > 0
