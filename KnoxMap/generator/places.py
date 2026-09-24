@@ -27,7 +27,8 @@ HEADERS = {
 # Nominatim's public server is shared and has a usage policy every client must
 # follow: https://operations.osmfoundation.org/policies/nominatim/
 # One request a second (see _throttle), a real User-Agent (HEADERS), results
-# cached (app.py), no autocomplete (the page searches only on Enter), no bulk use.
+# cached (app.py), no bulk use. The page waits briefly after typing before it
+# searches, and a newer query replaces one still in flight.
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",

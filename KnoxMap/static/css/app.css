@@ -170,14 +170,21 @@ input[readonly] { background: var(--bg); color: var(--muted); }
 
 /* ---- map overlays ------------------------------------------------------------------ */
 #search-box {
-  position: absolute; z-index: 1000; top: 10px; left: 56px; width: min(420px, calc(100% - 180px));
+  position: absolute; z-index: 1000; top: 10px; left: 56px; width: min(390px, calc((100% - 180px) * 0.75));
   background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 6px;
   box-shadow: var(--shadow);
 }
-#search-box input[type="search"] { border: 0; padding: 4px 6px; background: transparent; }
+.search-field { display: flex; align-items: center; gap: 8px; }
+#search-box input[type="search"] {
+  flex: 1; min-width: 0; width: auto; border: 0; padding: 4px 6px; background: transparent;
+}
 #search-box input[type="search"]:focus { outline: none; }
-.search-scope { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); padding: 2px 6px 0; }
-.search-scope input { width: auto; margin: 0; }
+.search-scope {
+  display: flex; align-items: center; gap: 5px; flex: none;
+  font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer;
+  user-select: none; padding-left: 8px; border-left: 1px solid var(--line);
+}
+.search-scope input { width: auto; margin: 0; cursor: pointer; }
 #search-results { list-style: none; margin: 6px 0 0; padding: 0; max-height: 320px; overflow-y: auto; border-top: 1px solid var(--line); }
 #search-results li { padding: 6px; display: flex; flex-wrap: wrap; gap: 2px 8px; align-items: baseline; cursor: pointer; border-bottom: 1px solid var(--line); }
 #search-results li:hover { background: var(--hover); }

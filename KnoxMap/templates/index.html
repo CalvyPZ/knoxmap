@@ -39,11 +39,14 @@
 <main>
   <section id="map-pane">
     <div id="search-box">
-      <input id="searchInput" type="search" autocomplete="off"
-             placeholder="Search for a place and press Enter" />
-      <label class="search-scope">
-        <input type="checkbox" id="searchHere" /> in this view
-      </label>
+      <div class="search-field">
+        <input id="searchInput" type="search" autocomplete="off"
+               placeholder="Search for a place" />
+        <label class="search-scope">
+          <input type="checkbox" id="searchHere" />
+          <span>Within view</span>
+        </label>
+      </div>
       <ul id="search-results" hidden></ul>
     </div>
 
@@ -55,12 +58,6 @@
     </div>
 
     <div id="map"></div>
-
-    <div id="map-hint">
-      Search for a place, or draw an area with the tools on the left.
-      A search result's <b>outline</b> button picks its real boundary.
-      <button type="button" class="hint-close" aria-label="Dismiss">&times;</button>
-    </div>
 
     <div id="gen-overlay" hidden>
       <div class="gen-box">

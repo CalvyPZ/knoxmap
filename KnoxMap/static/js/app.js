@@ -1747,7 +1747,11 @@ function renderSearchResults(results) {
   });
 }
 
+const SEARCH_DEBOUNCE_MS = 400;
+let searchSeq = 0;
+
 async function runSearch(q) {
+  const seq = ++searchSeq;
   if (!q.trim()) return hideSearchResults();
   searchResults.innerHTML = '<li class="empty">Searching…</li>';
   searchResults.hidden = false;
@@ -1767,22 +1771,52 @@ async function runSearch(q) {
   try {
     const res = await fetch('/api/search?' + params.toString());
     const data = await res.json();
+    if (seq !== searchSeq) return;
     if (!res.ok) throw apiError(data, res);
     renderSearchResults(data.results);
   } catch (err) {
+    if (seq !== searchSeq) return;
     searchResults.innerHTML = `<li class="empty">${escapeHtml(err.message)}</li>`;
   }
 }
 
-// Search runs when you press Enter, never as you type. Nominatim's usage
-// policy forbids autocomplete-style searching on its public server
-// (https://operations.osmfoundation.org/policies/nominatim/).
+// Search after a short pause while typing. Enter still searches immediately.
+// The server keeps Nominatim to one request a second; a newer query replaces
+// one that has not come back yet, so keystrokes do not each become a request.
+function scheduleSearch() {
+  clearTimeout(searchTimer);
+  if (!searchInput.value.trim()) {
+    searchSeq++;
+    hideSearchResults();
+    return;
+  }
+  searchTimer = setTimeout(() => runSearch(searchInput.value), SEARCH_DEBOUNCE_MS);
+}
+
+searchInput.addEventListener('input', scheduleSearch);
 searchInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { clearTimeout(searchTimer); runSearch(searchInput.value); }
-  if (e.key === 'Escape') hideSearchResults();
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    clearTimeout(searchTimer);
+    runSearch(searchInput.value);
+  }
+  if (e.key === 'Escape') {
+    clearTimeout(searchTimer);
+    searchSeq++;
+    hideSearchResults();
+  }
+});
+searchHere.addEventListener('change', () => {
+  if (!searchInput.value.trim()) return;
+  clearTimeout(searchTimer);
+  runSearch(searchInput.value);
 });
 document.addEventListener('click', (e) => {
-  if (!document.getElementById('search-box').contains(e.target)) hideSearchResults();
+  if (!document.getElementById('search-box').contains(e.target)) {
+    clearTimeout(searchTimer);
+    searchSeq++;
+    hideSearchResults();
+  }
 });
 
 // ---- landmarks inside the selection ---------------------------------------
