@@ -125,7 +125,7 @@ jobs:
           merge-multiple: true
           path: release
 
-      - name: Notes from CHANGELOG.md
+      - name: Notes from docs/CHANGELOG.md
         env:
           SYSTEMS: ${{ needs.which.outputs.systems }}
         run: |
@@ -134,8 +134,8 @@ jobs:
           version="$(printf '%s' "$version" | sed 's/-\([a-z]\)/ \1/')"
           awk -v v="$version" '
             /^## / { on = (index($0, "## " v " ") == 1 || $0 == "## " v) ; next }
-            on' CHANGELOG.md > notes.md
-          if [ ! -s notes.md ]; then echo "See CHANGELOG.md." > notes.md; fi
+            on' docs/CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "See docs/CHANGELOG.md." > notes.md; fi
           {
             case "$SYSTEMS" in
               *' '*) ;;

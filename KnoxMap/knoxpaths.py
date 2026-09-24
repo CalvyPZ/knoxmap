@@ -73,7 +73,10 @@ def mapping_tools_dir() -> Path | None:
         os.environ.get("PZ_MAPPING_TOOLS"),
         load_config().get("mapping_tools"),
         VENDOR_DIR / "PZMappingTools",
-        BASE_DIR.parent / "PZMappingTools",     # the layout this grew up in
+        BASE_DIR.parent / "PZMappingTools",
+        # Beside the checkout. The app lives in KnoxMap/, so that place is
+        # two folders up from this file, which is where it used to be found.
+        BASE_DIR.parent.parent / "PZMappingTools",
     )
 
 
@@ -300,7 +303,7 @@ def qt_trouble(output: str) -> str | None:
         return ("the map compiler could not load the libraries it needs. If this "
                 "system is older than Ubuntu 22.04 the build for Linux will not "
                 "run on it; install wine and KnoxMap will use the Windows build "
-                "instead (see LINUX.md)")
+                "instead (see docs/LINUX.md)")
     return None
 
 

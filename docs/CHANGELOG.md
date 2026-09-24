@@ -745,6 +745,6 @@ map.
 **Behind the scenes**
 - Follows OpenStreetMap's tile, Nominatim and Overpass usage policies; credits
   OpenStreetMap in every map; ships the compiler with its GPL source. See
-  [docs/LEGAL.md](docs/LEGAL.md).
+  [LEGAL.md](LEGAL.md).
 - `tools/selftest.py` runs the whole pipeline offline, `tools/audit_layouts.py`
   stress-tests floor plans, and GitHub Actions runs both on every push.

@@ -35,7 +35,7 @@ Needs Visual Studio 2022 Build Tools (C++ workload), Qt 5.14.2 `msvc2017_64`
 and git.
 
 ```bat
-worlded\build_worlded.bat C:\Qt\5.14.2\msvc2017_64
+KnoxMap\worlded\build_worlded.bat C:\Qt\5.14.2\msvc2017_64
 ```
 
 It clones PZ Mapping Tools at the pinned commit, applies the patch and builds.
@@ -55,7 +55,7 @@ upstream repository at the commit above plus `patch_worlded_cli.py`.
 ## Releases and the GPL
 
 Each compiler release on GitHub carries four files, built by
-`python worlded/make_release.py <PZ_Mapping_Tools checkout> <built exe> <out dir>`:
+`python KnoxMap/worlded/make_release.py <PZ_Mapping_Tools checkout> <built exe> <out dir>`:
 
 - `PZWorldEd_cli.exe` - the patched build (its SHA-256 is pinned in `knoxmap_setup.py`);
 - `PZWorldEd_cli-source.zip` - its complete corresponding source: the upstream

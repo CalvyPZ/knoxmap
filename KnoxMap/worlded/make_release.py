@@ -1,6 +1,6 @@
 """Put together the compiler release: binary, licence, and its complete source.
 
-    python worlded/make_release.py <PZ_Mapping_Tools git checkout> <built PZWorldEd.exe> <out dir>
+    python KnoxMap/worlded/make_release.py <PZ_Mapping_Tools git checkout> <built PZWorldEd.exe> <out dir>
 
 GPL-2.0 section 3 lets a modified program be passed on as a binary only with
 its complete corresponding source - "all the source code for all modules it

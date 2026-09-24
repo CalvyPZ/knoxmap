@@ -19,12 +19,13 @@ from pathlib import Path
 
 from PIL import Image
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE_DIR))
+REPO = Path(__file__).resolve().parent.parent
+APP = REPO / "KnoxMap"
+sys.path.insert(0, str(APP))
 
-OUT = BASE_DIR / "workshop"
+OUT = REPO / "workshop"
 SHOTS = OUT / "screenshots"
-COVER = BASE_DIR / "branding" / "cover.png"
+COVER = REPO / "branding" / "cover.png"
 # Steam shows the thumbnail small and the gallery big.
 PREVIEW = (512, 512)
 SHOT = (1920, 1080)
@@ -114,12 +115,12 @@ def letterbox(image: Image.Image, size: tuple[int, int]) -> Image.Image:
 def render_lots(project: Path, x: int, y: int, w: int, h: int, scale: float,
                 where: Path, max_level: int | None = None) -> Path | None:
     """One isometric view of the compiled cells, through render_lots.py."""
-    cmd = [sys.executable, str(BASE_DIR / "tools" / "render_lots.py"), str(project),
+    cmd = [sys.executable, str(APP / "tools" / "render_lots.py"), str(project),
            str(where), str(x), str(y), str(w), str(h), "--scale", str(scale)]
     if max_level is not None:
         cmd += ["--max-level", str(max_level)]
     done = subprocess.run(cmd, capture_output=True, text=True, check=False,
-                          cwd=str(BASE_DIR))
+                          cwd=str(APP))
     if done.returncode != 0 or not where.exists():
         print(f"   could not render {x},{y} {w}x{h}: "
               f"{(done.stderr or done.stdout).strip()[-200:]}")
@@ -199,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         shots.append((f"{len(shots) + 1:02d}-plan.png",
                       letterbox(Image.open(plan).convert("RGB"), SHOT)))
 
-    window = BASE_DIR / "branding" / "window.png"
+    window = REPO / "branding" / "window.png"
     if window.exists():
         shots.append((f"{len(shots) + 1:02d}-window.png",
                       letterbox(Image.open(window).convert("RGB"), SHOT)))

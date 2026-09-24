@@ -145,15 +145,15 @@ def _short(value, limit: int = 300) -> str:
 # --- the PC this is running on ---------------------------------------------
 
 def _changelog() -> Path:
-    """CHANGELOG.md beside the code, or one folder up in a source checkout.
+    """CHANGELOG.md beside the code, or in docs/ for a source checkout.
 
-    The packaged program carries it next to the code. A checkout keeps it at
-    the repository root, above KnoxMap/.
+    The packaged program carries it next to the code. A checkout keeps it in
+    docs/, above KnoxMap/.
     """
     beside = CODE_DIR / "CHANGELOG.md"
     if beside.is_file():
         return beside
-    return CODE_DIR.parent / "CHANGELOG.md"
+    return CODE_DIR.parent / "docs" / "CHANGELOG.md"
 
 
 def version() -> str:

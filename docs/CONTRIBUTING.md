@@ -4,7 +4,8 @@ Thanks for helping. A few things keep KnoxMap working and publishable.
 
 ## Before you open a pull request
 
-Run these from the KnoxMap folder (they are what GitHub Actions runs):
+Run these from the `KnoxMap` directory, where setup creates `.venv`
+(they are what GitHub Actions runs):
 
 ```bat
 .venv\Scripts\python tools\selftest.py
@@ -27,7 +28,7 @@ buildings or roads look, also generate a small real area and look at it with
 ## Be a good citizen of OpenStreetMap's servers
 
 KnoxMap uses free, volunteer-run services. Changes must keep to their usage
-policies (see [docs/LEGAL.md](docs/LEGAL.md)): no search-as-you-type, identify
+policies (see [LEGAL.md](LEGAL.md)): no search-as-you-type, identify
 the app, cache what you fetch, and never bulk-download tiles.
 
 ## Style
@@ -37,17 +38,17 @@ the app, cache what you fetch, and never bulk-download tiles.
 - New behaviour gets a check in `tools/selftest.py` or `tools/audit_layouts.py`
   when it can break.
 - Keep terms and credits intact: OpenStreetMap attribution, The Indie Stone's
-  fan-production credit, and the licences in `LICENSES.md`.
+  fan-production credit, and the licences in `docs/LICENSES.md`.
 
 ## Licences
 
 By contributing you agree your work is released under the licence of the part
-of the project it goes into: MIT for most files, GPL for `worlded/` (see
+of the project it goes into: MIT for most files, GPL for `KnoxMap/worlded/` (see
 [LICENSES.md](LICENSES.md)).
 
 ## Releasing
 
-Add a `## <version>` section to CHANGELOG.md, then push a tag:
+Add a `## <version>` section to `docs/CHANGELOG.md`, then push a tag:
 
     git tag v1.1
     git push origin v1.1

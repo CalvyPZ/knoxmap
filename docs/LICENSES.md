@@ -22,13 +22,13 @@ these files beyond that, ask arytek.
 
 ## Added in this fork — MIT
 
-See [LICENSE-MIT.txt](LICENSE-MIT.txt). Everything not listed in the other
+See [LICENSE-MIT.txt](../LICENSE-MIT.txt). Everything not listed in the other
 two sections, including:
 
 `KnoxMap/knoxbuild/` · `KnoxMap/tools/` · `KnoxMap/knoxmap.py` · `KnoxMap/knoxmap_setup.py` · `KnoxMap/knoxpaths.py` ·
-`Setup.bat` · `KnoxMap/generator/places.py` · `KnoxMap/static/js/fx.js` ·
-`desktop/` · `KNOXBUILD.md` · `LICENSES.md` · `CHANGELOG.md` ·
-`CONTRIBUTING.md` · `.github/` · `docs/`
+`KnoxMap/Setup.bat` · `KnoxMap/setup.sh` · `KnoxMap/knoxmap.sh` · `KnoxMap/generator/places.py` · `KnoxMap/static/js/fx.js` ·
+`desktop/` · `docs/KNOXBUILD.md` · `docs/LICENSES.md` · `docs/CHANGELOG.md` ·
+`docs/CONTRIBUTING.md` · `.github/` · `docs/`
 
 The program file is [Electron](https://www.electronjs.org/), which is MIT,
 built on Chromium, with CPython and the Python libraries packed inside.
@@ -37,15 +37,15 @@ file. They are not copied into this repository.
 
 ## The map compiler patch — GPL-2.0-or-later
 
-Everything in [`KnoxMap/worlded/`](KnoxMap/worlded/), and the prebuilt `PZWorldEd_cli.exe` in
+Everything in [`KnoxMap/worlded/`](../KnoxMap/worlded/), and the prebuilt `PZWorldEd_cli.exe` in
 this repository's releases, modifies
 [PZ Mapping Tools](https://github.com/Unjammer/PZ_Mapping_Tools) (Alree /
 Unjammer, built on Tim Baker's TileZed and WorldEd) and is distributed under
 the GNU General Public License version 2 or later. Each compiler release
 carries the binary's complete corresponding source (`PZWorldEd_cli-source.zip`,
 made by `KnoxMap/worlded/make_release.py`), the licence text and a written source
-offer. See [worlded/README.md](KnoxMap/worlded/README.md) and
-[docs/LEGAL.md](docs/LEGAL.md#the-map-compiler-gnu-gpl-version-2).
+offer. See [worlded/README.md](../KnoxMap/worlded/README.md) and
+[LEGAL.md](LEGAL.md#the-map-compiler-gnu-gpl-version-2).
 
 ## Things this repository does not contain
 

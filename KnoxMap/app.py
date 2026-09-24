@@ -2,8 +2,7 @@
 
 Real-world areas → Project Zomboid maps.
 
-Run:
-    source .venv/bin/activate
+Run from the KnoxMap directory (setup creates .venv there):
     python app.py
 
 Then open http://127.0.0.1:5000/ in a browser.

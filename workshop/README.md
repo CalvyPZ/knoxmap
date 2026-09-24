@@ -17,7 +17,7 @@ This folder is that item, ready to upload:
 
 None of them is a mock-up. `tools/make_workshop_art.py <a built and compiled
 map>` renders them from the compiled cells the game itself would load, the
-way `tools/render_lots.py` stacks them:
+way `KnoxMap/tools/render_lots.py` stacks them:
 
     01-town.png    the town from above
     02-town.png    the same blocks with the roofs off - every room, furnished
@@ -52,7 +52,7 @@ does something on its own and says where the map generator lives.
 The game's own uploader reads from `~/Zomboid/Workshop/<folder>`:
 
 1. `python tools/make_workshop.py` — copies this folder there, with the
-   current Reset loot code and the version from CHANGELOG.md.
+   current Reset loot code and the version from docs/CHANGELOG.md.
 2. Start Project Zomboid → **Workshop** → **Create and Upload**.
 3. Pick **KnoxMapTools**, check the description and the pictures, upload.
 4. Steam gives the item an id. Put it in `workshop.txt` as `id=<number>` so

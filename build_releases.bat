@@ -27,7 +27,7 @@ if exist "KnoxMap\.venv\Scripts\python.exe" set PY=KnoxMap\.venv\Scripts\python.
 if not defined PY where py >nul 2>nul && py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) and sys.maxsize > 2**32 else 1)" >nul 2>nul && set PY=py -3
 if not defined PY python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) and sys.maxsize > 2**32 else 1)" >nul 2>nul && set PY=python
 if not defined PY (
-  echo Need 64-bit Python 3.10 or newer. Run Setup.bat, or install Python, then run this again.
+  echo Need 64-bit Python 3.10 or newer. Run KnoxMap\Setup.bat, or install Python, then run this again.
   exit /b 1
 )
 
@@ -63,7 +63,7 @@ if not "%ERR%"=="0" exit /b %ERR%
 echo Packing the Windows command line...
 "KnoxMap\.venv\Scripts\python.exe" -m PyInstaller --noconfirm --distpath desktop\pybuild --workpath desktop\pybuild\work-cli desktop\knoxmap-cli.spec || exit /b 1
 set VER=0
-for /f "tokens=2" %%v in ('findstr /b /c:"## " CHANGELOG.md') do (
+for /f "tokens=2" %%v in ('findstr /b /c:"## " docs\CHANGELOG.md') do (
   set VER=%%v
   goto :gotver
 )

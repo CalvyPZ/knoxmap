@@ -19,15 +19,16 @@ import shutil
 import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE_DIR))
+REPO = Path(__file__).resolve().parent.parent
+APP = REPO / "KnoxMap"
+sys.path.insert(0, str(APP))
 
 import knoxpaths  # noqa: E402
 
-SOURCE = BASE_DIR / "workshop"
+SOURCE = REPO / "workshop"
 MOD_ID = "KnoxMapTools"
 # The one file the item ships, and where it comes from.
-RESET_LOOT = BASE_DIR / "knoxbuild" / "lua" / "resetloot.lua"
+RESET_LOOT = APP / "knoxbuild" / "lua" / "resetloot.lua"
 RESET_LOOT_AT = Path("Contents/mods") / MOD_ID / "common/media/lua/client/KnoxMap" / \
     "KnoxMapResetLoot.lua"
 # Every mod.info says poster=poster.png, and the game looks for it beside that

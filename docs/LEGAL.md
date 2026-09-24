@@ -12,7 +12,7 @@ Source: [openstreetmap.org/copyright](https://www.openstreetmap.org/copyright) �
 
 | Requirement | How KnoxMap meets it |
 |---|---|
-| Credit "OpenStreetMap" and say the data is under the ODbL, linking to the copyright page where possible. | The app's map shows "© OpenStreetMap contributors" linked to the copyright page, bottom right. The README and LICENSES.md credit it. |
+| Credit "OpenStreetMap" and say the data is under the ODbL, linking to the copyright page where possible. | The app's map shows "© OpenStreetMap contributors" linked to the copyright page, bottom right. The README and docs/LICENSES.md credit it. |
 | A game or other produced work may carry the credit in its menus, credits, loading screen or game view, legibly. | Every generated map shows "Map data (c) OpenStreetMap contributors" on the in-game paper map and in the mod's description in the Mods menu. |
 | A map, image or game world made from OSM data is a *Produced Work*. Whoever publishes one must credit OSM and make available the data used, or the method of deriving it (ODbL 4.6). | Each installed mod gets an `ATTRIBUTION.txt` giving the credit, the area and date of the data, and a link to KnoxMap's open-source method. |
 
@@ -27,7 +27,7 @@ Source: [Tile Usage Policy](https://operations.osmfoundation.org/policies/tiles/
 
 | Requirement | How KnoxMap meets it |
 |---|---|
-| Installed apps must send their own User-Agent naming the app, never a browser's. | Tiles are fetched by KnoxMap's local server (`/tiles` in `app.py`) with `KnoxMap/1.0 (+repository URL)`, not by the app window. |
+| Installed apps must send their own User-Agent naming the app, never a browser's. | Tiles are fetched by KnoxMap's local server (`/tiles` in `KnoxMap/app.py`) with `KnoxMap/1.0 (+repository URL)`, not by the app window. |
 | Honour caching headers, or cache for at least 7 days. | Tiles are kept in `cache/tiles` for the longer of 7 days and the server's `max-age`, and revalidated with `If-None-Match`. |
 | No bulk downloading, pre-seeding or offline use. | Only tiles the map is showing are requested, at most two at a time. |
 | Attribution visible on the map. | Bottom right, not hidden. |
@@ -39,7 +39,7 @@ Source: [Nominatim Usage Policy](https://operations.osmfoundation.org/policies/n
 |---|---|
 | At most one request per second. | `generator/places.py` throttles searches to one a second. |
 | Identify the application. | Every request sends KnoxMap's User-Agent. |
-| No autocomplete search. | Searching runs only when you press Enter. |
+| No request per keystroke. | Search waits briefly after you stop typing. `generator/places.py` still allows at most one Nominatim request per second, and a newer query replaces one that has not come back. |
 | Cache results. | Repeated searches are answered from a 24-hour cache. |
 | No bulk or systematic geocoding. | KnoxMap only searches what you type. |
 
@@ -70,7 +70,7 @@ Source: [Project Zomboid Terms & Conditions](https://store.steampowered.com/eula
 |---|---|
 | Changing base files is allowed as long as the game is not made available and nothing enables cheating or harm (Terms 2.1). | Setup only *reads* tile artwork from the player's installed game into the map tools' folder on that PC. Nothing from the game is uploaded or redistributed. |
 | Game assets may be used for non-commercial creative work that promotes the game, with this exact credit (Terms 2.2). | README and each mod's `ATTRIBUTION.txt` carry the credit quoted below. The only asset use in this repository is illustrative renders of tiles in `docs/images`. |
-| Mods must comply with the Modding Policy (Terms 2.6): not appear official, not be sold, credit third-party content, nothing harmful or objectionable. | KnoxMap and its maps are marked unofficial and free; third-party work is credited in LICENSES.md. |
+| Mods must comply with the Modding Policy (Terms 2.6): not appear official, not be sold, credit third-party content, nothing harmful or objectionable. | KnoxMap and its maps are marked unofficial and free; third-party work is credited in docs/LICENSES.md. |
 | Publishing a mod grants The Indie Stone a non-exclusive, permanent, royalty-free licence to use it in connection with the game. | Noted in the README for anyone publishing a map. |
 
 The credit, as the Terms require it:
@@ -88,9 +88,9 @@ Source: [GPL-2.0](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
 
 | Requirement | How KnoxMap meets it |
 |---|---|
-| Modified files carry a notice that they were changed, and when (2a). | `worlded/patch_worlded_cli.py` appends one to both files it changes. |
-| The modified program is under the GPL (2b). | `worlded/` and the binary are GPL; LICENSES.md says so. |
-| A binary comes with its complete corresponding source, including build scripts, from the same place (3a), or a written offer (3b). | Each compiler release carries `PZWorldEd_cli-source.zip` (the upstream tree at the pinned commit with the patch applied, plus build scripts), the licence text, and a written offer for three years. `worlded/make_release.py` builds these. |
+| Modified files carry a notice that they were changed, and when (2a). | `KnoxMap/worlded/patch_worlded_cli.py` appends one to both files it changes. |
+| The modified program is under the GPL (2b). | `KnoxMap/worlded/` and the binary are GPL; docs/LICENSES.md says so. |
+| A binary comes with its complete corresponding source, including build scripts, from the same place (3a), or a written offer (3b). | Each compiler release carries `PZWorldEd_cli-source.zip` (the upstream tree at the pinned commit with the patch applied, plus build scripts), the licence text, and a written offer for three years. `KnoxMap/worlded/make_release.py` builds these. |
 | Qt (LGPL) sources for Qt binaries. | The release does not include Qt; it comes with PZ Mapping Tools, which gives its own source offer. |
 
 ## Code from other projects
@@ -106,9 +106,12 @@ Source: [GPL-2.0](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
 - **Leaflet** (BSD-2-Clause) and **Leaflet.draw** (MIT) are bundled in
   `static/vendor/` with their licence texts, as both licences require when
   redistributing.
-- Python dependencies (Flask, Pillow, requests, pyproj, shapely, numpy,
-  pywebview) are installed by pip from PyPI under their own permissive
-  licences, and are not included in this repository.
+- Python dependencies (Flask, Pillow, requests, pyproj, shapely, numpy) are
+  installed by pip from PyPI under their own permissive licences, and are not
+  included in this repository as source. The program file packs them in.
+- **Electron** (MIT) is the window, built on Chromium, and is packed into the
+  program file together with CPython. That file includes Electron's licence
+  and Chromium's `LICENSES.chromium.html`.
 - The **Elevators** mod is not included or modified. KnoxMap only builds lifts
   the way that mod recognises them, from vanilla tile names.
 
@@ -119,7 +122,8 @@ contacts:
 
 - OpenStreetMap's tile server, Nominatim and Overpass servers, for the map,
   searches and map data (these see your IP address and what you look up);
-- GitHub, once during setup, to download PZ Mapping Tools and the compiler.
+- GitHub, once during setup, to download PZ Mapping Tools and the compiler,
+  and later when KnoxMap checks for a new version of its own program file.
 
 The map library is bundled and the page uses the system's own fonts, so no CDN or font service is contacted.
 

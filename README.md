@@ -103,10 +103,10 @@ actually lived, and installs the result as a mod.
 installed through Steam · an internet connection the first time. Python is
 already inside the download.
 
-**From a git checkout** it is still `Setup.bat` / `./setup.sh` once. After that,
+**From a git checkout** run `KnoxMap\Setup.bat` or `./KnoxMap/setup.sh` once. After that,
 start it from the `KnoxMap` folder with `.venv\Scripts\pythonw.exe knoxmap.py`
 on Windows, or `./knoxmap.sh` on Linux and macOS. Linux and macOS checkouts need
-64-bit Python 3.10+. See [LINUX.md](LINUX.md).
+64-bit Python 3.10+. See [docs/LINUX.md](docs/LINUX.md).
 
 1. **Download KnoxMap** from
    [Releases](https://github.com/spytheeuclidean-a11y/knoxmap/releases/latest) —
@@ -229,7 +229,7 @@ second without rebuilding, then compile again so the game sees the change.
 - **Project Zomboid Build 42 only.** Build 41 cannot load these maps, and setup
   warns you if your game looks like Build 41.
 - **The map compiler is a Windows program.** On Linux and macOS it runs
-  under Wine ([LINUX.md](LINUX.md)); every other step is Python and needs
+  under Wine ([docs/LINUX.md](docs/LINUX.md)); every other step is Python and needs
   nothing. Without Wine you can still compile by hand in WorldEd.
 - **Mods:** the generated map is an ordinary map mod. Lifts need the optional
   [Elevators](https://steamcommunity.com/sharedfiles/filedetails/?id=3780306632)
@@ -270,7 +270,7 @@ playing. Help is very welcome here, especially screenshots from the game.
 | Setup says the game looks like Build 41 | In Steam: right-click Project Zomboid → **Properties → Betas** → pick the Build 42 branch, then open KnoxMap again. |
 | *OSM query failed* | The free OpenStreetMap servers are busy. Wait a minute and try again, or choose a smaller area. |
 | The map is not in the game | Enable it under **Mods**, then start a **new** game. |
-| The window did not open | The download is the window. From a git checkout, `cd desktop` and `npm install`, then start KnoxMap again, and look at `logs/knoxmap.log`. `KNOXMAP_BROWSER=1` opens KnoxMap in the browser instead. On Linux see [LINUX.md](LINUX.md). |
+| The window did not open | The download is the window. From a git checkout, `cd desktop` and `npm install`, then start KnoxMap again, and look at `logs/knoxmap.log`. `KNOXMAP_BROWSER=1` opens KnoxMap in the browser instead. On Linux see [docs/LINUX.md](docs/LINUX.md). |
 | KnoxMap closes straight away | It shows a message and writes the error to `logs/knoxmap.log`. Open it again; most causes are in that file. |
 
 ### Reporting a problem
@@ -305,10 +305,10 @@ Everything the app does also works from the command line inside `KnoxMap\.venv`
 The window is a small Electron app in `desktop/`. The release file packs it
 together with Python. To work on the window from a checkout: `cd desktop`,
 `npm install`, then start KnoxMap from the `KnoxMap` folder with
-`.venv\Scripts\pythonw.exe knoxmap.py`, or `./knoxmap.sh` from the repository
-root. `KNOXMAP_ELECTRON` can point at a different Electron binary.
+`.venv\Scripts\pythonw.exe knoxmap.py`, or `./knoxmap.sh`. Both live in the
+`KnoxMap` folder. `KNOXMAP_ELECTRON` can point at a different Electron binary.
 
-- [KNOXBUILD.md](KNOXBUILD.md): how buildings, rooms, lifts, fences, streets and
+- [docs/KNOXBUILD.md](docs/KNOXBUILD.md): how buildings, rooms, lifts, fences, streets and
   the population model work, and the measurements behind them.
 - [worlded/README.md](KnoxMap/worlded/README.md): the map compiler patch and how to build
   it yourself.
@@ -398,6 +398,6 @@ for any damage or loss from using KnoxMap or its maps.
 The code here is under different terms depending on where it came from: work
 added in this fork is MIT, the compiler patch in `KnoxMap/worlded/` and its prebuilt
 binary are GPL, and files from the original Knoxify have no published licence.
-See **[LICENSES.md](LICENSES.md)** for the details, and
+See **[docs/LICENSES.md](docs/LICENSES.md)** for the details, and
 **[docs/LEGAL.md](docs/LEGAL.md)** for every licence and policy KnoxMap follows
 and how.

@@ -22,7 +22,7 @@ on:
         default: 'worlded-cli-linux-20260909f'
   push:
     paths:
-      - 'worlded/**'
+      - 'KnoxMap/worlded/**'
       - '.github/workflows/worlded-linux.yml'
 
 env:
@@ -54,10 +54,10 @@ jobs:
           git -C src log --oneline -1
 
       - name: KnoxMap's headless patch
-        run: python3 worlded/patch_worlded_cli.py src
+        run: python3 KnoxMap/worlded/patch_worlded_cli.py src
 
       - name: And what GCC will not build as it stands
-        run: python3 worlded/patch_worlded_linux.py src
+        run: python3 KnoxMap/worlded/patch_worlded_linux.py src
 
       - name: Build
         run: |
@@ -194,7 +194,7 @@ jobs:
           rm -rf src/.git
           mkdir -p srcpack
           cp -r src srcpack/PZ_Mapping_Tools
-          cp worlded/patch_worlded_cli.py worlded/patch_worlded_linux.py srcpack/
+          cp KnoxMap/worlded/patch_worlded_cli.py KnoxMap/worlded/patch_worlded_linux.py srcpack/
           cp .github/workflows/worlded-linux.yml srcpack/how-it-was-built.yml
           (cd srcpack && zip -qr ../pack/PZWorldEd_cli-linux-source.zip .)
           cp src/COPYING "$out/LICENSE-GPL-2.0.txt" 2>/dev/null ||
@@ -327,7 +327,7 @@ jobs:
           python - <<'PY'
           import sys, tempfile
           from pathlib import Path
-          sys.path.insert(0, ".")
+          sys.path.insert(0, "KnoxMap")
           import knoxmap_setup
 
           # The real thing: the pinned URL, the pinned fingerprint, and the
@@ -354,7 +354,7 @@ jobs:
           PZMAPPING_TOOLS="$tools" python - "$tools" <<'PY'
           import sys
           from pathlib import Path
-          sys.path.insert(0, ".")
+          sys.path.insert(0, "KnoxMap")
           import knoxpaths
 
           tools = Path(sys.argv[1])
