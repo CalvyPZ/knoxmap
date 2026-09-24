@@ -1596,6 +1596,10 @@ function stopProgress() {
 function renderResults(data) {
   const section = document.getElementById('results');
   section.hidden = false;
+  const downloadReady = document.getElementById('downloadReady');
+  const downloadEmpty = document.getElementById('downloadEmpty');
+  if (downloadReady) downloadReady.hidden = false;
+  if (downloadEmpty) downloadEmpty.hidden = true;
   document.getElementById('previewImg').src = data.files.preview + '?t=' + Date.now();
   document.getElementById('previewLink').href = data.files.preview;
 
@@ -1619,8 +1623,7 @@ function renderResults(data) {
   const all = document.getElementById('downloadAll');
   all.href = data.files.zip;
   all.setAttribute('download', `${data.mapName}.zip`);
-  all.textContent = IN_WINDOW ? 'Save everything as a .zip' : 'Download everything (.zip)';
-  wireDownload(all, 'zip', 'the zip');
+  all.textContent = 'Download everything (.zip)';
   const note = document.getElementById('saveNote');
   if (note) { note.className = 'hint'; note.textContent = ''; }
   wirePictures(data.mapName);

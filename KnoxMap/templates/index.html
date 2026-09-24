@@ -359,69 +359,8 @@
     </figure>
     <div class="results-side">
       <div id="results-info"></div>
-      <a id="downloadAll" class="btn" download>Download everything (.zip)</a>
-      <div id="saveNote" class="hint"></div>
-      <button id="makePictures" class="btn" type="button" hidden>Draw a picture of it</button>
-      <div id="pictureNote" class="hint"></div>
-      <div id="pictureShots" class="shots" hidden></div>
-      <details id="downloads-details">
-        <summary>Single files</summary>
-        <ul id="downloads"></ul>
-      </details>
     </div>
   </div>
-
-  <h3>Finish the map</h3>
-  <ol class="pipeline">
-    <li class="pipe-card" data-step="buildings">
-      <div class="pipe-body">
-        <div class="pipe-title">3. Buildings</div>
-        <span id="buildingsNote" class="step-note">Makes a furnished building for every footprint.</span>
-        <div class="bar bar-indet"><div class="bar-fill"></div></div>
-        <div id="census" class="census" hidden>
-          <div class="census-head">Population</div>
-          <div class="tiles census-tiles" id="censusTiles"></div>
-          <div class="census-official" id="censusOfficial"></div>
-          <div class="census-actions">
-            <button id="recountBtn" class="btn btn-small" type="button">Recount</button>
-            <span id="censusNote" class="step-note">Change the zombie settings under More settings,
-              then recount. No need to rebuild.</span>
-          </div>
-        </div>
-      </div>
-      <button id="buildingsBtn" class="btn">Build</button>
-      <button class="btn btn-small btn-stop" data-stop hidden>Stop</button>
-    </li>
-    <li class="pipe-card" data-step="compile">
-      <div class="pipe-body">
-        <div class="pipe-title">4. Compile</div>
-        <span id="compileNote" class="step-note">Turns the map into the game's files with WorldEd.
-          Takes a few minutes.</span>
-        <div class="bar"><div id="compileBar" class="bar-fill"></div></div>
-        <button id="retryCellsBtn" class="btn btn-small" hidden>Compile the cells that failed</button>
-        <details class="manual-fallback">
-          <summary>Or do it yourself in WorldEd</summary>
-          <button id="worldedBtn" class="btn btn-small" disabled>Open in WorldEd</button>
-          <span id="worldedNote" class="step-note">Then
-            <b>File → BMP To TMX → All Cells…</b> and
-            <b>File → Generate Lots 8x8 → All Cells…</b></span>
-        </details>
-      </div>
-      <button id="compileBtn" class="btn" disabled>Compile</button>
-      <button class="btn btn-small btn-stop" data-stop hidden>Stop</button>
-    </li>
-    <li class="pipe-card" data-step="install">
-      <div class="pipe-body">
-        <div class="pipe-title">5. Install</div>
-        <div class="install-row">
-          <label>Name in game <input type="text" id="mapTitle"/></label>
-          <label>Mod id <input type="text" id="modId"/></label>
-        </div>
-        <span id="installNote" class="step-note">Copies the map into your Zomboid mods folder.</span>
-      </div>
-      <button id="installBtn" class="btn" disabled>Install</button>
-    </li>
-  </ol>
 </section>
 
 <div id="toasts" aria-live="polite"></div>
