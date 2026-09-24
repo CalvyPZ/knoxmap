@@ -130,6 +130,44 @@ class Projector:
     def cell_grid(self) -> tuple[int, int]:
         return self.width // C.CELL_SIZE, self.height // C.CELL_SIZE
 
+    def window(self, x0: int, y0: int, tiles_w: int, tiles_h: int) -> "Projector":
+        """A tile rectangle of this map, on the same metre grid.
+
+        Adjacent windows share the edge between them, so two mods drawn from
+        them meet when both are enabled.
+        """
+        mpt = self.meters_per_tile
+        north_m = self.min_y_m + self.height * mpt
+        return Projector(
+            self.south, self.west, self.north, self.east, mpt,
+            tiles_w, tiles_h,
+            self.min_x_m + x0 * mpt,
+            north_m - (y0 + tiles_h) * mpt,
+            self._transformer, self.rotation)
+
+    def grid_dict(self) -> dict:
+        epsg = self._transformer.target_crs.to_epsg()
+        return {
+            "min_x_m": self.min_x_m,
+            "min_y_m": self.min_y_m,
+            "width_tiles": self.width,
+            "height_tiles": self.height,
+            "meters_per_tile": self.meters_per_tile,
+            "epsg": int(epsg or 0),
+            "rotation": self.rotation,
+        }
+
+    @classmethod
+    def from_grid(cls, grid: dict) -> "Projector":
+        """The projector a mod was drawn with, so a later build lands on it."""
+        epsg = int(grid["epsg"])
+        transformer = pyproj.Transformer.from_crs(
+            "EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+        return cls(0.0, 0.0, 0.0, 0.0, float(grid["meters_per_tile"]),
+                   int(grid["width_tiles"]), int(grid["height_tiles"]),
+                   float(grid["min_x_m"]), float(grid["min_y_m"]),
+                   transformer, float(grid.get("rotation") or 0.0))
+
 
 # Roads that count towards a town's street grid. Paths wander, and a motorway
 # slicing through at its own angle should not turn the town around it.
@@ -555,8 +593,10 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
            osm_bbox: tuple[float, float, float, float] | None = None,
            shape: dict | None = None,
            straight_roads: bool = False,
-           should_stop=None) -> RenderResult:
-    proj = Projector.build(south, west, north, east, meters_per_tile, rotation)
+           should_stop=None,
+           proj: "Projector | None" = None) -> RenderResult:
+    if proj is None:
+        proj = Projector.build(south, west, north, east, meters_per_tile, rotation)
     # Read more than once below - the buildings pass goes back over the
     # address points - so never leave this as a generator.
     features = list(features)
@@ -775,6 +815,9 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
             # it, so "it made none of mine" is a number rather than a guess.
             "houses_from_addresses": len(addressed),
             "guide_reference": "Thuztor Mapping Guide v0.2",
+            # The metre grid this bitmap was drawn on. A later build uses it
+            # so a mod cut out of a larger map stays where it was drawn.
+            "grid": proj.grid_dict(),
         }, f, indent=2)
 
     return RenderResult(

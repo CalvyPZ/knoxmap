@@ -114,6 +114,12 @@ def choose_origin(out_dir: str, cells_x: int, cells_y: int) -> tuple[int, int]:
     mine = _project_box(os.path.join(here, f"{name}.pzw"))
     if mine:
         return mine[0], mine[1]
+    # A pack of mods reserves its whole rectangle before any of them has a
+    # project of its own, and keeps that place when the pack is built again.
+    from .modgrid import pack_box
+    reserved = pack_box(here)
+    if reserved:
+        return reserved[0], reserved[1]
 
     taken = _installed_boxes()
     root = os.path.dirname(here)
@@ -126,6 +132,9 @@ def choose_origin(out_dir: str, cells_x: int, cells_y: int) -> tuple[int, int]:
         if not os.path.isdir(folder) or os.path.abspath(folder) == here:
             continue
         box = _project_box(os.path.join(folder, f"{entry}.pzw"))
+        if not box:
+            from .modgrid import pack_box
+            box = pack_box(folder)
         if box:
             taken.append(box)
 

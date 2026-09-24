@@ -767,9 +767,13 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
         geo = json.load(f)
 
     bbox = info["bbox"]
-    proj = Projector.build(bbox["south"], bbox["west"], bbox["north"],
-                           bbox["east"], info["meters_per_tile"],
-                           info.get("rotation") or 0.0)
+    grid = info.get("grid") or {}
+    if grid.get("epsg"):
+        proj = Projector.from_grid(grid)
+    else:
+        proj = Projector.build(bbox["south"], bbox["west"], bbox["north"],
+                               bbox["east"], info["meters_per_tile"],
+                               info.get("rotation") or 0.0)
     if (proj.width, proj.height) != (info["width_tiles"], info["height_tiles"]):
         print("projection does not match the rendered BMP - is this folder "
               "from a different Knoxify version?", file=sys.stderr)
@@ -780,7 +784,11 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     # below - the paper map, the zones, the compiled cells - is written from
     # here on, so it is settled first.
     from .world import choose_origin, origin, set_origin
-    set_origin(choose_origin(out_dir, info["cells_x"], info["cells_y"]))
+    forced = info.get("world_origin")
+    if isinstance(forced, (list, tuple)) and len(forced) == 2:
+        set_origin((int(forced[0]), int(forced[1])))
+    else:
+        set_origin(choose_origin(out_dir, info["cells_x"], info["cells_y"]))
 
     # Record what this build actually used, whoever started it. Without this
     # a map generated from the command line cannot be reproduced, and the app
