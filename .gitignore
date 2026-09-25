@@ -1,14 +1,17 @@
-# A program file built in the repo root. The ones players download are
-# written to release/ by build_releases.bat.
+# A program file built in the repo root. Player downloads are written to
+# releases/ by build_releases.bat.
 /KnoxMap.exe
 
-# The Electron window's dependencies and packager scratch (desktop/).
-# The named downloads are copied to release/.
+# Electron dependencies. Packager output and PyInstaller scratch are written
+# under releases/ (releases/dist and releases/temp). These stay ignored so an
+# older desktop build is not committed.
 desktop/node_modules/
 desktop/out/
 desktop/pybuild/
 
 # Local builds of the player downloads (build_releases.bat).
+# releases/ is the directory builders use. release/ and released/ are older
+# names, still ignored so leftover output stays untracked.
 /release/*
 !/release/.gitkeep
 /releases/*

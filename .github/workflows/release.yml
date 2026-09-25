@@ -77,10 +77,16 @@ jobs:
           sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
 
       - name: Python server
+        shell: bash
         run: |
+          set -eu
           python -m pip install --upgrade pip
           python -m pip install -r KnoxMap/requirements.txt pyinstaller
-          pyinstaller --noconfirm --distpath desktop/pybuild --workpath desktop/pybuild/work desktop/knoxmap-server.spec
+          mkdir -p releases/temp
+          pyinstaller --noconfirm --distpath releases/temp --workpath releases/temp/work desktop/knoxmap-server.spec
+          # The packager reads desktop/pybuild. The files live in releases/temp.
+          rm -rf desktop/pybuild
+          ln -s "$(pwd)/releases/temp" desktop/pybuild
 
       - name: Program file
         working-directory: desktop
@@ -93,22 +99,31 @@ jobs:
         run: |
           set -eu
           shopt -s nullglob
-          mkdir -p release
+          mkdir -p releases
+          if [ -d desktop/out ]; then
+            rm -rf releases/dist
+            mv desktop/out releases/dist
+          fi
           v="${GITHUB_REF_NAME}"
           case "${{ matrix.system }}" in
             windows) ext=exe ;;
             linux)   ext=AppImage ;;
             macos)   ext=dmg ;;
           esac
-          found=(desktop/out/*."$ext")
+          found=(releases/dist/*."$ext")
+          if [ "${#found[@]}" -ne 1 ]; then
+            found=(release/*."$ext" released/*."$ext")
+          fi
           test "${#found[@]}" -eq 1
-          cp "${found[0]}" "release/KnoxMap-${v}-${{ matrix.system }}.$ext"
-          ls -l release
+          cp "${found[0]}" "releases/KnoxMap-${v}-${{ matrix.system }}.$ext"
+          shopt -u nullglob
+          rm -f release/KnoxMap-* released/KnoxMap-*
+          ls -l releases
 
       - uses: actions/upload-artifact@v4
         with:
           name: knoxmap-${{ matrix.system }}
-          path: release/KnoxMap-${{ github.ref_name }}-${{ matrix.system }}.*
+          path: releases/KnoxMap-${{ github.ref_name }}-${{ matrix.system }}.*
           if-no-files-found: error
 
   release:
@@ -123,7 +138,7 @@ jobs:
         with:
           pattern: knoxmap-*
           merge-multiple: true
-          path: release
+          path: releases
 
       - name: Notes from docs/CHANGELOG.md
         env:
@@ -170,9 +185,9 @@ jobs:
           files=""
           for system in $SYSTEMS; do
             case "$system" in
-              windows) files="$files release/KnoxMap-$v-windows.exe" ;;
-              linux)   files="$files release/KnoxMap-$v-linux.AppImage" ;;
-              macos)   files="$files release/KnoxMap-$v-macos.dmg" ;;
+              windows) files="$files releases/KnoxMap-$v-windows.exe" ;;
+              linux)   files="$files releases/KnoxMap-$v-linux.AppImage" ;;
+              macos)   files="$files releases/KnoxMap-$v-macos.dmg" ;;
             esac
           done
           case "$SYSTEMS" in

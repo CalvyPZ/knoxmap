@@ -100,13 +100,23 @@ actually lived, and installs the result as a mod.
 ## Quick start
 
 **You need:** Windows 10 or 11, or Linux, or macOS · **Project Zomboid Build 42**
-installed through Steam · an internet connection the first time. Python is
-already inside the download.
+installed through Steam · an internet connection the first time ·
+[osmium-tool](https://osmcode.org/osmium-tool/) on your PATH, which reads the
+map extracts. Python is already inside the download.
 
-**From a git checkout** run `KnoxMap\Setup.bat` or `./KnoxMap/setup.sh` once. After that,
-start it from the `KnoxMap` folder with `.venv\Scripts\pythonw.exe knoxmap.py`
-on Windows, or `./knoxmap.sh` on Linux and macOS. Linux and macOS checkouts need
-64-bit Python 3.10+. See [docs/LINUX.md](docs/LINUX.md).
+**From a git checkout** you need 64-bit Python 3.10+. In the `KnoxMap` folder,
+make the environment and start it:
+
+```bat
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\pythonw knoxmap.py
+```
+
+On Linux and macOS the same two steps use `python3` and `.venv/bin/python`,
+then `./knoxmap.sh` once `.venv` exists. See [docs/LINUX.md](docs/LINUX.md).
+The first time the window opens, KnoxMap downloads the map tools and reads
+tiles from your game, the same as the program file.
 
 1. **Download KnoxMap** from
    [Releases](https://github.com/spytheeuclidean-a11y/knoxmap/releases/latest) —
@@ -119,38 +129,58 @@ on Windows, or `./knoxmap.sh` on Linux and macOS. Linux and macOS checkouts need
    - downloads the free [PZ Mapping Tools](https://github.com/Unjammer/PZ_Mapping_Tools),
    - downloads the map compiler from this repository's releases and checks its fingerprint,
    - finds your Project Zomboid install and copies the tile artwork the map tools
-     need **from your own copy of the game** (games or Workshop mods on another
-     drive: name it under Steam libraries on the Setup tab),
+     need **from your own copy of the game** (if it does not find the game,
+     **Setup → Game** takes the folder that contains the game's jar),
    - adds the rules for kerbs, road markings and Build 42 trees to the map tools.
 
    It takes a few minutes, once. After that the same file opens straight away.
    Maps and logs appear in the folder beside it.
-3. **Make a map** in the window that opens:
-   1. **Choose an area** (see below). Start small, a few streets, while you get a
-      feel for it.
-   2. Pick a **kind of place** (Town, Suburb, City, Rural) and press **Generate map**.
-   3. Under *Finish the map*: **Build** → **Compile** → **Install**.
+3. **Make a map** in the window that opens. The first time, it offers a short
+   tour. The sidebar is **Setup**, **Map**, and **Build**.
+   1. **Setup → Game** finds Project Zomboid, or you point it at the folder
+      that contains the game's jar. **Setup → Mod** is the map name, the
+      scale, and a **kind of place** (Town, Suburb, City, Rural).
+   2. **Choose an area** on the map (see below). Start small, a few streets,
+      while you get a feel for it.
+   3. **Build → Generate**, then **Generate map**. The download of that
+      project sits on the same tab.
+   4. **Build → Build** is **Build**. **Build → Export** is **Compile**, then
+      **Install**. **Edit** is reserved; it does not change the map yet.
 4. **In Project Zomboid**: enable your map in **Mods** (and **Elevators** too, if
    you want working lifts), then start a **new** game and choose it. Existing
    saves never pick up new maps.
 
-If anything is missing, a *Setup incomplete* panel in the app says exactly what
-and how to fix it. Run that again at any time; it only does what is still needed.
+If anything is missing, a *Setup isn't finished* panel in the app says exactly
+what and how to fix it. Open KnoxMap again at any time; setup only does what
+is still needed.
 
 ## Choosing an area
 
 | Tool | How |
 |---|---|
-| **Search** | Type a place and press **Enter**. Pick a result for a box around it, or its **OUTLINE** button for the place's real boundary: a park, a district, a whole town. |
+| **Search** | Type a place. Results appear as you type; **Enter** searches at once. Pick a result for a box around it, or its **outline** button for the place's real boundary: a park, a district, a whole town. **Within view** keeps the results inside the map you are looking at. |
 | **Rectangle** | Drag a box on the map. |
 | **Polygon** | Click point by point round any outline; click the first point to finish. |
 | **Circle** | Drag out a radius from a centre. |
-| **Freehand ✎** | Drag round what you want. The line is smoothed into a clean outline. |
+| **Freehand** | Drag round what you want. The line is smoothed into a clean outline. |
+| **Eraser** | Draw any of those shapes to cut it out of the area you already have. |
 
 A shape is built only inside itself. The map still covers the shape's whole
 bounding box (the game needs whole cells), but outside the shape the land turns
 back to countryside, with the main roads and rivers running on so the town is not
 an island.
+
+The area is listed as layers, with its real size. **Overlay Vanilla Map**
+lays the base game's Knox County on the view, at the scale you picked, so you
+can judge how big a drawing is. Drag that overlay to move it.
+
+A selection larger than one mod is cut into pieces of 20 cells by 20 cells
+(6000 tiles on a side). The pieces meet on a cell edge, so the streets
+continue when every piece is enabled, and each piece is its own mod. The
+streets and buildings come from [Geofabrik](https://download.geofabrik.de/)'s
+daily regional extracts, read on your PC with osmium and kept under
+`cache/geofabrik`. The list of named places inside the area still comes from
+the Overpass API.
 
 You can also open KnoxMap straight to a place: add `?q=Bryant Park, New York` to
 the address, and `&outline=1` to take its real boundary.
@@ -161,22 +191,28 @@ the address, and `&outline=1` to take its real boundary.
 
 ## Tuning a map
 
-Open **Fine tuning** under *Style*:
+On **Map → Area**, four switches sit with the selection:
 
 | Setting | What it does |
 |---|---|
-| **Fill gaps from Overture** | 1 adds the buildings OpenStreetMap has not got, from [Overture Maps](https://overturemaps.org) — which is OSM plus machine-detected roofprints, under the same ODbL licence. Off by default: where OSM is complete it adds sheds (60 buildings on a German town), and where OSM is thin it nearly trebles the place (761 on a Turkish one). Needs DuckDB — `python -m pip install duckdb` into KnoxMap's own `.venv`. The fetch takes a few minutes and is then cached with the map. |
-| **True map generation** | 1 rebuilds every address the map has. 0 keeps the real roads, rivers, woods and terrain but lays the housing out for the game: about half the ordinary houses are left out and the ones that stay grow into the gap, so a street is proper homes with yards rather than rows of one-room boxes. Worth turning off at 2 m a tile or more, and on a town mapped at European density. |
-| **Guaranteed rifle** | 1 leaves one military rifle somewhere on the map: an army building if there is one, else the police station, else a gun shop, else a house on the edge of town. A real town has no army checkpoints in it, so without this the game's rifles may have nowhere at all they could spawn. |
+| **Add missing buildings** | On adds the buildings OpenStreetMap has not got, from [Overture Maps](https://overturemaps.org) — which is OSM plus machine-detected roofprints, under the same ODbL licence. Off by default: where OSM is complete it adds sheds (60 buildings on a German town), and where OSM is thin it nearly trebles the place (761 on a Turkish one). Needs DuckDB — `python -m pip install duckdb` into KnoxMap's own `.venv`. The fetch takes a few minutes and is then cached with the map. |
+| **Randomise seed** | On picks a new seed for each generate. Off keeps the number in the field under it. |
+| **True map generation** | On rebuilds every address the map has. Off keeps the real roads, rivers, woods and terrain but lays the housing out for the game: about half the ordinary houses are left out and the ones that stay grow into the gap, so a street is proper homes with yards rather than rows of one-room boxes. Worth turning off at 2 m a tile or more, and on a town mapped at European density. |
+| **Guaranteed rifle** | On leaves one military rifle somewhere on the map: an army building if there is one, else the police station, else a gun shop, else a house on the edge of town. A real town has no army checkpoints in it, so without this the game's rifles may have nowhere at all they could spawn. |
+
+The rest is under **Map → Advanced**, headed **More settings**:
+
+| Setting | What it does |
+|---|---|
 | **Zombies per person** | How many zombies each person who lived or worked there becomes. |
 | **Living space** | Floor area per person. Lower means more crowded buildings and more zombies. |
 | **Horde cap** | The most zombies one 10×10-tile spot can hold. Vanilla towns peak at 10. |
 | **Flats above / Flats chance** | How readily large untagged buildings become blocks of flats. |
 | **Tallest building** | The storey limit, up to 30. Real heights from OpenStreetMap are used where mapped. Tall cities take much longer to compile. |
-| **Straighten streets** | 1 turns the map so its main street grid runs along the tiles; 0 keeps north straight up, with diagonal streets as staircases. |
-| **Knox County roads** | 1 lays every road in straight runs along the tiles and on 45-degree diagonals, like the game's own map: curves become straight sides with 45-degree corners, and the buildings, parks and car parks move with their streets and stand upright beside them. Streets end up a little way off their real places. 0 draws roads as mapped. |
+| **Straighten streets** | On turns the map so its main street grid runs along the tiles; off keeps north straight up, with diagonal streets as staircases. |
+| **Knox County roads** | On lays every road in straight runs along the tiles and on 45-degree diagonals, like the game's own map: curves become straight sides with 45-degree corners, and the buildings, parks and car parks move with their streets and stand upright beside them. Streets end up a little way off their real places. Off draws roads as mapped. |
 | **Woodland**, **Parking**, **Room size** | What they say. |
-| **Seed** | The same area and seed always give the same town. |
+| **Seed** | With **Randomise seed** off, the same area and seed always give the same town. |
 
 After **Build**, a **Zombie census** shows the estimated residents, workers and
 zombies. Change the zombie settings and press **Recount** to redraw them in a
@@ -189,13 +225,14 @@ second without rebuilding, then compile again so the game sees the change.
 
 ## Good to know
 
-- **KnoxMap in your language.** `lang/english.txt` holds every line the window
-  says, as `English = English`. Copy it, name the copy after the language
-  (`russian.txt`, `deutsch.txt`, `turkce.txt`), translate the right-hand side
-  of each line, and pick it from the menu at the top of the window. Lines left
-  in English stay English, so you can translate as much or as little as you
-  like, and `python tools/make_lang_template.py` writes the English file again
-  after an update. Translations are welcome as pull requests.
+- **KnoxMap in your language.** In the `KnoxMap` folder, `lang/english.txt`
+  holds every line the window says, as `English = English`. Copy it, name the
+  copy after the language (`russian.txt`, `deutsch.txt`, `turkce.txt`),
+  translate the right-hand side of each line, and pick it from the menu at
+  the top of the window. Lines left in English stay English, so you can
+  translate as much or as little as you like, and
+  `python tools/make_lang_template.py` writes the English file again after an
+  update. Translations are welcome as pull requests.
 - **Fresh loot without a new save.** The game fills a container once and
   remembers it, so a map installed again keeps what it rolled the first time.
   In game, right-click the ground and pick **Reset loot** - this building, or
@@ -213,8 +250,9 @@ second without rebuilding, then compile again so the game sees the change.
   minutes with 30-storey towers.
 - **North may not be up.** With *Straighten streets* on, the map is turned to
   its street grid, often by 20-45°. The in-game map is turned the same way.
-- **Maps are cached.** Regenerating the same area reuses its OpenStreetMap
-  download, so trying different settings is quick.
+- **Map extracts are cached.** Regenerating the same area reuses the
+  Geofabrik file and the clip osmium already cut, so trying different
+  settings is quick.
 - **A map is only as good as OpenStreetMap's data for that place.** Well-mapped
   city centres come out best; rural areas often lack buildings entirely.
 - **Where maps go.** Installed maps are copied into `%USERPROFILE%\Zomboid\mods`.
@@ -228,9 +266,12 @@ second without rebuilding, then compile again so the game sees the change.
 
 - **Project Zomboid Build 42 only.** Build 41 cannot load these maps, and setup
   warns you if your game looks like Build 41.
-- **The map compiler is a Windows program.** On Linux and macOS it runs
-  under Wine ([docs/LINUX.md](docs/LINUX.md)); every other step is Python and needs
-  nothing. Without Wine you can still compile by hand in WorldEd.
+- **The map compiler.** On 64-bit Linux, setup fetches a build made for that
+  system. On macOS, and on Linux if that download fails, it is the Windows
+  program and runs under Wine ([docs/LINUX.md](docs/LINUX.md)). Without it you
+  can still compile by hand in WorldEd. **Open in WorldEd** offers to download
+  the community editor (PZ Mapping Tools, the release the compiler was built
+  against) the first time.
 - **Mods:** the generated map is an ordinary map mod. Lifts need the optional
   [Elevators](https://steamcommunity.com/sharedfiles/filedetails/?id=3780306632)
   mod; without it they are just closed doors. With the optional
@@ -266,9 +307,9 @@ playing. Help is very welcome here, especially screenshots from the game.
 | Problem | Fix |
 |---|---|
 | Setup fails | The whole run is written to `logs/setup.log`. Open KnoxMap again; if it fails the same way, post that file. |
-| Setup cannot find Project Zomboid | On the Setup tab, under Steam libraries, name the drive or the `ProjectZomboid` folder and look again. |
+| Setup cannot find Project Zomboid | On **Setup → Game**, choose **Choose a folder** and pick the folder that contains the Project Zomboid jar. `KNOXMAP_STEAM_FOLDERS` can name extra Steam libraries, separated by `;`. |
 | Setup says the game looks like Build 41 | In Steam: right-click Project Zomboid → **Properties → Betas** → pick the Build 42 branch, then open KnoxMap again. |
-| *OSM query failed* | The free OpenStreetMap servers are busy. Wait a minute and try again, or choose a smaller area. |
+| *OSM query failed* | Generate reads a Geofabrik extract with osmium. Install [osmium-tool](https://osmcode.org/osmium-tool/) so `osmium` is on your PATH, then try again. Extracts already in `cache/geofabrik` are reused, so a second run does not download them again. |
 | The map is not in the game | Enable it under **Mods**, then start a **new** game. |
 | The window did not open | The download is the window. From a git checkout, `cd desktop` and `npm install`, then start KnoxMap again, and look at `logs/knoxmap.log`. `KNOXMAP_BROWSER=1` opens KnoxMap in the browser instead. On Linux see [docs/LINUX.md](docs/LINUX.md). |
 | KnoxMap closes straight away | It shows a message and writes the error to `logs/knoxmap.log`. Open it again; most causes are in that file. |
@@ -292,15 +333,21 @@ When something fails, the message in the app carries an id such as
 
 ## For tinkerers
 
-Everything the app does also works from the command line inside `KnoxMap\.venv`
-(run these from the `KnoxMap` directory):
+Everything the app does also works from the command line inside `KnoxMap\.venv`,
+without opening a window (run these from the `KnoxMap` directory):
 
 ```bat
-.venv\Scripts\python -m knoxbuild output\mytown --preset city --set max_levels=12
-.venv\Scripts\python tools\compile_map.py output\mytown
-.venv\Scripts\python tools\render_ground.py output\mytown street.png 300 300 40 40
-.venv\Scripts\python tools\audit_layouts.py 400
+.venv\Scripts\python knoxmap_cli.py build output\mytown --preset city --set max_levels=12
+.venv\Scripts\python knoxmap_cli.py compile output\mytown
+.venv\Scripts\python knoxmap_cli.py install output\mytown --name "My Town, KY" --id mytown
+.venv\Scripts\python knoxmap_cli.py render-ground output\mytown street.png 300 300 40 40
+.venv\Scripts\python knoxmap_cli.py audit 400
 ```
+
+`knoxmap_cli.py --help` lists `render-lots` and `validate` as well. The same
+build step is `python -m knoxbuild`. `build_releases.bat` packs a command-line
+program next to the window; the GitHub release of the window is the `.exe`,
+AppImage, or dmg.
 
 The window is a small Electron app in `desktop/`. The release file packs it
 together with Python. To work on the window from a checkout: `cd desktop`,
@@ -363,8 +410,12 @@ connection with Project Zomboid.
 under their usage policies: the [tile server](https://operations.osmfoundation.org/policies/tiles/)
 for the background map, [Nominatim](https://operations.osmfoundation.org/policies/nominatim/)
 for place search, and the [Overpass API](https://dev.overpass-api.de/overpass-doc/en/preface/commons.html)
-for map data. KnoxMap identifies itself, caches tiles, searches and downloads,
-searches after a short pause as you type, and paces its requests. Please do not modify
+for the list of named places in an area. The streets, buildings, water and
+land of the map itself come from [Geofabrik](https://download.geofabrik.de/)'s
+daily extracts, read locally with osmium. **Add missing buildings** also
+reads [Overture](https://overturemaps.org) buildings from their public files.
+KnoxMap identifies itself, caches tiles, searches and extracts, searches
+after a short pause as you type, and paces its requests. Please do not modify
 it to get around those limits; for heavy use, run your own servers.
 
 **Privacy.** KnoxMap has no accounts, telemetry or analytics. The servers it
