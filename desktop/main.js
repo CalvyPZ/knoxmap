@@ -84,7 +84,7 @@ function logFile() {
 function windowIcon() {
   const packed = path.join(__dirname, 'icon.png');
   if (fs.existsSync(packed)) return packed;
-  const branding = path.join(__dirname, '..', 'branding', 'knoxmap.png');
+  const branding = path.join(__dirname, '..', 'docs', 'branding', 'knoxmap.png');
   if (fs.existsSync(branding)) return branding;
   return undefined;
 }

@@ -6,10 +6,10 @@
 // Windows comes out as KnoxMap.exe (portable). Linux comes out as
 // KnoxMap.AppImage. macOS comes out as KnoxMap.dmg on a Mac, or a zip of
 // KnoxMap.app when the packager is not a Mac (a dmg needs Apple's tools).
-// The finished file is also copied to release/ at the top of the repository.
-// The Python server must already be at desktop/pybuild/knoxmap-server,
+// The finished file is also copied to releases/ at the top of the repository.
+// The Python server must already be at releases/temp/knoxmap-server,
 // built on this same system:
-//   pyinstaller --noconfirm --distpath desktop/pybuild --workpath desktop/pybuild/work desktop/knoxmap-server.spec
+//   pyinstaller --noconfirm --distpath releases/temp --workpath releases/temp/work desktop/knoxmap-server.spec
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -44,12 +44,12 @@ const hostArch = process.arch === 'arm64' ? 'arm64' : 'x64';
 const platform = arg('platform', hostPlatform);
 const arch = arg('arch', hostArch);
 const serverName = platform === 'win32' ? 'knoxmap-server.exe' : 'knoxmap-server';
-const server = path.join(here, 'pybuild', 'knoxmap-server', serverName);
+const server = path.join(root, 'releases', 'temp', 'knoxmap-server', serverName);
 
 if (!fs.existsSync(server)) {
   console.error(`Missing ${server}`);
   console.error('Build the Python server on this system first:');
-  console.error('  pyinstaller --noconfirm --distpath desktop/pybuild --workpath desktop/pybuild/work desktop/knoxmap-server.spec');
+  console.error('  pyinstaller --noconfirm --distpath releases/temp --workpath releases/temp/work desktop/knoxmap-server.spec');
   process.exit(1);
 }
 
@@ -79,16 +79,16 @@ if (result.status !== 0) process.exit(result.status || 1);
 
 const ext = { win32: '.exe', linux: '.AppImage', darwin: crossMac ? '.zip' : '.dmg' }[platform];
 const system = { win32: 'windows', linux: 'linux', darwin: 'macos' }[platform];
-const outDir = path.join(here, 'out');
+const outDir = path.join(root, 'releases', 'dist');
 const made = fs.readdirSync(outDir)
   .filter((name) => name.endsWith(ext))
   .map((name) => ({ name, mtime: fs.statSync(path.join(outDir, name)).mtimeMs }))
   .sort((a, b) => b.mtime - a.mtime);
 if (!made.length) {
-  console.error(`Expected a ${ext} in desktop/out, found: ${fs.readdirSync(outDir).join(', ') || 'nothing'}`);
+  console.error(`Expected a ${ext} in releases/dist, found: ${fs.readdirSync(outDir).join(', ') || 'nothing'}`);
   process.exit(1);
 }
-const released = path.join(root, 'release');
+const released = path.join(root, 'releases');
 fs.mkdirSync(released, { recursive: true });
 const dest = path.join(released, `KnoxMap-v${changelogVersion()}-${system}${ext}`);
 fs.copyFileSync(path.join(outDir, made[0].name), dest);

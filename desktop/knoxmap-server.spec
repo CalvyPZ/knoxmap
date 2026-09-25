@@ -2,7 +2,7 @@
 # The Python half of the single program file. Electron starts knoxmap-server;
 # this folder is copied in beside the window as resources/python.
 # Build with:
-#   pyinstaller --noconfirm --distpath desktop/pybuild --workpath desktop/pybuild/work desktop/knoxmap-server.spec
+#   pyinstaller --noconfirm --distpath releases/temp --workpath releases/temp/work desktop/knoxmap-server.spec
 import os
 
 REPO = os.path.abspath(os.path.join(SPECPATH, ".."))

@@ -21,7 +21,7 @@
     "executableName": "KnoxMap",
     "npmRebuild": false,
     "directories": {
-      "output": "out"
+      "output": "../releases/dist"
     },
     "files": [
       "main.js",
@@ -30,14 +30,14 @@
     ],
     "extraResources": [
       {
-        "from": "pybuild/knoxmap-server",
+        "from": "../releases/temp/knoxmap-server",
         "to": "python"
       }
     ],
     "asar": true,
     "win": {
       "signAndEditExecutable": false,
-      "icon": "../branding/knoxmap.ico",
+      "icon": "../docs/branding/knoxmap.ico",
       "target": [
         "portable"
       ],
@@ -52,7 +52,7 @@
       "artifactName": "KnoxMap.${ext}"
     },
     "mac": {
-      "icon": "../branding/knoxmap.icns",
+      "icon": "../docs/branding/knoxmap.icns",
       "identity": null,
       "target": [
         "dmg"

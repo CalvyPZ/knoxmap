@@ -10,13 +10,14 @@ apt-get update
 apt-get install -y python3 python3-pip python3-venv python3-dev build-essential curl ca-certificates zip
 
 rm -rf /tmp/build
-mkdir -p /tmp/build /knoxmap/release
+mkdir -p /tmp/build /knoxmap/release /knoxmap/releases
 tar -C /knoxmap -cf - \
   --exclude=.git \
   --exclude=.venv \
   --exclude=node_modules \
   --exclude=pybuild \
   --exclude=release \
+  --exclude=releases \
   --exclude=released \
   --exclude=output \
   --exclude=cache \
@@ -34,7 +35,7 @@ python3 -m venv /tmp/venv
 
 echo "Packing the Linux Python server..."
 /tmp/venv/bin/pyinstaller --noconfirm \
-  --distpath desktop/pybuild --workpath /tmp/pyi-work \
+  --distpath releases/temp --workpath releases/temp/work \
   desktop/knoxmap-server.spec
 
 cd /tmp/build/desktop
@@ -42,19 +43,19 @@ npm ci
 
 echo "Packing the Linux program..."
 node build.mjs --platform linux --arch x64
-cp -f /tmp/build/release/KnoxMap-v*-linux.AppImage /knoxmap/release/
+cp -f /tmp/build/releases/KnoxMap-v*-linux.AppImage /knoxmap/releases/
 
 echo "Packing the Linux command line..."
 /tmp/venv/bin/pyinstaller --noconfirm \
-  --distpath /tmp/build/desktop/pybuild --workpath /tmp/pyi-work-cli \
+  --distpath /tmp/build/releases/temp --workpath /tmp/build/releases/temp/work-cli \
   /tmp/build/desktop/knoxmap-cli.spec
 ver=$(awk '/^## [0-9]/{print $2; exit}' /tmp/build/CHANGELOG.md)
-cp -f /tmp/build/desktop/pybuild/knoxmap-cli "/knoxmap/release/KnoxMap-v${ver}-linux-cli"
-chmod 755 "/knoxmap/release/KnoxMap-v${ver}-linux-cli"
+cp -f /tmp/build/releases/temp/knoxmap-cli "/knoxmap/releases/KnoxMap-v${ver}-linux-cli"
+chmod 755 "/knoxmap/releases/KnoxMap-v${ver}-linux-cli"
 
 echo "Packing the Mac Python tree..."
-rm -rf /tmp/build/desktop/pybuild /tmp/build/desktop/out
-dest=/tmp/build/desktop/pybuild/knoxmap-server
+rm -rf /tmp/build/releases/temp /tmp/build/releases/dist
+dest=/tmp/build/releases/temp/knoxmap-server
 mkdir -p "$dest"
 url=$(node << 'JS'
 const https = require('https');
@@ -121,7 +122,7 @@ chmod 755 "$dest/knoxmap-cli"
 
 echo "Packing the Mac program..."
 node build.mjs --platform darwin --arch arm64
-cp -f /tmp/build/release/KnoxMap-v*-macos.zip /knoxmap/release/
+cp -f /tmp/build/releases/KnoxMap-v*-macos.zip /knoxmap/releases/
 wrap=$(mktemp -d)
 cat > "$wrap/knoxmap-cli" << 'EOF'
 #!/bin/sh
@@ -129,7 +130,7 @@ DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 exec "$DIR/KnoxMap.app/Contents/Resources/python/knoxmap-cli" "$@"
 EOF
 chmod 755 "$wrap/knoxmap-cli"
-for z in /knoxmap/release/KnoxMap-v*-macos.zip; do
+for z in /knoxmap/releases/KnoxMap-v*-macos.zip; do
   (cd "$wrap" && zip -u "$z" knoxmap-cli)
 done
-echo "Linux and Mac files are in release/"
+echo "Linux and Mac files are in releases/"

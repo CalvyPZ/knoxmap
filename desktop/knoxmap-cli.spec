@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # The command-line KnoxMap. One console program, no window.
-#   pyinstaller --noconfirm --distpath desktop/pybuild --workpath desktop/pybuild/work-cli desktop/knoxmap-cli.spec
+#   pyinstaller --noconfirm --distpath releases/temp --workpath releases/temp/work-cli desktop/knoxmap-cli.spec
 import os
 
 REPO = os.path.abspath(os.path.join(SPECPATH, ".."))

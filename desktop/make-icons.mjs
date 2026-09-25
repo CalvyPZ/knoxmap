@@ -1,4 +1,4 @@
-// Draws branding/knoxmap.ico, .icns and .png from branding/logo.svg.
+// Draws docs/branding/knoxmap.ico, .icns and .png from docs/branding/logo.svg.
 // The mark is small enough to rasterise here: a rounded tile, a diamond
 // stroke and a map pin. Run with: node desktop/make-icons.mjs
 import fs from 'node:fs';
@@ -6,7 +6,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
-const branding = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'branding');
+const branding = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'docs', 'branding');
 const desktop = path.dirname(fileURLToPath(import.meta.url));
 
 const BG = [0x14, 0x18, 0x0f];
@@ -218,4 +218,4 @@ fs.writeFileSync(path.join(branding, 'knoxmap.ico'), ico(
 fs.writeFileSync(path.join(branding, 'knoxmap.icns'), icns(
   rendered.filter((img) => [16, 32, 64, 128, 256, 512, 1024].includes(img.size)),
 ));
-console.log('wrote branding/knoxmap.png, .ico, .icns and desktop/icon.png');
+console.log('wrote docs/branding/knoxmap.png, .ico, .icns and desktop/icon.png');
