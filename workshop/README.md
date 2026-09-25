@@ -25,12 +25,12 @@ way `KnoxMap/tools/render_lots.py` stacks them:
     04-plan.png    the plan the generator draws
     05-window.png  KnoxMap itself, with a real town's boundary picked out
 
-The last one is `branding/window.png`, which is a screenshot of the app and
+The last one is `docs/branding/window.png`, which is a screenshot of the app and
 the only one that cannot be rendered. Take it at 1600x1000 with the window
 showing a place chosen and the **Generate map** button lit - a headless
 browser will do it:
 
-    chrome --headless=new --window-size=1600,1000       --screenshot=branding/window.png       "http://localhost:<port>/?q=Rye%2C%20East%20Sussex&outline=1"
+    chrome --headless=new --window-size=1600,1000       --screenshot=docs/branding/window.png       "http://localhost:<port>/?q=Rye%2C%20East%20Sussex&outline=1"
 
 Pick somewhere small enough to stay under the tile limit, or the panel shows
 a red warning instead of a green button.

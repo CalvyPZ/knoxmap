@@ -14,7 +14,7 @@ it. These files come from it (most have since been modified here):
 `KnoxMap/static/css/app.css` · `KnoxMap/static/js/app.js` ·
 `KnoxMap/templates/index.html` · `.gitignore`
 
-The KnoxMap logo and cover (`branding/*`, `static/logo.svg`) are new to this
+The KnoxMap logo and cover (`docs/branding/*`, `static/logo.svg`) are new to this
 fork and replace Knoxify's own artwork; they are under the MIT licence below.
 
 If you want to reuse

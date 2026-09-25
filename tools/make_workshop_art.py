@@ -25,7 +25,7 @@ sys.path.insert(0, str(APP))
 
 OUT = REPO / "workshop"
 SHOTS = OUT / "screenshots"
-COVER = REPO / "branding" / "cover.png"
+COVER = REPO / "docs" / "branding" / "cover.png"
 # Steam shows the thumbnail small and the gallery big.
 PREVIEW = (512, 512)
 SHOT = (1920, 1080)
@@ -41,7 +41,7 @@ BACKGROUND = (20, 24, 15)
 # rest instead of being squeezed into a strip.
 WORDMARK = "KnoxMap"
 STRAPLINE = "REAL PLACES, PLAYABLE IN PROJECT ZOMBOID"
-GREEN = (165, 226, 102)          # the pin in branding/logo.svg
+GREEN = (165, 226, 102)          # the pin in docs/branding/logo.svg
 INK = (18, 22, 14)
 BAND = 120
 # Of the 1920x1080 render, the quarter with the most furnished rooms in it
@@ -200,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         shots.append((f"{len(shots) + 1:02d}-plan.png",
                       letterbox(Image.open(plan).convert("RGB"), SHOT)))
 
-    window = REPO / "branding" / "window.png"
+    window = REPO / "docs" / "branding" / "window.png"
     if window.exists():
         shots.append((f"{len(shots) + 1:02d}-window.png",
                       letterbox(Image.open(window).convert("RGB"), SHOT)))

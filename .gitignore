@@ -11,6 +11,7 @@ desktop/pybuild/
 # Local builds of the player downloads (build_releases.bat).
 /release/*
 !/release/.gitkeep
+/releases/*
 /released/
 
 # Python
