@@ -1,0 +1,63 @@
+{
+  "name": "knoxmap-shell",
+  "version": "1.5.0",
+  "private": true,
+  "description": "KnoxMap's window. The packaged program starts the Python server packed beside it.",
+  "main": "main.js",
+  "author": "KnoxMap",
+  "scripts": {
+    "postinstall": "node node_modules/electron/install.js",
+    "start": "electron .",
+    "icons": "node make-icons.mjs",
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "electron": "44.4.5",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "dev.knoxmap.app",
+    "productName": "KnoxMap",
+    "executableName": "KnoxMap",
+    "npmRebuild": false,
+    "directories": {
+      "output": "out"
+    },
+    "files": [
+      "main.js",
+      "package.json",
+      "icon.png"
+    ],
+    "extraResources": [
+      {
+        "from": "pybuild/knoxmap-server",
+        "to": "python"
+      }
+    ],
+    "asar": true,
+    "win": {
+      "signAndEditExecutable": false,
+      "icon": "../branding/knoxmap.ico",
+      "target": [
+        "portable"
+      ],
+      "artifactName": "KnoxMap.${ext}"
+    },
+    "linux": {
+      "icon": "icon.png",
+      "category": "Utility",
+      "target": [
+        "AppImage"
+      ],
+      "artifactName": "KnoxMap.${ext}"
+    },
+    "mac": {
+      "icon": "../branding/knoxmap.icns",
+      "identity": null,
+      "target": [
+        "dmg"
+      ],
+      "artifactName": "KnoxMap.${ext}"
+    }
+  }
+}
