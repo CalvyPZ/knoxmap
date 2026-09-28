@@ -37,4 +37,4 @@ body:
     id: settings
     attributes:
       label: Settings
-      description: Kind of place and anything changed in Fine tuning, or attach output\<your map>\settings.json.
+      description: Kind of place and anything changed under Map → Area or Advanced, or attach output\<your map>\settings.json.

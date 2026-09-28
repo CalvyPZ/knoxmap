@@ -10,7 +10,7 @@ body:
     id: step
     attributes:
       label: Which step went wrong?
-      options: [Setup.bat, Opening KnoxMap, Choosing an area / search, Generate map, Build, Compile, Install, In the game]
+      options: [First-run setup, Opening KnoxMap, Choosing an area / search, Generate map, Build, Compile, Install, In the game]
     validations:
       required: true
   - type: textarea
@@ -30,13 +30,13 @@ body:
     id: settings
     attributes:
       label: Settings
-      description: The kind of place (Town/Suburb/City/Rural) and anything you changed in Fine tuning. Or attach output\<your map>\settings.json.
+      description: The kind of place (Town/Suburb/City/Rural) and anything you changed under Map → Area or Advanced. Or attach output\<your map>\settings.json.
   - type: textarea
     id: logs
     attributes:
       label: Logs
       description: |
-        Whatever exists of: knoxmap_error.log in the KnoxMap folder; the Setup.bat window's text; the newest file in vendor\PZMappingTools\settings\logs (for compile problems).
+        Whatever exists of: logs\knoxmap.log and logs\setup.log; the newest file in logs\worlded (for compile problems). The in-app report zip is logs\KnoxMap-report-….zip.
       render: text
   - type: input
     id: version
