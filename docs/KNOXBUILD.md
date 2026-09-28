@@ -11,8 +11,11 @@ top by hand. `knoxbuild` fills that gap — it generates a real, furnished PZ
 building for every footprint and writes a WorldEd project with all of them
 already placed.
 
-The commands below are run from the `KnoxMap` directory. `Setup.bat` and
-`./setup.sh` create `.venv` there.
+The commands below are run from the `KnoxMap` directory. A checkout creates
+`.venv` there (`python -m venv .venv`, then pip install `-r requirements.txt`).
+The first time `knoxmap.py` opens, or `python knoxmap_setup.py`, it fetches
+the map tools and the compiler. The map reader is installed with the other
+libraries in `requirements.txt`; the program file already contains it.
 
 ```bash
 # 1. make a map with Knoxify (web UI, or the API directly)
@@ -230,7 +233,7 @@ the same `BuildingTemplates.txt`, `BuildingFurniture.txt` and `RoomNames.txt`
 that BuildingEd itself loads:
 
 ```bash
-python tools/make_catalog.py ../../PZMappingTools/config knoxbuild/catalog.py
+python tools/make_catalog.py vendor/PZMappingTools/config knoxbuild/catalog.py
 ```
 
 Entries are selected by tile **name**, and a missing anchor is a hard error. An
@@ -244,8 +247,8 @@ Picking an anchor by name proves nothing about what it *looks* like, so
 into a labelled contact sheet:
 
 ```bash
-python tools/preview_catalog.py ../../PZMappingTools/Tiles/2x \
-    ../../PZMappingTools/config/Tilesets.txt catalog.png
+python tools/preview_catalog.py vendor/PZMappingTools/Tiles/2x \
+    vendor/PZMappingTools/config/Tilesets.txt catalog.png
 ```
 
 That check earned its keep immediately - four anchors were wrong: an armchair
@@ -294,7 +297,7 @@ Both formats have been loaded by the real editors (PZ_Mapping_Tools build
 
 ## Local changes to Knoxify itself
 
-This clone carries two changes beyond upstream; both are worth re-applying if
+This clone carries changes beyond upstream; they are worth re-applying if
 you ever re-clone:
 
 1. **`generator/osm.py` sends a `User-Agent`.** Without one every Overpass
@@ -310,19 +313,25 @@ you ever re-clone:
    the placement CSV. Individual files are still there, folded into a
    disclosure below the button.
 
-Search uses Nominatim: type a name, pick a result, and the map flies there and
-drops the selection rectangle for you. A result's own bounding box is used when
-it is a reasonable size; searching something huge like a whole city centres a
-1.2 km box instead rather than handing back a selection the generator would
-refuse. "Only this view" restricts results to the current viewport.
+Search uses Nominatim: type a name and results appear as you type; Enter
+searches at once. Pick a result and the map flies there and drops the
+selection rectangle. A result's own bounding box is used when it is at most
+400 km² and at least 0.4 km on a side; anything else centres a 1.2 km box on
+it. **outline** takes the place's real boundary. **Within view** restricts
+results to the current viewport. The eraser cuts a drawn shape out of the
+selection. A selection larger than one mod is split by `knoxbuild/modgrid.py`
+into pieces of 25 cells (7500 tiles) that meet on a cell edge.
 
 The landmarks panel asks Overpass what named things are inside the current
 selection - schools, shops, parks, places of worship - grouped by kind with
 counts, and clicking one zooms to it. It is the quickest way to judge whether
-an area is worth generating before spending a minute on it.
+an area is worth generating before spending a minute on it. The terrain
+itself is not an Overpass query: `generator/localosm.py` reads the covering
+Geofabrik daily inside the program.
 
 Nominatim's usage policy allows one request per second, which `places._throttle`
-enforces process-wide, and the front end debounces typing by 500 ms.
+enforces process-wide, and the front end waits 400 ms after you stop typing.
+A newer query replaces one that has not come back.
 
 ## Map size
 
@@ -333,29 +342,26 @@ splits a large request into a grid of sub-queries of `OVERPASS_TILE_KM2`
 `out geom` returns a way's complete geometry from every tile it touches, so
 features that straddle a boundary survive whole.
 
-Current rails, all in `app.py`:
+Current warnings, all in `app.py`. None of them refuses the map. A scale that
+is not a scale — under `MIN_METERS_PER_TILE` (0.01) or over
+`MAX_METERS_PER_TILE` (100) — is still rejected. The window offers 0.5 to 8 m
+a tile.
 
 | | | |
 |---|---|---|
-| `MAX_AREA_KM2` | 400 | patience, not API limits |
-| `MAX_TILES_PER_SIDE` | 9000 (30 cells) | memory: landscape + vegetation at 3 bytes a tile is ~490 MB at that size |
-| `MAX_METERS_PER_TILE` | 8.0 | coarse enough to fit a region inside the tile cap |
-| `MAX_LANDMARK_KM2` | 40 | the landmark query asks for far more tag keys |
+| `BIG_AREA_KM2` | 400 | patience; the button stays lit |
+| `BIG_TILES_PER_SIDE` | 9000 (30 cells) | memory: landscape + vegetation at 3 bytes a tile is ~490 MB at that size |
+| `BIG_LANDMARK_KM2` | 40 | the landmark query asks for far more tag keys |
 
-Measured on a 62 km² slice of Muncie at 3 m/tile: 9 Overpass queries, 17,282
-features, 3300x3000 tiles (11x10 cells), 3,908 footprints, and `knoxbuild` then
-produced 2,206 buildings with 45,840 furniture pieces in under three seconds —
-all 2,206 valid. That map is left in `output/bigtest2` as a ready example.
+`osm.fetch_features_tiled` used to split a large Overpass request into tiles of
+`OVERPASS_TILE_KM2`. Generate does not call it. A 62 km² slice of Muncie at
+3 m/tile, measured on that older path, was 9 Overpass queries, 17,282
+features, 3300x3000 tiles, 3,908 footprints, and then 2,206 buildings.
 
-Because a big map means minutes of querying, generation reports its stage
-through `GET /api/progress?map=<name>` and the page polls it, so you see
-"area 4 of 9" rather than a dead spinner. The area panel also predicts the
-query count and bitmap size before you commit, warns above 60 km², and blocks
-only at the real ceilings.
-
-If you want a map larger than 400 km², raise `MAX_AREA_KM2` and coarsen metres
-per tile to stay under the tile cap — the tiling itself has no upper bound, only
-your RAM and willingness to wait.
+Because a big map means minutes of reading an extract, generation reports its
+stage through `GET /api/progress?map=<name>` and the page polls it. The area
+panel says what the area will cost and leaves the choice to the mapper. A
+selection is then cut into mods of 25 cells a side (`knoxbuild/modgrid.py`).
 
 ## Getting the tilesheets (tools/extract_tiles.py)
 
@@ -364,8 +370,8 @@ extractor. `tools/extract_tiles.py` does the same job headlessly, reading the
 game's `.pack` files directly:
 
 ```bash
-PACKS="<your ProjectZomboid folder>/media/texturepacks"   # Setup.bat does all this for you
-TOOLS="../PZMappingTools"
+PACKS="<your ProjectZomboid folder>/media/texturepacks"   # first-run setup does all this for you
+TOOLS="vendor/PZMappingTools"
 python tools/extract_tiles.py "$PACKS/Tiles2x.pack"       "$TOOLS/config/Tilesets.txt" "$TOOLS/Tiles/2x"
 python tools/extract_tiles.py "$PACKS/Tiles2x.floor.pack" "$TOOLS/config/Tilesets.txt" "$TOOLS/Tiles/2x"
 ```
@@ -384,18 +390,22 @@ the second pass writes sheets out and frees them as they complete.
 ## The app (knoxmap.py)
 
 `knoxmap.py` is deliberately thin: it starts the Flask app on a loopback port
-and shows it in the Electron window. The window therefore gets the real Leaflet map — rectangle
-tool, place search, landmark lookup — instead of a second UI that would drift
-from the web one. There is one front end, used two ways.
+and shows it in the Electron window when `desktop/main.js` is available, and
+in the browser otherwise. The window therefore gets the real Leaflet map —
+rectangle, polygon, circle, freehand, eraser, place search, landmark lookup —
+instead of a second UI that would drift from the web one. There is one front
+end, used two ways.
 
 The page carries the whole pipeline:
 
-1. **Draw or search an area**, then **Generate map** — Overpass query and
-   terrain render.
-2. **Generate buildings** — `POST /api/buildings`, which calls `knoxbuild`.
-3. **Open in WorldEd** — `POST /api/worlded` launches PZWorldEd with the `.pzw`
-   already open. It finds `../PZMappingTools/bin/PZWorldEd.exe` by itself; set
-   `PZWORLDED` to override.
+1. **Draw or search an area**, then **Generate map** — the covering Geofabrik
+   extract, a clip of that extract, and the terrain render. A large selection becomes
+   several mods.
+2. **Build** — `POST /api/buildings`, which calls `knoxbuild`. The project
+   download sits on the Generate tab.
+3. **Open in WorldEd** — under Export, as the manual fallback. It offers to
+   download the community editor (PZ Mapping Tools `43.00B260909`) once, then
+   launches it with the `.pzw` already open. `PZWORLDED` overrides the path.
 4. The page then polls `GET /api/lots` every few seconds and enables **Install**
    by itself the moment `lots/*.lotheader` appears — you never have to tell it
    you are done.
@@ -465,8 +475,9 @@ in PZWorldEd the remaining work is two menu commands:
 2. **Generate Lots**, all cells — compiles everything, buildings included, into
    the `lots/` folder.
 
-Neither has a command-line entry point (WorldEd's `--` options are developer
-self-tests), so these two are unavoidable from here.
+The patched `PZWorldEd_cli --generate-map` runs both of those, which is what
+**Compile** does. The menus are the fallback when that compiler is not there,
+from **Open in WorldEd**.
 
 Knoxify's palette does line up with the tools' terrain rules: of the 18 colours
 it paints, 17 are defined in `config/Rules.txt` with the right bitmap and layer.
@@ -564,9 +575,11 @@ project for ever.
 
 ## Limits worth knowing
 
-- **Rotation is lost** — see *Footprint fitting*. Size is right; angle is not.
-- **Single storey.** No upper floors, and the stairs entry goes unused.
-- **Size filtered.** Footprints under 5 or over 60 tiles are skipped
-  (`--min-size` / `--max-size`).
+- **Rotation of one building is lost** — see *Footprint fitting*. Size is
+  right; that building's angle is not. The whole map can still be turned
+  (`align_streets`, `rotate_degrees`).
+- **Storeys.** `max_levels` is 6 by default and 30 at most. Buildings of five
+  storeys or more get a lift shaft. Footprints under `min_size` (3 tiles) or
+  over `max_size` (200) are skipped (`--min-size` / `--max-size`).
 - **Interiors are plausible, not architectural.** BSP rooms don't know a
   bathroom should sit off a hallway.

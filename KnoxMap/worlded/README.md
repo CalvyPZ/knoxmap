@@ -9,8 +9,10 @@ switch:
 PZWorldEd_cli.exe --generate-map=<project.pzw> [--cells=x0,y0,x1,y1]
 ```
 
-`Setup.bat` downloads a prebuilt `PZWorldEd_cli.exe` from this repository's
-releases and checks its SHA-256 fingerprint, so most people never touch this.
+The first time KnoxMap opens, `knoxmap_setup.py` downloads a prebuilt
+`PZWorldEd_cli.exe` from this repository's releases and checks its SHA-256
+fingerprint, so most people never touch this. 64-bit Linux gets the same
+compiler built for that system, as a `.tar.gz` from the matching release.
 
 ## What the patch changes
 

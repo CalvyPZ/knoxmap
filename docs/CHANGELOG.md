@@ -2,8 +2,8 @@
 
 ## 1.5
 
-- **KnoxMap is one file.** Windows gets `KnoxMap.exe`, Linux an AppImage,
-  macOS a dmg. Python and the libraries are already inside. Put the file
+- **KnoxMap is one file.** Windows gets `KnoxMap-v…-windows.exe`, Linux an
+  AppImage, macOS a dmg. Python and the libraries are already inside. Put the file
   anywhere and open it. Maps, logs and the first-run downloads sit in the
   folder beside it (on a Mac that lives in Applications, they sit in a
   `KnoxMap` folder in your home directory). The map tools and the game's
@@ -14,7 +14,8 @@
   The window is the same Electron window on every system. The page is
   unchanged — the map, the search, the pipeline — and Python still serves it
   and still does the work. A source checkout opens that window from `desktop/`
-  after `npm install`, or the browser when `KNOXMAP_BROWSER=1`.
+  after `npm install` when `desktop/main.js` is present, or the browser when
+  it is not, or when `KNOXMAP_BROWSER=1`.
   On Windows, start that checkout from the `KnoxMap` folder with
   `.venv\Scripts\pythonw.exe knoxmap.py`. On Linux and macOS, `./knoxmap.sh`.
 
@@ -28,6 +29,48 @@
   sandbox cannot start — the helper is not setuid, or AppArmor will not allow
   a user namespace — KnoxMap opens it once more without the sandbox. The page
   is only this computer's.
+
+- **The map comes from a regional extract.** Generate no longer asks Overpass
+  for the streets and buildings. It downloads the smallest Geofabrik daily
+  that covers the box, keeps it under `cache/geofabrik`, and cuts the piece
+  this mod draws inside the program. A selection bigger
+  than one mod is cut into pieces of 20 cells by 20 cells that meet on a cell
+  edge, each its own mod, so the streets continue when all of them are
+  enabled. Named places inside the area still come from Overpass. **Add
+  missing buildings** is the Overture switch, on the area tab. While an
+  extract downloads, the progress box shows its size, how much has arrived,
+  the speed, and the time left. Picking the roads and buildings out of a new
+  extract has its own step in that box, and only tagged objects pass through
+  Python, so a state extract no longer takes minutes to prepare.
+
+- **The sidebar is one surface.** Setup finds the game, or takes the folder
+  that contains its jar. Map holds the area as layers, with its real size, an
+  overlay of the vanilla Knox County map, and switches for missing buildings,
+  a random seed, true map generation and the guaranteed rifle. The rest of
+  the knobs are under Advanced, headed More settings. Build is Generate
+  (with the project download), Build, a placeholder Edit tab, and Export
+  (Compile and Install). The eraser cuts a shape out of a drawn area. Search
+  runs as you type, in a narrower field, with Within view. The first open
+  offers a short tour. The top bar is Credits and the Discord mark. Open in
+  WorldEd offers to install the community editor before it opens the map.
+
+- **The tools run without the window.** `knoxmap_cli.py` builds, compiles,
+  installs, draws and checks a map from a terminal. A checkout creates
+  `KnoxMap/.venv` itself and starts `knoxmap.py`; the old `Setup.bat` and
+  `setup.sh` are gone, and the first open still runs that setup.
+
+- **Building generation is faster.** Room grids, zone detection and spatial
+  queries now use NumPy and SciPy. The layout workers stay alive across the
+  mods in one build, so the frozen app starts them once.
+
+- **Junctions come from OpenStreetMap.** After the streets are drawn, each
+  place roads meet is typed from the nodes on it: traffic signals, stop,
+  give way, a crossing, a roundabout, a mini-roundabout, a turning circle.
+  Nothing is guessed. A tagged junction gets its stop line, crosswalk, dropped
+  kerb, stop sign or signal pole, and parked cars stay out of the box.
+  Untagged corners are only squared off so the kerb can turn. Roundabouts are
+  rings with an island, not discs of tarmac. The download now asks for those
+  nodes, so the first generate after this version fetches the area again.
 
 ## 1.4
 

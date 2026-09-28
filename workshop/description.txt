@@ -9,8 +9,9 @@ free and open source, and it lives here:
 
 [url=https://github.com/spytheeuclidean-a11y/knoxmap/releases/latest][h3]➜ Download KnoxMap from GitHub[/h3][/url]
 
-Windows, Linux and macOS. Unpack it, run it, draw an area, press the four
-buttons. The map appears in your game as its own starting region.
+Windows, Linux and macOS. Open the program file, draw an area, and work
+through Setup, Map and Build. The map appears in your game as its own
+starting region. KnoxMap reads the place from a Geofabrik extract on your PC.
 
 [hr][/hr]
 [h2]What this Workshop item is[/h2]

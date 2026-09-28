@@ -1,16 +1,16 @@
 # KnoxMap on Linux and macOS
 
 Everything KnoxMap does itself is Python, and runs anywhere Python does:
-downloading the area from OpenStreetMap, drawing the terrain, laying out and
-furnishing the buildings, writing the paper map and installing the mod. Only
-one step needs help, and that is **Compile**, which drives the PZ Mapping
-Tools. On 64-bit Linux, Setup fetches a build of the map compiler made for
-this system, so that needs no help either; anywhere else it is a Windows
-program and runs through Wine.
+reading the area from a Geofabrik extract of OpenStreetMap, drawing the
+terrain, laying out and furnishing the buildings, writing the paper map and
+installing the mod. The map reader is one of those libraries, already inside
+the program file. **Compile** drives the PZ Mapping Tools. On 64-bit Linux,
+setup fetches a build of the map compiler made for this system, so that needs
+no help either; anywhere else it is a Windows program and runs through Wine.
 
 Download `KnoxMap-v…-linux.AppImage` (or `…-macos.dmg`) from
 [Releases](https://github.com/spytheeuclidean-a11y/knoxmap/releases/latest).
-That file is the whole program. Python is already inside.
+That file is the whole program. Python and the map reader are already inside.
 
     chmod +x KnoxMap-v1.5-linux.AppImage
     ./KnoxMap-v1.5-linux.AppImage
@@ -20,21 +20,29 @@ still downloads the map tools and reads tiles from your own copy of the game.
 Maps and logs appear beside the AppImage. A copy that lives in Applications
 keeps them in a `KnoxMap` folder in your home directory.
 
-A git checkout is the other way in. From the `KnoxMap` folder, `./setup.sh` once
-and `./knoxmap.sh` after that. It needs 64-bit Python 3.10+. If the scripts
-are not executable:
+A git checkout is the other way in. It needs 64-bit Python 3.10+. From the
+`KnoxMap` folder:
 
-    cd KnoxMap
-    chmod +x setup.sh knoxmap.sh
+    python3 -m venv .venv
+    .venv/bin/python -m pip install -r requirements.txt
+    chmod +x knoxmap.sh
+    ./knoxmap.sh
+
+`./knoxmap.sh` expects `.venv` to exist already. The first time the window
+opens, it downloads the map tools and reads tiles from your game.
 
 ## What setup does
 
-The same as `Setup.bat`: a private Python environment in `KnoxMap/.venv`, the PZ
-Mapping Tools into `vendor/`, the patched map compiler, and the tile artwork
-extracted from **your own copy of the game** — never downloaded.
+The first open, or `python knoxmap_setup.py` from the `KnoxMap` folder, puts
+the PZ Mapping Tools into `vendor/`, fetches the patched map compiler, and
+extracts the tile artwork from **your own copy of the game** — never
+downloaded. The Python environment above is the checkout's own step; the
+program file already has Python inside it.
 
 It needs 64-bit Python 3.10 or newer. A 32-bit one can only address about
 2 GB, which a town-sized map runs out of part-way through.
+
+A checkout needs Python:
 
     sudo apt install python3 python3-venv python3-pip     # Debian, Ubuntu
     sudo pacman -S python                                 # Arch
@@ -45,7 +53,8 @@ It needs 64-bit Python 3.10 or newer. A 32-bit one can only address about
 The window is Electron, the same one on Windows, Linux and macOS, and it is
 inside the AppImage or the app. It does not need the GTK or Qt libraries
 Python used to need for a window of its own. A checkout uses the Electron
-binary from `desktop/` after `npm install`.
+binary from `desktop/` after `npm install` when `desktop/main.js` is present,
+and opens in the browser when it is not.
 
 It does need the ordinary desktop libraries, which a normal desktop already
 has. If the window will not open and `logs/knoxmap.log` names one of them,
@@ -118,8 +127,9 @@ and setup leaves it alone.
   for under `/mnt`, `/media`, `/run/media` and your home folder.
 - **Saves and mods** are in `~/Zomboid`, as on Windows. `ZOMBOID_DIR` moves
   that if yours is somewhere else.
-- If a library is somewhere none of this looks, add it in the window under
-  **Steam libraries**, or set `KNOXMAP_STEAM_FOLDERS=/path/one;/path/two`.
+- If a library is somewhere none of this looks, on **Setup → Game** choose
+  the folder that contains the game's jar, or set
+  `KNOXMAP_STEAM_FOLDERS=/path/one;/path/two`.
 
 ## Proton and the game's memory
 

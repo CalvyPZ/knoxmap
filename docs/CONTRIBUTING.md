@@ -28,8 +28,11 @@ buildings or roads look, also generate a small real area and look at it with
 ## Be a good citizen of OpenStreetMap's servers
 
 KnoxMap uses free, volunteer-run services. Changes must keep to their usage
-policies (see [LEGAL.md](LEGAL.md)): no search-as-you-type, identify
-the app, cache what you fetch, and never bulk-download tiles.
+policies (see [LEGAL.md](LEGAL.md)): the search box may offer results as you
+type, but Nominatim still gets at most one request a second and a newer
+query replaces one that has not come back. Identify the app, cache what you
+fetch, and never bulk-download tiles. Map geometry comes from Geofabrik
+extracts read in the program, not from a grid of Overpass queries.
 
 ## Style
 
@@ -53,5 +56,9 @@ Add a `## <version>` section to `docs/CHANGELOG.md`, then push a tag:
     git tag v1.1
     git push origin v1.1
 
-GitHub Actions runs the checks, zips the repository as `KnoxMap-v1.1.zip` and
-publishes a release with that CHANGELOG section as its notes.
+GitHub Actions runs the checks and publishes one program file per system:
+`KnoxMap-v1.1-windows.exe`, `KnoxMap-v1.1-linux.AppImage`, and
+`KnoxMap-v1.1-macos.dmg`, with that CHANGELOG section as the notes. A tag
+whose suffix names one system (`v1.1-mc1`, `v1.1-win1`, `v1.1-lin1`) publishes
+only that system's file. The version the window shows is the first `##`
+heading in `docs/CHANGELOG.md`, so that heading has to be the version.

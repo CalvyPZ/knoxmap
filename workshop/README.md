@@ -32,8 +32,9 @@ browser will do it:
 
     chrome --headless=new --window-size=1600,1000       --screenshot=docs/branding/window.png       "http://localhost:<port>/?q=Rye%2C%20East%20Sussex&outline=1"
 
-Pick somewhere small enough to stay under the tile limit, or the panel shows
-a red warning instead of a green button.
+Pick somewhere small. A very large area warns in the panel; **Generate map**
+stays available, and the warning is what a screenshot of a normal town should
+not be showing.
 
 ## What subscribers get
 

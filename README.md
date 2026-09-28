@@ -6,7 +6,7 @@
 
 <p align="center"><strong>Draw any place on Earth. Play it in Project Zomboid.</strong></p>
 
-<p align="center">Made by <strong>euclid80tr</strong> · <a href="https://discord.gg/ePM8dSxPm7">Discord</a></p>
+<p align="center">Made by <strong>euclid80tr</strong> and <strong>CalvyPZ</strong> · <a href="https://discord.gg/ePM8dSxPm7">Discord</a></p>
 
 <p align="center">
   <img alt="Project Zomboid Build 42" src="https://img.shields.io/badge/Project%20Zomboid-Build%2042-8b0000"/>
@@ -100,9 +100,8 @@ actually lived, and installs the result as a mod.
 ## Quick start
 
 **You need:** Windows 10 or 11, or Linux, or macOS · **Project Zomboid Build 42**
-installed through Steam · an internet connection the first time ·
-[osmium-tool](https://osmcode.org/osmium-tool/) on your PATH, which reads the
-map extracts. Python is already inside the download.
+installed through Steam · an internet connection the first time. Python and
+the map reader are already inside the download.
 
 **From a git checkout** you need 64-bit Python 3.10+. In the `KnoxMap` folder,
 make the environment and start it:
@@ -174,11 +173,11 @@ The area is listed as layers, with its real size. **Overlay Vanilla Map**
 lays the base game's Knox County on the view, at the scale you picked, so you
 can judge how big a drawing is. Drag that overlay to move it.
 
-A selection larger than one mod is cut into pieces of 20 cells by 20 cells
-(6000 tiles on a side). The pieces meet on a cell edge, so the streets
+A selection larger than one mod is cut into pieces of 25 cells by 25 cells
+(7500 tiles on a side). The pieces meet on a cell edge, so the streets
 continue when every piece is enabled, and each piece is its own mod. The
 streets and buildings come from [Geofabrik](https://download.geofabrik.de/)'s
-daily regional extracts, read on your PC with osmium and kept under
+daily regional extracts, read on your PC and kept under
 `cache/geofabrik`. The list of named places inside the area still comes from
 the Overpass API.
 
@@ -251,7 +250,7 @@ second without rebuilding, then compile again so the game sees the change.
 - **North may not be up.** With *Straighten streets* on, the map is turned to
   its street grid, often by 20-45°. The in-game map is turned the same way.
 - **Map extracts are cached.** Regenerating the same area reuses the
-  Geofabrik file and the clip osmium already cut, so trying different
+  Geofabrik file and the clip already cut, so trying different
   settings is quick.
 - **A map is only as good as OpenStreetMap's data for that place.** Well-mapped
   city centres come out best; rural areas often lack buildings entirely.
@@ -309,9 +308,9 @@ playing. Help is very welcome here, especially screenshots from the game.
 | Setup fails | The whole run is written to `logs/setup.log`. Open KnoxMap again; if it fails the same way, post that file. |
 | Setup cannot find Project Zomboid | On **Setup → Game**, choose **Choose a folder** and pick the folder that contains the Project Zomboid jar. `KNOXMAP_STEAM_FOLDERS` can name extra Steam libraries, separated by `;`. |
 | Setup says the game looks like Build 41 | In Steam: right-click Project Zomboid → **Properties → Betas** → pick the Build 42 branch, then open KnoxMap again. |
-| *OSM query failed* | Generate reads a Geofabrik extract with osmium. Install [osmium-tool](https://osmcode.org/osmium-tool/) so `osmium` is on your PATH, then try again. Extracts already in `cache/geofabrik` are reused, so a second run does not download them again. |
+| *OSM query failed* | Generate reads a Geofabrik extract on this computer. The words after the colon are the reason. Extracts already in `cache/geofabrik` are reused, so a second run does not download them again. |
 | The map is not in the game | Enable it under **Mods**, then start a **new** game. |
-| The window did not open | The download is the window. From a git checkout, `cd desktop` and `npm install`, then start KnoxMap again, and look at `logs/knoxmap.log`. `KNOXMAP_BROWSER=1` opens KnoxMap in the browser instead. On Linux see [docs/LINUX.md](docs/LINUX.md). |
+| The window did not open | The download is the window. From a git checkout, look at `logs/knoxmap.log`. If `desktop/main.js` is there, `cd desktop` and `npm install`, then start KnoxMap again. Without it the page opens in the browser. `KNOXMAP_BROWSER=1` forces that. On Linux see [docs/LINUX.md](docs/LINUX.md). |
 | KnoxMap closes straight away | It shows a message and writes the error to `logs/knoxmap.log`. Open it again; most causes are in that file. |
 
 ### Reporting a problem
@@ -323,13 +322,13 @@ for Setup, and `worlded/` for the map compiler's own output.
 When something fails, the message in the app carries an id such as
 **E-7F3A2C**, the same id that sits beside the full error in the log.
 
-1. Click **Save report** on the error, or **report a problem** at the top of
-   the window. It saves `KnoxMap-report-….zip` into `logs` and shows it in
-   Explorer. The zip holds the logs and the settings of your last few maps;
-   your Windows user name is taken out of every path.
+1. Click **Save report** on the error. It saves `KnoxMap-report-….zip` into
+   `logs` and shows it in Explorer. The zip holds the logs and the settings of
+   your last few maps; your Windows user name is taken out of every path.
 2. Post the zip, the error id and a screenshot in **#bug-reports** on the
-   [Discord](https://discord.gg/ePM8dSxPm7), or
-   [open an issue](../../issues/new/choose).
+   [Discord](https://discord.gg/ePM8dSxPm7), or open an issue.
+   **Bug Reports** at the top of the window opens the
+   [issues page](https://github.com/spytheeuclidean-a11y/knoxmap/issues).
 
 ## For tinkerers
 
@@ -349,11 +348,14 @@ build step is `python -m knoxbuild`. `build_releases.bat` packs a command-line
 program next to the window; the GitHub release of the window is the `.exe`,
 AppImage, or dmg.
 
-The window is a small Electron app in `desktop/`. The release file packs it
-together with Python. To work on the window from a checkout: `cd desktop`,
-`npm install`, then start KnoxMap from the `KnoxMap` folder with
-`.venv\Scripts\pythonw.exe knoxmap.py`, or `./knoxmap.sh`. Both live in the
-`KnoxMap` folder. `KNOXMAP_ELECTRON` can point at a different Electron binary.
+The release file packs an Electron window together with Python. A checkout
+opens that window when `desktop/main.js` is present: `cd desktop`, `npm install`,
+then start KnoxMap from the `KnoxMap` folder with
+`.venv\Scripts\pythonw.exe knoxmap.py`, or `./knoxmap.sh`. Without that file
+the page opens in the browser. `KNOXMAP_BROWSER=1` forces the browser.
+`KNOXMAP_ELECTRON` can point at a different Electron binary. The checks
+workflow expects `desktop/main.js`, `desktop/build.mjs` and
+`desktop/make-icons.mjs`.
 
 - [docs/KNOXBUILD.md](docs/KNOXBUILD.md): how buildings, rooms, lifts, fences, streets and
   the population model work, and the measurements behind them.
@@ -412,7 +414,7 @@ for the background map, [Nominatim](https://operations.osmfoundation.org/policie
 for place search, and the [Overpass API](https://dev.overpass-api.de/overpass-doc/en/preface/commons.html)
 for the list of named places in an area. The streets, buildings, water and
 land of the map itself come from [Geofabrik](https://download.geofabrik.de/)'s
-daily extracts, read locally with osmium. **Add missing buildings** also
+daily extracts, read on this computer. **Add missing buildings** also
 reads [Overture](https://overturemaps.org) buildings from their public files.
 KnoxMap identifies itself, caches tiles, searches and extracts, searches
 after a short pause as you type, and paces its requests. Please do not modify
@@ -436,7 +438,7 @@ for any damage or loss from using KnoxMap or its maps.
 
 ## Credits and licences
 
-- **KnoxMap** is made by **euclid80tr**.
+- **KnoxMap** is made by **euclid80tr** and **CalvyPZ**.
 - **[Knoxify](https://github.com/arytek/knoxify)** by arytek: the original
   OpenStreetMap-to-Project-Zomboid terrain generator KnoxMap is built on.
 - **[PZ Mapping Tools](https://github.com/Unjammer/PZ_Mapping_Tools)** by Alree /
