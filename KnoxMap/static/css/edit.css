@@ -1,0 +1,71 @@
+/* Edit step: the georeferenced map and the compact sidebar tools. */
+
+#edit-map { background: var(--map); }
+#edit-map .leaflet-tile-pane { opacity: 0.45; }
+#edit-map .leaflet-paint-pane { opacity: var(--edit-terrain, 0.85); }
+#map-pane.is-editing #search-box { display: none; }
+
+#tabPanelEdit .edit-layers {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 10px;
+  margin-bottom: 8px;
+}
+#tabPanelEdit .edit-layer,
+#tabPanelEdit .edit-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+#tabPanelEdit .edit-check { margin: 0 0 8px; }
+#tabPanelEdit .edit-layer input,
+#tabPanelEdit .edit-check input { width: auto; margin: 0; }
+#tabPanelEdit .edit-opacity { margin-bottom: 8px; }
+#tabPanelEdit .edit-readout { font-variant-numeric: tabular-nums; margin: 0 0 8px; }
+#tabPanelEdit .edit-readout b,
+#tabPanelEdit .edit-meta b { font-weight: 600; color: var(--text); }
+#tabPanelEdit .edit-meta { margin: 0 0 8px; }
+#tabPanelEdit .field-label { margin-top: 12px; }
+#tabPanelEdit .edit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+#tabPanelEdit .edit-nudge {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+#tabPanelEdit .edit-nudge .field-label { margin: 0 4px 0 0; }
+#tabPanelEdit .edit-offset {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+#tabPanelEdit .edit-pending {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  max-height: 160px;
+  overflow: auto;
+}
+#tabPanelEdit .edit-pending li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 1.35;
+}
+#tabPanelEdit .edit-pending li span { flex: 1; min-width: 0; }
+#tabPanelEdit .btn[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+#editApply { margin-top: 8px; }
