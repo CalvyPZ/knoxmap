@@ -50,6 +50,12 @@ BLOCK = ramp_tile("N", 20)
 PLINTH = ramp_tile("N", 6)           # a block about a third of a storey tall
 
 DECK_FLOOR = "blends_street_01_64"   # street3, the tarmac of ordinary streets
+# A path or a track on a bridge keeps its own surface.
+DECK_TILE = {
+    "dirt_path": "blends_natural_01_64",    # dirt
+    "road_track": "blends_street_01_48",    # lightgravel, the track tiles
+    "paved_path": "blends_street_01_96",    # pale concrete
+}
 PAVING = "floors_exterior_tilesandstone_01_0"
 # fencing_01, black metal railing (knoxbuild/fences.py STYLES["black_metal"])
 RAIL_W, RAIL_N, RAIL_NW = "fencing_01_002", "fencing_01_001", "fencing_01_003"
@@ -60,11 +66,11 @@ FOUNTAIN = "location_community_park_01_48"
 POST_EVERY = 8
 
 ROAD_CATS = {"road_major", "road_medium", "road_minor", "road_service"}
-PATH_CATS = {"paved_path", "dirt_path"}
+PATH_CATS = {"paved_path", "dirt_path", "road_track"}
 # What a deck has to clear. Footpaths pass under a bridge at its abutment
 # often enough that lifting a road over each would raise half the bridges in a
-# park for nothing.
-CLEARS = ROAD_CATS | {"railway"}
+# park for nothing. A track is a road, so a bridge does clear it.
+CLEARS = ROAD_CATS | {"railway", "road_track"}
 LIFTS = ROAD_CATS | PATH_CATS | {"railway"}
 
 
@@ -334,45 +340,167 @@ def _substring(line: LineString, a: float, b: float) -> LineString:
     return substring(line, a, b)
 
 
+def _area_polygons(area):
+    kind = area.geom_type
+    if kind == "Polygon":
+        yield area
+    elif kind == "MultiPolygon":
+        yield from area.geoms
+    elif kind == "GeometryCollection":
+        for part in area.geoms:
+            yield from _area_polygons(part)
+
+
+def _scan_ring(ring, spans, y_lo: int, y_hi: int) -> None:
+    """Crossings of tile-centre rows with this ring.
+
+    A row at y + 0.5 counts an edge when one end is strictly above that
+    row and the other is on it or below, so a vertex is owned by one edge.
+    An edge that does not rise is not a crossing; the caps of a flat run
+    close that row instead.
+    """
+    pts = ring.coords
+    count = len(pts) - 1
+    if count < 1:
+        return
+    seq = [(pts[i][0], pts[i][1]) for i in range(count + 1)]
+    for i in range(count):
+        x1, y1 = seq[i]
+        x2, y2 = seq[i + 1]
+        # A rise this small is float noise on a flat edge, and dividing by
+        # it throws the crossing off by whole tiles. The caps still close
+        # the row.
+        if abs(y2 - y1) < 1e-9:
+            continue
+        y_low, y_high = (y1, y2) if y1 < y2 else (y2, y1)
+        start = math.floor(y_low - 0.5)
+        stop = math.floor(y_high - 0.5)
+        if start < y_lo:
+            start = y_lo
+        if stop >= y_hi:
+            stop = y_hi - 1
+        if start > stop:
+            continue
+        dy = y2 - y1
+        dx = x2 - x1
+        for y in range(start, stop + 1):
+            cy = y + 0.5
+            if cy < y_low or cy >= y_high:
+                continue
+            spans[y - y_lo].append(x1 + dx * ((cy - y1) / dy))
+
+
+def _covered_tiles(area, width: int, height: int) -> list[tuple[int, int]]:
+    """Map tiles whose centre ``contains`` would accept, without a point per cell.
+
+    Even-odd fill of the polygon edges proposes each row's run, two tiles
+    wider than the crossings so a rounding error still lands in the list.
+    ``contains_xy`` then keeps a centre only when it is strictly inside,
+    the same answer as ``area.contains(Point)``, and it does not build a
+    Point. Cells of the bounding box that the outline misses are never
+    tested.
+    """
+    if area.is_empty:
+        return []
+    x0, y0, x1, y1 = (int(math.floor(v)) for v in area.bounds)
+    y_lo = max(0, y0)
+    y_hi = min(height, y1 + 1)
+    x_lo = max(0, x0)
+    x_hi = min(width, x1 + 1)
+    if y_lo >= y_hi or x_lo >= x_hi:
+        return []
+    spans = [[] for _ in range(y_hi - y_lo)]
+    for poly in _area_polygons(area):
+        _scan_ring(poly.exterior, spans, y_lo, y_hi)
+        for hole in poly.interiors:
+            _scan_ring(hole, spans, y_lo, y_hi)
+    tiles = []
+    for row, xs in enumerate(spans):
+        if not xs:
+            continue
+        xs.sort()
+        y = y_lo + row
+        pair = 0
+        nxs = len(xs)
+        while pair + 1 < nxs:
+            left = xs[pair]
+            right = xs[pair + 1]
+            pair += 2
+            if not right > left:
+                continue
+            # x + 0.5 strictly between the crossings, plus a tile either side.
+            xa = max(x_lo, math.floor(left - 0.5) + 1 - 2)
+            xb = min(x_hi - 1, math.ceil(right - 0.5) - 1 + 2)
+            if xa <= xb:
+                tiles.extend((x, y) for x in range(xa, xb + 1))
+    if not tiles:
+        return []
+    from shapely import contains_xy
+    mask = contains_xy(
+        area,
+        [x + 0.5 for x, _y in tiles],
+        [y + 0.5 for _x, y in tiles])
+    try:
+        flags = [bool(v) for v in mask]
+    except TypeError:
+        flags = [bool(mask)]
+    return [tile for tile, ok in zip(tiles, flags) if ok]
+
+
+def _distances(line: LineString, tiles: list[tuple[int, int]]) -> list[float]:
+    """Distance along ``line`` of each tile centre. Same value as ``project``."""
+    from shapely import line_locate_point, points
+    raw = line_locate_point(line, points([(x + 0.5, y + 0.5) for x, y in tiles]))
+    if getattr(raw, "shape", ()):
+        dists = [float(v) for v in raw]
+    else:
+        dists = [float(raw)]
+    if len(dists) == len(tiles):
+        return dists
+    return [float(line.project(Point(x + 0.5, y + 0.5))) for x, y in tiles]
+
+
 def _lay_run(plan: Plan, line: LineString, h, level: int, width: float, cat: str, proj) -> None:
     half = width / 2
     area = line.buffer(half, cap_style=2)
-    x0, y0, x1, y1 = (int(math.floor(v)) for v in area.bounds)
+    tiles = _covered_tiles(area, proj.width, proj.height)
+    if not tiles:
+        return
+    dists = _distances(line, tiles)
+    length = float(line.length)
     deck: dict[int, set] = {}
     ramps: set = set()
-    for y in range(max(0, y0), min(proj.height, y1 + 1)):
-        for x in range(max(0, x0), min(proj.width, x1 + 1)):
-            centre = Point(x + 0.5, y + 0.5)
-            if not area.contains(centre):
-                continue
-            s = line.project(centre)
-            height = h(s)
-            if height <= 0:
-                continue
-            steps = int(round(height * RAMP_STEPS))
-            z, seg = divmod(steps, RAMP_STEPS)
-            if steps == 0:
-                continue
-            plan.clear_veg.add((x, y))
-            if seg == 0:
-                plan.put(x, y, z, "Floor", DECK_FLOOR)
-                deck.setdefault(z, set()).add((x, y))
-                continue
-            ahead = line.interpolate(min(line.length, s + 1)).coords[0]
-            behind = line.interpolate(max(0.0, s - 1)).coords[0]
-            dx, dy = ahead[0] - behind[0], ahead[1] - behind[1]
-            if h(min(line.length, s + 1)) < h(max(0.0, s - 1)):
-                dx, dy = -dx, -dy
-            if abs(dx) >= abs(dy):
-                direction = "E" if dx > 0 else "W"
-            else:
-                direction = "S" if dy > 0 else "N"
-            plan.put(x, y, z, "Floor", ramp_tile(direction, seg))
-            ramps.add((x, y))
+    for i, (x, y) in enumerate(tiles):
+        s = dists[i]
+        height = h(s)
+        if height <= 0:
+            continue
+        steps = int(round(height * RAMP_STEPS))
+        z, seg = divmod(steps, RAMP_STEPS)
+        if steps == 0:
+            continue
+        plan.clear_veg.add((x, y))
+        if seg == 0:
+            plan.put(x, y, z, "Floor", DECK_TILE.get(cat, DECK_FLOOR))
+            deck.setdefault(z, set()).add((x, y))
+            continue
+        ahead_s = min(length, s + 1.0)
+        behind_s = max(0.0, s - 1.0)
+        ahead = line.interpolate(ahead_s).coords[0]
+        behind = line.interpolate(behind_s).coords[0]
+        dx, dy = ahead[0] - behind[0], ahead[1] - behind[1]
+        if h(ahead_s) < h(behind_s):
+            dx, dy = -dx, -dy
+        if abs(dx) >= abs(dy):
+            direction = "E" if dx > 0 else "W"
+        else:
+            direction = "S" if dy > 0 else "N"
+        plan.put(x, y, z, "Floor", ramp_tile(direction, seg))
+        ramps.add((x, y))
     footprint = set(ramps).union(*deck.values()) if deck else set(ramps)
-    for z, tiles in deck.items():
-        _rail(plan, tiles, footprint, z)
-        _posts(plan, tiles, footprint, z)
+    for z, cells in deck.items():
+        _rail(plan, cells, footprint, z)
+        _posts(plan, cells, footprint, z)
 
 
 def _rail(plan: Plan, tiles: set, footprint: set, z: int) -> None:

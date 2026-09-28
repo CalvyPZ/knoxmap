@@ -77,6 +77,12 @@ OVERPASS_FILTERS: Sequence[str] = (
     'way["highway"]',
     'way["area:highway"]',
     'way["place"="square"]',
+    # What controls a junction. Ways come back as coordinates with no node
+    # ids, so the signal, the stop and the crossing have to be their own
+    # nodes (generator/intersections.py). A way crossing a tile is already
+    # complete; these nodes are not on it.
+    'node["highway"~"^(traffic_signals|stop|give_way|crossing|mini_roundabout|'
+    'turning_circle|turning_loop)$"]',
     # Monuments, statues and fountains: generator/structures.py
     'node["historic"~"^(monument|memorial)$"]',
     'way["historic"~"^(monument|memorial)$"]',
@@ -93,6 +99,14 @@ OVERPASS_FILTERS: Sequence[str] = (
     'military|cemetery|orchard|vineyard|allotments)$"]',
     'relation["landuse"~"^(residential|commercial|retail|industrial|railway|'
     'military|cemetery|orchard|vineyard)$"]',
+    # Airfields. The aerodrome is the grounds; runways, taxiways and aprons
+    # are the paved part of it, usually a line with a width or a closed way.
+    'way["aeroway"~"^(aerodrome|apron|runway|taxiway|helipad|heliport|terminal|hangar)$"]',
+    'relation["aeroway"~"^(aerodrome|apron|runway|taxiway|helipad|heliport|terminal|hangar)$"]',
+    # Station grounds, platforms and yards when they are not landuse=railway.
+    # The rails themselves are the railway filter further up.
+    'way["railway"~"^(station|halt|platform|yard)$"]',
+    'relation["railway"~"^(station|halt|platform|yard)$"]',
     'way["amenity"~"^(parking|school|university|college|kindergarten|hospital|'
     'clinic|bus_station|grave_yard|marketplace|place_of_worship)$"]',
     'relation["amenity"~"^(parking|school|university|college|hospital|'
@@ -131,7 +145,7 @@ OVERPASS_FILTERS: Sequence[str] = (
 
 # Bumped whenever the filters above change, so a cached download made with
 # the old list is fetched again instead of silently lacking the new features.
-FILTERS_VERSION = 10
+FILTERS_VERSION = 12
 
 
 @dataclass
@@ -504,6 +518,42 @@ UNPAVED_SURFACES = {"unpaved", "dirt", "earth", "ground", "grass", "gravel",
 # through whole blocks; a car park under a square covered the square in tarmac.
 TUNNEL_VALUES = {"yes", "building_passage", "culvert", "avalanche_protector", "flooded"}
 
+# Track centre lines. Yards, stations and platforms are areas, classified
+# with the other land use; these are the rails themselves.
+RAIL_TRACKS = frozenset({
+    "rail", "light_rail", "narrow_gauge", "disused", "preserved",
+})
+# Grounds mapped with railway=* rather than landuse=railway.
+RAIL_GROUNDS = frozenset({"station", "halt", "platform", "yard"})
+# The airfield. Aprons, runways and taxiways are the paved surface on it.
+AIRPORT_GROUNDS = frozenset({"aerodrome", "heliport"})
+AIRPORT_PAVED = frozenset({
+    "apron", "runway", "taxiway", "helipad", "terminal", "hangar",
+})
+AIRPORT_VALUES = AIRPORT_GROUNDS | AIRPORT_PAVED
+# What becomes an area a building can stand in. A runway is a surface, and
+# classifying the strip as the site would re-kind whatever it crosses.
+AIRPORT_AREAS = AIRPORT_GROUNDS | frozenset({
+    "apron", "helipad", "terminal", "hangar",
+})
+
+
+def is_rail_area(tags: dict) -> bool:
+    """True when these tags mark railway land, not a track centre line."""
+    if tags.get("landuse") == "railway":
+        return True
+    return tags.get("railway") in RAIL_GROUNDS
+
+
+def is_airport_ground(tags: dict) -> bool:
+    """True when these tags mark the airfield, not a runway or an apron."""
+    return tags.get("aeroway") in AIRPORT_GROUNDS
+
+
+def is_airport_area(tags: dict) -> bool:
+    """True when these tags mark airport land, not a runway or a taxiway."""
+    return tags.get("aeroway") in AIRPORT_AREAS
+
 
 def classify(tags: dict) -> str | None:
     """Map OSM tags to a PZ feature category string. None = ignore."""
@@ -516,6 +566,7 @@ def classify(tags: dict) -> str | None:
     amenity = tags.get("amenity")
     landuse = tags.get("landuse")
     leisure = tags.get("leisure")
+    military = landuse == "military" or (tags.get("military") or "no") != "no"
 
     # Paved areas before the linear road classes: a pedestrian square and a
     # car park are tagged highway/amenity too, but they are polygons and want
@@ -541,11 +592,19 @@ def classify(tags: dict) -> str | None:
         # streets paved every yard and car park aisle at full street width.
         if h in {"service", "pedestrian"}:
             return "road_service"
-        if h in {"track", "path", "footway", "cycleway", "bridleway", "steps"}:
+        # A farm track is a road, not a footpath. A paved one is a narrow
+        # street; anything else is laid with the track tiles, unless the
+        # mapper said the surface is dirt.
+        if h == "track":
+            surface = (tags.get("surface") or "").lower()
+            if surface in PAVED_SURFACES:
+                return "road_service"
+            return "road_track"
+        if h in {"path", "footway", "cycleway", "bridleway", "steps"}:
             # A city's pavements are mapped as footways alongside each street,
             # and painting them as dirt put a brown strip down every kerb in
             # Paris. Footways, cycleways and steps are paved unless the mapper
-            # says otherwise; tracks and paths are dirt unless they say paved.
+            # says otherwise; paths and bridleways are dirt unless they say paved.
             surface = (tags.get("surface") or "").lower()
             if surface in PAVED_SURFACES:
                 return "paved_path"
@@ -562,7 +621,14 @@ def classify(tags: dict) -> str | None:
         return "coastline"
     if tags.get("man_made") in {"pier", "breakwater", "groyne"}:
         return "pier"
-    if tags.get("railway") in {"rail", "light_rail", "narrow_gauge", "disused", "preserved"}:
+    if tags.get("railway") in RAIL_TRACKS:
+        return "railway"
+    # Before the land-cover tags. An aerodrome is often also grass, and a
+    # platform often sits inside a park; the aeroway or railway tag is the
+    # ground that was mapped. A military airfield stays a base.
+    if tags.get("aeroway") in AIRPORT_VALUES and not military:
+        return "airport"
+    if is_rail_area(tags):
         return "railway"
     if tags.get("natural") == "water" or tags.get("waterway") in {
             "river", "riverbank", "canal", "stream"}:
@@ -608,11 +674,11 @@ def classify(tags: dict) -> str | None:
         return "hospital_grounds"
     if amenity == "marketplace" or landuse in {"commercial", "retail"}:
         return "commercial"
-    if landuse in {"industrial", "railway"}:
+    if landuse == "industrial":
         return "industrial"
     # A base is as often drawn with military=* alone - airfield, barracks,
     # range, training_area, naval_base - as with landuse=military.
-    if landuse == "military" or (tags.get("military") or "no") != "no":
+    if military:
         return "military"
     if landuse == "residential":
         return "residential"
