@@ -33,10 +33,15 @@ from __future__ import annotations
 import struct
 import xml.etree.ElementTree as ET
 
+import numpy as np
+import shapely
+from shapely import STRtree
 from shapely.geometry import Polygon, box
 
 XML_CELL = 300
 BIN_CELL = 256
+# Cells of one outline clipped in one shapely.intersection call.
+_CLIP_BATCH = 128
 
 
 def _features(xml_path: str):
@@ -62,16 +67,8 @@ def _features(xml_path: str):
             yield rings, props
 
 
-def _pieces(rings, cell_x, cell_y):
-    """The part of a polygon inside one 256-tile cell, as ring lists."""
-    x0, y0 = cell_x * BIN_CELL, cell_y * BIN_CELL
-    try:
-        shape = Polygon(rings[0], rings[1:])
-        if not shape.is_valid:
-            shape = shape.buffer(0)
-        clipped = shape.intersection(box(x0, y0, x0 + BIN_CELL, y0 + BIN_CELL))
-    except Exception:  # noqa: BLE001 - a broken outline is left off, not fatal
-        return []
+def _polygons_to_pieces(clipped, x0, y0):
+    """Ring lists for the polygons in one clipped geometry, cell-local."""
     out = []
     for part in getattr(clipped, "geoms", [clipped]):
         if part.geom_type != "Polygon" or part.is_empty or part.area < 0.25:
@@ -85,6 +82,129 @@ def _pieces(rings, cell_x, cell_y):
         if piece:
             out.append(piece)
     return out
+
+
+def _pieces(rings, cell_x, cell_y):
+    """The part of a polygon inside one 256-tile cell, as ring lists."""
+    x0, y0 = cell_x * BIN_CELL, cell_y * BIN_CELL
+    try:
+        shape = Polygon(rings[0], rings[1:])
+        if not shape.is_valid:
+            shape = shape.buffer(0)
+        clipped = shape.intersection(box(x0, y0, x0 + BIN_CELL, y0 + BIN_CELL))
+        return _polygons_to_pieces(clipped, x0, y0)
+    except Exception:  # noqa: BLE001 - a broken outline is left off, not fatal
+        return []
+
+
+def _sorted_unique(cells: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """(cx, cy) with cy changing slowest, matching the old cell walk."""
+    cells.sort(key=lambda c: (c[1], c[0]))
+    out = []
+    prev = None
+    for cell in cells:
+        if cell != prev:
+            out.append(cell)
+            prev = cell
+    return out
+
+
+def _assign_feature_cells(multi) -> dict[int, list[tuple[int, int]]]:
+    """Cells each multi-cell outline crosses, from an STRtree of its bounds.
+
+    `multi` rows are (loaded index, minx, miny, maxx, maxy, cx0, cx1, cy0, cy1).
+    cx1 and cy1 are inclusive, as `max // BIN_CELL`.
+    """
+    assigned: dict[int, list[tuple[int, int]]] = {}
+    if not multi:
+        return assigned
+    keys: list[tuple[int, int]] = []
+    index_of: dict[tuple[int, int], int] = {}
+    spans = {}
+    bounds = np.empty((len(multi), 4), dtype=np.float64)
+    for i, (idx, minx, miny, maxx, maxy, cx0, cx1, cy0, cy1) in enumerate(multi):
+        bounds[i] = (minx, miny, maxx, maxy)
+        rx0, rx1 = max(0, cx0), cx1 + 1
+        ry0, ry1 = max(0, cy0), cy1 + 1
+        spans[idx] = (rx0, rx1, ry0, ry1)
+        if rx0 >= rx1 or ry0 >= ry1:
+            continue
+        for cy in range(ry0, ry1):
+            for cx in range(rx0, rx1):
+                key = (cx, cy)
+                if key not in index_of:
+                    index_of[key] = len(keys)
+                    keys.append(key)
+    hits: dict[int, list[tuple[int, int]]] = {}
+    if keys:
+        xs = np.array([cx * BIN_CELL for cx, _cy in keys], dtype=np.float64)
+        ys = np.array([cy * BIN_CELL for _cx, cy in keys], dtype=np.float64)
+        cell_boxes = shapely.box(xs, ys, xs + BIN_CELL, ys + BIN_CELL)
+        try:
+            tree = STRtree(shapely.box(bounds[:, 0], bounds[:, 1], bounds[:, 2], bounds[:, 3]))
+            pairs = np.asarray(tree.query(cell_boxes, predicate="intersects"))
+        except Exception:  # noqa: BLE001 - the span below is the same cell walk
+            pairs = np.empty((2, 0), dtype=np.int64)
+        if pairs.ndim == 1:
+            pairs = np.vstack((np.zeros(pairs.size, dtype=np.int64), pairs))
+        if pairs.size:
+            for ci, mi in zip(pairs[0].tolist(), pairs[1].tolist()):
+                idx = multi[mi][0]
+                cx, cy = keys[ci]
+                rx0, rx1, ry0, ry1 = spans[idx]
+                if rx0 <= cx < rx1 and ry0 <= cy < ry1:
+                    hits.setdefault(idx, []).append((cx, cy))
+    for idx, (rx0, rx1, ry0, ry1) in spans.items():
+        span_n = max(0, rx1 - rx0) * max(0, ry1 - ry0)
+        unique = _sorted_unique(hits[idx]) if idx in hits else []
+        if len(unique) == span_n:
+            if unique:
+                assigned[idx] = unique
+        elif span_n:
+            assigned[idx] = [(cx, cy) for cy in range(ry0, ry1) for cx in range(rx0, rx1)]
+    return assigned
+
+
+def _clip_shape(shape, rings, chunk):
+    """Pieces of `shape` inside each (cx, cy), in that order."""
+    x0 = np.array([cx * BIN_CELL for cx, _cy in chunk], dtype=np.float64)
+    y0 = np.array([cy * BIN_CELL for _cx, cy in chunk], dtype=np.float64)
+    boxes = shapely.box(x0, y0, x0 + BIN_CELL, y0 + BIN_CELL)
+    try:
+        geoms = np.asarray(shapely.intersection(shape, boxes), dtype=object).ravel()
+        if geoms.size != len(chunk):
+            raise RuntimeError("clip")
+    except Exception:  # noqa: BLE001 - one cell at a time still drops a broken outline
+        return [((cx, cy), _pieces(rings, cx, cy)) for cx, cy in chunk]
+    out = []
+    for geom, (cx, cy) in zip(geoms, chunk):
+        ox, oy = cx * BIN_CELL, cy * BIN_CELL
+        try:
+            pieces = _polygons_to_pieces(geom, ox, oy)
+        except Exception:  # noqa: BLE001
+            pieces = _pieces(rings, cx, cy)
+        out.append(((cx, cy), pieces))
+    return out
+
+
+def _append_clipped(cells, rings, props, cell_list) -> None:
+    try:
+        shape = Polygon(rings[0], rings[1:])
+        if not shape.is_valid:
+            shape = shape.buffer(0)
+        if shape.is_empty:
+            return
+    except Exception:  # noqa: BLE001
+        shape = None
+    for start in range(0, len(cell_list), _CLIP_BATCH):
+        chunk = cell_list[start:start + _CLIP_BATCH]
+        if shape is None:
+            groups = [((cx, cy), _pieces(rings, cx, cy)) for cx, cy in chunk]
+        else:
+            groups = _clip_shape(shape, rings, chunk)
+        for (cx, cy), pieces in groups:
+            for piece in pieces:
+                cells.setdefault((cx, cy), []).append((piece, props))
 
 
 # The game keeps all of a cell's points in one buffer and remembers where each
@@ -142,22 +262,32 @@ def _within_budget(features: list) -> list:
 
 def write_bin(xml_path: str, bin_path: str) -> int:
     """Convert worldmap.xml to worldmap.xml.bin. Returns features written."""
-    cells: dict[tuple[int, int], list] = {}
+    loaded = []
+    multi = []
     for rings, props in _features(xml_path):
         xs = [x for x, _ in rings[0]]
         ys = [y for _, y in rings[0]]
-        cx0, cx1 = min(xs) // BIN_CELL, max(xs) // BIN_CELL
-        cy0, cy1 = min(ys) // BIN_CELL, max(ys) // BIN_CELL
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        cx0, cx1 = minx // BIN_CELL, maxx // BIN_CELL
+        cy0, cy1 = miny // BIN_CELL, maxy // BIN_CELL
+        loaded.append((rings, props, cx0, cy0, cx1, cy1))
+        if not (cx0 == cx1 and cy0 == cy1):
+            multi.append((len(loaded) - 1, minx, miny, maxx, maxy, cx0, cx1, cy0, cy1))
+    assigned = _assign_feature_cells(multi)
+
+    cells: dict[tuple[int, int], list] = {}
+    for i, (rings, props, cx0, cy0, cx1, cy1) in enumerate(loaded):
         if cx0 == cx1 and cy0 == cy1:
             if cx0 < 0 or cy0 < 0:
                 continue
             local = [[(x - cx0 * BIN_CELL, y - cy0 * BIN_CELL) for x, y in r] for r in rings]
             cells.setdefault((cx0, cy0), []).append((local, props))
             continue
-        for cy in range(max(0, cy0), cy1 + 1):
-            for cx in range(max(0, cx0), cx1 + 1):
-                for piece in _pieces(rings, cx, cy):
-                    cells.setdefault((cx, cy), []).append((piece, props))
+        cell_list = assigned.get(i)
+        if not cell_list:
+            continue
+        _append_clipped(cells, rings, props, cell_list)
 
     for key in list(cells):
         cells[key] = _within_budget(cells[key])

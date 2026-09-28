@@ -11,10 +11,14 @@ user_tiles, used_tiles, used_furniture, the <room> list, then <floor>.
 """
 from __future__ import annotations
 
+import functools
 import random
 from xml.sax.saxutils import escape, quoteattr
 
+import numpy as np
+
 from . import catalog as C
+from .grids import erode, rooms_text
 from .layout import ROOM_STYLE, Building, Plan, _erika_ready, roof_rects
 
 # Version 4 is the first that carries a per-room Ceiling tile. Writing 3 still
@@ -22,13 +26,135 @@ from .layout import ROOM_STYLE, Building, Plan, _erika_ready, roof_rects
 # itself, so we may as well state them.
 VERSION = 4
 
+# A tile is interior when its whole 3x3 neighbourhood is roof. erode's default
+# footprint steps in by two; this one is the neighbourhood the plant used.
+_ROOF_INTERIOR = np.ones((3, 3), dtype=bool)
+
+
+_QUOTE: dict[str, str] = {}
+_ENTRY_XML: dict[tuple, str] = {}
+# The shared catalog rows are only read while a town is written, so their
+# XML is built on the first building and reused.
+_BASE_ENTRY_XML: list[str] | None = None
+
+
+def _quote(value: str) -> str:
+    """quoteattr, without the escape scan for the usual tile and enum names.
+
+    quoteattr wraps in double quotes when the text has no ``&``, ``<``, ``>``
+    or ``"``. Anything else, including a quote or an ampersand, goes through
+    quoteattr so the escaping stays its.
+    """
+    hit = _QUOTE.get(value)
+    if hit is not None:
+        return hit
+    if any(ch in "&<>\"" for ch in value):
+        hit = quoteattr(value)
+    else:
+        hit = f'"{value}"'
+    _QUOTE[value] = hit
+    return hit
+
 
 def _attrs(pairs: list[tuple[str, object]]) -> str:
     # Nearly every value is a coordinate or an index. Quoting those through
-    # quoteattr, nine million calls for a town, was 40% of the time spent
-    # writing buildings; numbers never need escaping.
-    return "".join(f' {k}="{v}"' if type(v) is int else f" {k}={quoteattr(str(v))}"
-                   for k, v in pairs)
+    # quoteattr, tens of millions of calls for a town, was most of the time
+    # spent writing buildings; numbers never need escaping.
+    parts = []
+    append = parts.append
+    quote = _quote
+    for key, value in pairs:
+        if type(value) is int:
+            append(f' {key}="{value}"')
+        elif type(value) is str:
+            append(f" {key}={quote(value)}")
+        else:
+            append(f" {key}={quote(str(value))}")
+    return "".join(parts)
+
+
+def _entry_xml(entry: dict) -> str:
+    tiles = entry["tiles"]
+    items = tuple(tiles.items())
+    key = (entry["category"], items)
+    hit = _ENTRY_XML.get(key)
+    if hit is not None:
+        return hit
+    lines = [f" <tile_entry category={_quote(entry['category'])}>"]
+    for enum_name, tile in items:
+        lines.append(f"  <tile enum={_quote(enum_name)} tile={_quote(tile)}/>")
+    lines.append(" </tile_entry>")
+    hit = "\n".join(lines)
+    _ENTRY_XML[key] = hit
+    return hit
+
+
+def _base_entry_xml() -> list[str]:
+    global _BASE_ENTRY_XML
+    if _BASE_ENTRY_XML is None:
+        _BASE_ENTRY_XML = [_entry_xml(entry) for entry in C.TILE_ENTRIES]
+    return _BASE_ENTRY_XML
+
+
+def _fingerprint(entry: dict) -> tuple:
+    """Category plus tiles in key order. The first copy of a fingerprint wins."""
+    return (entry["category"], tuple(sorted(entry["tiles"].items())))
+
+
+def _remember(index: dict[tuple, int], entry: dict, at: int) -> None:
+    index.setdefault(_fingerprint(entry), at)
+
+
+def _add(entries: list[dict], index: dict[tuple, int], entry: dict | None) -> int:
+    """The 1-based index of `entry` in the tile-entry table, appending it if it
+    is not there yet; 0, BuildingEd's "none", for no entry."""
+    if not entry:
+        return 0
+    key = _fingerprint(entry)
+    found = index.get(key)
+    if found is not None:
+        return found
+    entries.append(entry)
+    index[key] = len(entries)
+    return len(entries)
+
+
+def _append_entry(entries: list[dict], index: dict[tuple, int], entry: dict) -> None:
+    """Append even when the same tiles are already in the table.
+
+    Style walls and the per-building roof cap are always their own rows.
+    Lookup still resolves to the first copy, which is what a scan used to do.
+    """
+    entries.append(entry)
+    _remember(index, entry, len(entries))
+
+
+@functools.lru_cache(maxsize=None)
+def _furniture_xml(role: str) -> str:
+    """One <furniture> block for this role, built once.
+
+    BuildingWriter only writes a layer when it is not the default. Leaving
+    it off a wall piece drops it onto the floor layer, which is how light
+    switches, paintings and mirrors ended up standing mid-room.
+
+    All four facings, in the order BuildingWriter emits them. Writing only
+    W and N leaves the E/S slots empty, so any object facing that way
+    renders as nothing at all.
+    """
+    layer = C.FURNITURE_LAYERS.get(role, "Furniture")
+    lines = [" <furniture>" if layer == "Furniture"
+             else f" <furniture layer={quoteattr(layer)}>"]
+    for orient in ("W", "N", "E", "S"):
+        tiles = C.FURNITURE[role].get(orient)
+        if not tiles:
+            continue
+        lines.append(f'  <entry orient="{orient}">')
+        for key, tile in tiles.items():
+            dx, dy = key.split(",")
+            lines.append(f'   <tile x="{dx}" y="{dy}" name={quoteattr(tile)}/>')
+        lines.append("  </entry>")
+    lines.append(" </furniture>")
+    return "\n".join(lines)
 
 
 # A pitched roof needs room for two slopes; a narrower strip of a house (a
@@ -110,12 +236,12 @@ ROOF_AC_EVERY = 90
 ROOF_VENT_EVERY = 60
 
 
-def _rooftop(grid: list[list[int]], width: int, height: int) -> list[tuple[str, int, int, str]]:
-    import random
-
-    tiles = [(x, y) for y in range(1, height - 1) for x in range(1, width - 1)
-             if all(grid[y + dy][x + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1))]
-    area = sum(1 for row in grid for v in row if v)
+def _rooftop(grid, width: int, height: int) -> list[tuple[str, int, int, str]]:
+    g = np.asarray(grid)
+    ys, xs = np.nonzero(erode(g, _ROOF_INTERIOR))
+    # Row-major (x, y), the order the old y-then-x scan handed to the shuffle.
+    tiles = list(zip(xs.tolist(), ys.tolist()))
+    area = int(np.count_nonzero(g))
     if area < ROOF_MIN_TILES or not tiles:
         return []
     rng = random.Random(width * 7919 + height * 104729 + area)
@@ -139,11 +265,13 @@ def _storefront_runs(storey, doors) -> list[tuple[str, int, int, int]]:
     fixed coordinate, first tile along, length). A run spans from its first
     glazed tile to its last, taking in the doors and the bits of wall beside
     them, and stops wherever the line is no longer an outside wall."""
-    grid = storey.grid
-    h, w = len(grid), len(grid[0])
+    grid = np.asarray(storey.grid)
+    height, width = grid.shape
 
     def cell(x, y):
-        return grid[y][x] if 0 <= x < w and 0 <= y < h else 0
+        if 0 <= x < width and 0 <= y < height:
+            return int(grid[y, x])
+        return 0
 
     def outside(d, fixed, t):
         x, y = (fixed, t) if d == "W" else (t, fixed)
@@ -176,17 +304,6 @@ def _storefront_runs(storey, doors) -> list[tuple[str, int, int, int]]:
     return runs
 
 
-def _add(entries: list[dict], entry: dict | None) -> int:
-    """The 1-based index of `entry` in the tile-entry table, appending it if it
-    is not there yet; 0, BuildingEd's "none", for no entry."""
-    if not entry:
-        return 0
-    if entry in entries:
-        return entries.index(entry) + 1
-    entries.append(entry)
-    return len(entries)
-
-
 def render_tbx(plan: Plan | Building, name: str,
                style: dict | None = None) -> str:
     """Return the complete .tbx document for a plan or a stack of them.
@@ -202,6 +319,9 @@ def render_tbx(plan: Plan | Building, name: str,
     storeys = building.storeys
 
     entries = list(C.TILE_ENTRIES)
+    entry_index: dict[tuple, int] = {}
+    for at, entry in enumerate(entries, start=1):
+        _remember(entry_index, entry, at)
     exterior_idx = C.EXTERIOR_WALL
     interior_idx = C.INTERIOR_WALL
     floor_override = None
@@ -214,38 +334,41 @@ def render_tbx(plan: Plan | Building, name: str,
     roof30 = False
 
     if style:
-        entries.append(style["exterior"])
+        _append_entry(entries, entry_index, style["exterior"])
         exterior_idx = len(entries)
-        entries.append(style["interior"])
+        _append_entry(entries, entry_index, style["interior"])
         interior_idx = len(entries)
         if style.get("floor"):
-            entries.append(style["floor"])
+            _append_entry(entries, entry_index, style["floor"])
             floor_override = len(entries)
         if style.get("window"):
-            entries.append(style["window"])
+            _append_entry(entries, entry_index, style["window"])
             window_idx = len(entries)
-        curtains_idx = _add(entries, style.get("curtains")) if "curtains" in style else C.CURTAINS
+        curtains_idx = _add(entries, entry_index, style.get("curtains")) if "curtains" in style else C.CURTAINS
         # Taller buildings of a kind take bigger windows: the last row whose
         # storey count this building reaches.
         for levels, entry, curtains in style.get("windows_by_levels") or ():
             if len(storeys) >= levels and levels > 1:
-                window_idx = _add(entries, entry)
-                curtains_idx = _add(entries, curtains)
-        trim_idx = _add(entries, style.get("trim"))
-        shutters_idx = _add(entries, style.get("shutters"))
-        grime_idx = _add(entries, style.get("grime"))
+                window_idx = _add(entries, entry_index, entry)
+                curtains_idx = _add(entries, entry_index, curtains)
+        trim_idx = _add(entries, entry_index, style.get("trim"))
+        shutters_idx = _add(entries, entry_index, style.get("shutters"))
+        grime_idx = _add(entries, entry_index, style.get("grime"))
         if style.get("roof"):
             roof = style["roof"]
             if roof.get("slopes"):
-                slope_idx = _add(entries, roof["slopes"])
-            top_idx = _add(entries, roof["tops"])
+                slope_idx = _add(entries, entry_index, roof["slopes"])
+            top_idx = _add(entries, entry_index, roof["tops"])
             peaked = bool(roof.get("peaked"))
             # 30-degree roofs only where the gable ends have 30-degree tiles.
-            roof30 = "CapPeak30S1" in ((roof.get("caps") or {}).get("tiles") or {})                 and "Slope30S1" in ((roof.get("slopes") or {}).get("tiles") or {})
+            roof30 = (
+                "CapPeak30S1" in ((roof.get("caps") or {}).get("tiles") or {})
+                and "Slope30S1" in ((roof.get("slopes") or {}).get("tiles") or {})
+            )
         if style.get("shop_front"):
             entry, curtains = style["shop_front"]
-            front_idx = _add(entries, entry)
-            front_curtains = _add(entries, curtains)
+            front_idx = _add(entries, entry_index, entry)
+            front_curtains = _add(entries, entry_index, curtains)
     # With Erika's Tiles, a shop front is a wall of glass in a painted frame,
     # not windows set in brick, and a sign hangs over it.
     runs: list[tuple[str, int, int, int]] = []
@@ -255,7 +378,9 @@ def render_tbx(plan: Plan | Building, name: str,
     if front_idx and C.ERIKA_STOREFRONTS and storeys[0].shop_front and _erika_ready():
         rng = random.Random(name)
         ext, inte, door = rng.choice(C.ERIKA_STOREFRONTS)
-        store_ext, store_int, store_door = _add(entries, ext), _add(entries, inte), _add(entries, door)
+        store_ext = _add(entries, entry_index, ext)
+        store_int = _add(entries, entry_index, inte)
+        store_door = _add(entries, entry_index, door)
         # A one-tile run is a step in a slanted wall, not a shop window.
         runs = [r for r in _storefront_runs(storeys[0], storeys[0].doors) if r[3] >= 2]
         for d, fixed, start, length in runs:
@@ -264,10 +389,11 @@ def render_tbx(plan: Plan | Building, name: str,
         # The sign goes on the longest run the street can see, one storey up
         # so it hangs above the glass. Only the south and east faces are
         # seen: a sign on a north or west wall is drawn on its inner side.
-        grid = storeys[0].grid
+        grid = np.asarray(storeys[0].grid)
+        gh, gw = int(grid.shape[0]), int(grid.shape[1])
         seen = [r for r in runs
-                if (r[0] == "N" and (r[1] >= len(grid) or not grid[r[1]][r[2]]))
-                or (r[0] == "W" and (r[1] >= len(grid[0]) or not grid[r[2]][r[1]]))]
+                if (r[0] == "N" and (r[1] >= gh or not grid[r[1], r[2]]))
+                or (r[0] == "W" and (r[1] >= gw or not grid[r[2], r[1]]))]
         if seen:
             d, fixed, start, length = max(seen, key=lambda r: r[3])
             fits = [s for s in C.ERIKA_SIGNS.get(d, ()) if len(s) <= length]
@@ -285,19 +411,20 @@ def render_tbx(plan: Plan | Building, name: str,
         base = ((style or {}).get("roof") or {}).get("caps") or entries[C.ROOF_CAP - 1]
         cap = dict(base["tiles"])
         cap["CapGapE3"], cap["CapGapS3"] = ext_tiles["West"], ext_tiles["North"]
-        entries.append({"category": "roof_caps", "tiles": cap})
+        _append_entry(entries, entry_index, {"category": "roof_caps", "tiles": cap})
         roof_cap_idx = len(entries)
 
     rooftop = [] if peaked else _rooftop(storeys[-1].grid, building.width, building.height)
     # Which furniture roles this building actually uses, in first-use order.
-    roles: list[str] = []
+    # The index is 0-based, which is how furniture entries are referenced.
+    role_to_idx: dict[str, int] = {}
     for storey in storeys:
         for role, _x, _y, _o in storey.furniture:
-            if role not in roles:
-                roles.append(role)
+            if role not in role_to_idx:
+                role_to_idx[role] = len(role_to_idx)
     for role, _x, _y, _o in rooftop:
-        if role not in roles:
-            roles.append(role)
+        if role not in role_to_idx:
+            role_to_idx[role] = len(role_to_idx)
 
     out: list[str] = ['<?xml version="1.0" encoding="UTF-8"?>']
 
@@ -320,37 +447,23 @@ def render_tbx(plan: Plan | Building, name: str,
     ]
     out.append(f"<building{_attrs(building_attrs)}>")
 
-    for entry in entries:
-        out.append(f' <tile_entry category={quoteattr(entry["category"])}>')
-        for enum_name, tile in entry["tiles"].items():
-            out.append(f'  <tile enum={quoteattr(enum_name)} tile={quoteattr(tile)}/>')
-        out.append(" </tile_entry>")
+    base_n = len(C.TILE_ENTRIES)
+    if len(entries) >= base_n and all(entries[i] is C.TILE_ENTRIES[i] for i in range(base_n)):
+        out.extend(_base_entry_xml())
+        extra = entries[base_n:]
+    else:
+        extra = entries
+    for entry in extra:
+        out.append(_entry_xml(entry))
 
-    for role in roles:
-        # BuildingWriter only writes a layer when it is not the default. Leaving
-        # it off a wall piece drops it onto the floor layer, which is how light
-        # switches, paintings and mirrors ended up standing mid-room.
-        layer = C.FURNITURE_LAYERS.get(role, "Furniture")
-        out.append(" <furniture>" if layer == "Furniture"
-                   else f" <furniture layer={quoteattr(layer)}>")
-        # All four facings, in the order BuildingWriter emits them. Writing only
-        # W and N leaves the E/S slots empty, so any object facing that way
-        # renders as nothing at all.
-        for orient in ("W", "N", "E", "S"):
-            tiles = C.FURNITURE[role].get(orient)
-            if not tiles:
-                continue
-            out.append(f'  <entry orient="{orient}">')
-            for key, tile in tiles.items():
-                dx, dy = key.split(",")
-                out.append(f'   <tile x="{dx}" y="{dy}" name={quoteattr(tile)}/>')
-            out.append("  </entry>")
-        out.append(" </furniture>")
+    for role in role_to_idx:
+        out.append(_furniture_xml(role))
 
     names = sorted({t for tiles in user_tiles.values() for t in tiles.values()})
+    name_to_idx = {tile: i + 1 for i, tile in enumerate(names)}
     if names:
         out.append(" <user_tiles>")
-        out.extend(f"  <tile tile={quoteattr(t)}/>" for t in names)
+        out.extend(f"  <tile tile={_quote(t)}/>" for t in names)
         out.append(" </user_tiles>")
 
     def user_tile_layer(level: int) -> str | None:
@@ -358,16 +471,15 @@ def render_tbx(plan: Plan | Building, name: str,
         if not tiles:
             return None
         cols, rows = building.width + 1, building.height + 1
-        text = ["\n"]
-        for y in range(rows):
-            row = [str(names.index(tiles[(x, y)]) + 1) if (x, y) in tiles else "0"
-                   for x in range(cols)]
-            text.append(",".join(row) + ("," if y < rows - 1 else "") + "\n")
-        return '  <tiles layer="WallFurniture">' + escape("".join(text)) + "</tiles>"
+        layer = np.zeros((rows, cols), dtype=np.int32)
+        for (x, y), tile in tiles.items():
+            if 0 <= x < cols and 0 <= y < rows:
+                layer[y, x] = name_to_idx[tile]
+        return '  <tiles layer="WallFurniture">' + escape(rooms_text(layer)) + "</tiles>"
 
     used = " ".join(str(i) for i in range(1, len(entries) + 1))
     out.append(f" <used_tiles>{used}</used_tiles>")
-    used_f = " ".join(str(i) for i in range(len(roles)))
+    used_f = " ".join(str(i) for i in range(len(role_to_idx)))
     out.append(f" <used_furniture>{used_f}</used_furniture>")
 
     for room in building.rooms:
@@ -424,7 +536,7 @@ def render_tbx(plan: Plan | Building, name: str,
 
         for role, x, y, orient in storey.furniture:
             attrs = [("type", "furniture"),
-                     ("FurnitureTiles", roles.index(role)),
+                     ("FurnitureTiles", role_to_idx[role]),
                      ("orient", orient), ("x", x), ("y", y)]
             out.append(f"  <object{_attrs(attrs)}/>")
 
@@ -444,10 +556,14 @@ def render_tbx(plan: Plan | Building, name: str,
         # a roof over its own back yard.
         # A roof over whatever of this storey has no storey above it: the
         # whole top floor, and the ledge where a tower steps back.
-        above = storeys[level + 1].grid if level + 1 < len(storeys) else None
-        exposed = [[v if above is None or not above[y][x] else 0
-                    for x, v in enumerate(row)] for y, row in enumerate(storey.grid)]
-        if any(any(row) for row in exposed):
+        storey_grid = np.asarray(storey.grid)
+        if level + 1 < len(storeys):
+            above = np.asarray(storeys[level + 1].grid)
+            exposed = np.where(above != 0, np.int32(0), storey_grid)
+        else:
+            above = None
+            exposed = storey_grid
+        if np.any(exposed):
             rects = roof_rects(exposed)
             for roof_type, depth, cap, (rx, ry, rw, rh) in _roof_pieces(
                     rects, peaked and above is None, roof30):
@@ -474,19 +590,9 @@ def render_tbx(plan: Plan | Building, name: str,
                 # walls. Pitched roofs go on the roof floor above instead.
                 (attic if roof_type != "FlatTop" else out).append(line)
 
-        # Match BuildingWriter byte for byte: a comma follows every value
-        # except the very last one, and each row ends with a newline.
-        grid = building.grid_for(level)
-        text = ["\n"]
-        count, total = 0, building.width * building.height
-        for y in range(building.height):
-            for x in range(building.width):
-                text.append(str(grid[y][x]))
-                count += 1
-                if count < total:
-                    text.append(",")
-            text.append("\n")
-        out.append("  <rooms>" + escape("".join(text)) + "</rooms>")
+        # rooms_text is the BuildingWriter grid: a comma after every cell but
+        # the last, and a newline after every row. escape() is applied here.
+        out.append("  <rooms>" + escape(rooms_text(np.asarray(building.grid_for(level)))) + "</rooms>")
         if (layer := user_tile_layer(level)):
             out.append(layer)
 
@@ -494,22 +600,14 @@ def render_tbx(plan: Plan | Building, name: str,
 
     # The roof floor: no rooms. It holds the pitched roofs, and the flat roof
     # tops BuildingEd places here from the depth-three roofs below.
-    empty = ["\n"]
-    count, total = 0, building.width * building.height
-    for _y in range(building.height):
-        for _x in range(building.width):
-            empty.append("0")
-            count += 1
-            if count < total:
-                empty.append(",")
-        empty.append("\n")
+    empty_rooms = escape(rooms_text(np.zeros((building.height, building.width), dtype=np.int32)))
     out.append(" <floor>")
     out.extend(attic)
     for role, x, y, orient in rooftop:
-        attrs = [("type", "furniture"), ("FurnitureTiles", roles.index(role)),
+        attrs = [("type", "furniture"), ("FurnitureTiles", role_to_idx[role]),
                  ("orient", orient), ("x", x), ("y", y)]
         out.append(f"  <object{_attrs(attrs)}/>")
-    out.append("  <rooms>" + escape("".join(empty)) + "</rooms>")
+    out.append("  <rooms>" + empty_rooms + "</rooms>")
     if (layer := user_tile_layer(len(storeys))):
         out.append(layer)
     out.append(" </floor>")
@@ -517,7 +615,7 @@ def render_tbx(plan: Plan | Building, name: str,
         # A pitched roof's top rises a full storey above the roof floor, and
         # BuildingEd lays what is up there on the floor above that.
         out.append(" <floor>")
-        out.append("  <rooms>" + escape("".join(empty)) + "</rooms>")
+        out.append("  <rooms>" + empty_rooms + "</rooms>")
         out.append(" </floor>")
     out.append("</building>")
     return "\n".join(out) + "\n"

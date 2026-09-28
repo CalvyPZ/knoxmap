@@ -17,7 +17,11 @@ import math
 import os
 from xml.sax.saxutils import quoteattr
 
+import knoxstop
+import numpy as np
+
 from . import catalog as C
+from .grids import colour_mask, rooms_text
 
 CELL = 300
 
@@ -72,7 +76,7 @@ def style_for(tags: dict, area: str | None) -> str:
         return "tall_concrete"
     kind = (tags.get("fence_type") or tags.get("material") or "").lower()
     if kind in {"chain_link", "chain", "mesh"}:
-        return "tall_chainlink" if area in {"industrial", "military"} else "short_chainlink"
+        return "tall_chainlink" if area in {"industrial", "military", "airport", "railway"} else "short_chainlink"
     if kind in {"wood", "wooden", "split_rail", "board", "panel"}:
         return "tall_wooden"
     if kind in {"picket", "pales"}:
@@ -85,6 +89,7 @@ def style_for(tags: dict, area: str | None) -> str:
         return "tall_concrete"
     return {
         "industrial": "tall_chainlink", "military": "tall_chainlink",
+        "airport": "tall_chainlink", "railway": "tall_chainlink",
         "schoolyard": "short_chainlink", "sports": "short_chainlink",
         "residential": "tall_wooden", "cemetery": "black_metal",
         "worship_grounds": "black_metal", "hospital_grounds": "black_metal",
@@ -123,7 +128,6 @@ def _grid_path(points: list[tuple[float, float]]) -> list[tuple[int, int]]:
 
 def _tarmac_mask(bmp_path: str, width: int, height: int):
     """True where the ground is a road, service lane or car park."""
-    import numpy as np
     from PIL import Image
 
     from generator import pz_colors as C
@@ -133,18 +137,13 @@ def _tarmac_mask(bmp_path: str, width: int, height: int):
     ground = np.asarray(Image.open(bmp_path).convert("RGB"))
     if ground.shape[:2] != (height, width):
         return None
-    mask = np.zeros((height, width), dtype=bool)
-    for colour in (C.LIGHT_ASPHALT, C.MEDIUM_ASPHALT, C.DARK_ASPHALT,
-                   C.DARKEST_ASPHALT, C.DARK_POTHOLE, C.LIGHT_POTHOLE):
-        same = ground[:, :, 0] == colour[0]
-        same &= ground[:, :, 1] == colour[1]
-        same &= ground[:, :, 2] == colour[2]
-        mask |= same
-    return mask
+    return colour_mask(ground, (C.LIGHT_ASPHALT, C.MEDIUM_ASPHALT, C.DARK_ASPHALT,
+                                C.DARKEST_ASPHALT, C.DARK_POTHOLE, C.LIGHT_POTHOLE))
 
 
 def build_fences(out_dir: str, map_name: str, proj, occupied, areas,
-                 bdir: str, extra: list | None = None) -> tuple[list, int]:
+                 bdir: str, extra: list | None = None,
+                 should_stop=None) -> tuple[list, int]:
     """Write one fence .tbx per map cell that has fences. Returns placements."""
     from .world import Placement
 
@@ -205,7 +204,9 @@ def build_fences(out_dir: str, map_name: str, proj, occupied, areas,
         todo.append((pts, style))
         for gx, gy in (item[2] if len(item) > 2 else ()):
             gates[(gx, gy)] = style
-    for pts, style in todo:
+    for n, (pts, style) in enumerate(todo):
+        if n % 32 == 0:
+            knoxstop.check(should_stop, "the buildings")
         walk = _grid_path(pts)
         for (x1, y1), (x2, y2) in zip(walk, walk[1:]):
             if y1 == y2:                      # along a north edge
@@ -317,8 +318,7 @@ def render_fence_tbx(width: int, height: int,
     for (x, y), tile in sorted(pieces.items()):
         out.append(f'  <object type="furniture" FurnitureTiles="{index[tile]}" '
                    f'orient="W" x="{x}" y="{y}"/>')
-    grid = "\n" + "\n".join(",".join("0" for _ in range(width)) + ("," if y < height - 1 else "")
-                            for y in range(height)) + "\n"
+    grid = rooms_text(np.zeros((height, width), dtype=np.int32))
     out.append("  <rooms>" + grid + "</rooms>")
     out.append(" </floor>")
     out.append("</building>")

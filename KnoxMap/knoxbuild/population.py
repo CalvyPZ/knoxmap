@@ -25,8 +25,11 @@ import os
 
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 
 from generator import pz_colors as C
+
+from .grids import colour_mask
 
 CHUNK = C.SPAWN_MAP_SCALE     # tiles per spawn-map pixel, each way
 
@@ -88,10 +91,8 @@ def _ground_shares(path: str, gw: int, gh: int) -> tuple[np.ndarray, np.ndarray]
                                             (top + rows) * CHUNK)))
             if strip.shape[:2] != (rows * CHUNK, gw * CHUNK):
                 continue
-            is_paved = np.zeros(strip.shape[:2], dtype=bool)
-            for colour in STREET_COLOURS:
-                is_paved |= np.all(strip == colour, axis=2)
-            is_water = np.all(strip == np.array(C.WATER), axis=2)
+            is_paved = colour_mask(strip, STREET_COLOURS)
+            is_water = colour_mask(strip, (C.WATER,))
             shape = (rows, CHUNK, gw, CHUNK)
             paved[top:top + rows] = is_paved.reshape(shape).mean(axis=(1, 3))
             water[top:top + rows] = is_water.reshape(shape).mean(axis=(1, 3))
@@ -112,12 +113,16 @@ def occupants(kind: str, tiles: int, levels: int, metres_per_tile: float,
 
 def _soften(grid: np.ndarray) -> np.ndarray:
     """A small separable blur, [1 4 6 4 1] each way, that keeps the total."""
+    if grid.size == 0:
+        return grid
+    # The same 5-tap as summing the padded slices: centred kernel, zeros
+    # outside the map, horizontal then vertical.
     k = np.array([1, 4, 6, 4, 1], dtype=float) / 16.0
-    padded = np.pad(grid, 2, mode="constant")
-    rows = sum(k[i] * padded[:, i:i + grid.shape[1]] for i in range(5))
-    cols = sum(k[i] * rows[i:i + grid.shape[0], :] for i in range(5))
+    blurred = ndimage.convolve1d(grid, k, axis=1, mode="constant", cval=0.0)
+    blurred = ndimage.convolve1d(blurred, k, axis=0, mode="constant", cval=0.0)
     total = grid.sum()
-    return cols * (total / cols.sum()) if cols.sum() > 0 else cols
+    scale = blurred.sum()
+    return blurred * (total / scale) if scale > 0 else blurred
 
 
 def build_spawn_map(buildings: list[tuple[int, int, np.ndarray, int, str]],

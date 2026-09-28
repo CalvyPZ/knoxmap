@@ -22,6 +22,7 @@ import os
 import random
 
 import numpy as np
+import shapely
 from PIL import Image
 
 from generator import pz_colors as C
@@ -71,6 +72,22 @@ def _blocked_mask(ground: np.ndarray) -> np.ndarray:
     return out
 
 
+def _cells_inside(poly, xs, ys, rows: int = 128):
+    """Tile coordinates whose centres sit in `poly`, row-major in (y, x)."""
+    xs = np.asarray(xs)
+    ys = np.asarray(ys)
+    if xs.size == 0 or ys.size == 0:
+        return
+    cx = xs.astype(np.float64, copy=False) + 0.5
+    for i0 in range(0, int(ys.size), rows):
+        sub = ys[i0:i0 + rows]
+        cy = sub.astype(np.float64, copy=False) + 0.5
+        xx, yy = np.meshgrid(cx, cy)
+        iy, ix = np.nonzero(shapely.contains_xy(poly, xx, yy))
+        for x, y in zip(xs[ix].tolist(), sub[iy].tolist()):
+            yield int(x), int(y)
+
+
 def _polygons(areas, category: str) -> list:
     """The land-use polygons of one category, in tiles."""
     return [shape for shape, props in getattr(areas, "_items", [])
@@ -86,8 +103,6 @@ def place_props(out_dir: str, map_name: str, bdir: str, occupied: np.ndarray,
     water are left alone, and anything put down is cleared of trees so a
     headstone does not grow out of a pine.
     """
-    from shapely.geometry import Point
-
     from .world import Placement
 
     bmp = os.path.join(out_dir, f"{map_name}.bmp")
@@ -126,25 +141,22 @@ def place_props(out_dir: str, map_name: str, bdir: str, occupied: np.ndarray,
         if counts["graves"] >= MAX_GRAVES:
             break
         minx, miny, maxx, maxy = (int(v) for v in poly.bounds)
-        row = 0
-        for y in range(miny + down, maxy, down):
-            row += 1
-            if row % PATH_EVERY_ROWS == 0:
-                continue                       # a way through the plots
-            for x in range(minx + across, maxx, across):
-                if counts["graves"] >= MAX_GRAVES:
-                    break
-                if not poly.contains(Point(x + 0.5, y + 0.5)):
-                    continue
-                roll = rng.random()
-                if roll < ANGEL_SHARE:
-                    tile = rng.choice(ANGELS)
-                elif roll < ANGEL_SHARE + CROSS_SHARE:
-                    tile = rng.choice(CROSSES)
-                else:
-                    tile = rng.choice(HEADSTONES)
-                if put(x, y, tile):
-                    counts["graves"] += 1
+        ys = np.arange(miny + down, maxy, down)
+        # Row 1 is the first sample. Every 8th row is the path between plots.
+        ys = ys[(np.arange(1, ys.size + 1) % PATH_EVERY_ROWS) != 0]
+        xs = np.arange(minx + across, maxx, across)
+        for x, y in _cells_inside(poly, xs, ys):
+            if counts["graves"] >= MAX_GRAVES:
+                break
+            roll = rng.random()
+            if roll < ANGEL_SHARE:
+                tile = rng.choice(ANGELS)
+            elif roll < ANGEL_SHARE + CROSS_SHARE:
+                tile = rng.choice(CROSSES)
+            else:
+                tile = rng.choice(HEADSTONES)
+            if put(x, y, tile):
+                counts["graves"] += 1
 
     gap = step(DUMP_EVERY_M)
     for poly in bases:
@@ -153,25 +165,26 @@ def place_props(out_dir: str, map_name: str, bdir: str, occupied: np.ndarray,
         if poly.area * metres_per_tile * metres_per_tile < DUMP_MIN_M2:
             continue
         minx, miny, maxx, maxy = (int(v) for v in poly.bounds)
-        for y in range(miny + gap, maxy, gap):
-            for x in range(minx + gap, maxx, gap):
-                if counts["dumps"] >= MAX_DUMPS:
-                    break
-                if not poly.contains(Point(x + 0.5, y + 0.5)):
-                    continue
-                # A stack of stores: a short row of crates with a drum or two
-                # at the end of it, as they are stacked on a real apron.
-                run = rng.randint(2, 5)
-                horizontal = rng.random() < 0.5
-                placed = 0
-                for k in range(run):
-                    tile = rng.choice(DRUMS if k == run - 1 and rng.random() < 0.4
-                                      else CRATES)
-                    px = x + (k if horizontal else 0)
-                    py = y + (0 if horizontal else k)
-                    placed += bool(put(px, py, tile))
-                if placed:
-                    counts["dumps"] += 1
+        xs = np.arange(minx + gap, maxx, gap)
+        ys = np.arange(miny + gap, maxy, gap)
+        for x, y in _cells_inside(poly, xs, ys):
+            if counts["dumps"] >= MAX_DUMPS:
+                break
+            # A stack of stores: a short row of crates with a drum or two
+            # at the end of it, as they are stacked on a real apron.
+            # One randint, one random for the direction, then one choice per
+            # crate and one extra random on the last crate only.
+            run = rng.randint(2, 5)
+            horizontal = rng.random() < 0.5
+            placed = 0
+            for k in range(run):
+                tile = rng.choice(DRUMS if k == run - 1 and rng.random() < 0.4
+                                  else CRATES)
+                px = x + (k if horizontal else 0)
+                py = y + (0 if horizontal else k)
+                placed += bool(put(px, py, tile))
+            if placed:
+                counts["dumps"] += 1
 
     if not tiles:
         return [], counts

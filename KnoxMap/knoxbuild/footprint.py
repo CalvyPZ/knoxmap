@@ -23,6 +23,8 @@ import numpy as np
 import shapely
 from shapely.geometry import Polygon
 
+from .grids import label4, sat
+
 # Within this many degrees of the grid, square the building up.
 SNAP_DEGREES = 8.0
 # A footprint filling this share of its rotated rectangle is a rectangle.
@@ -53,30 +55,17 @@ def grid_angle(poly) -> float:
 
 
 def _largest_component(mask: np.ndarray) -> np.ndarray:
-    """Keep only the biggest 4-connected piece of a mask."""
-    h, w = mask.shape
-    seen = np.zeros_like(mask, dtype=bool)
-    best: list[tuple[int, int]] = []
-    for y in range(h):
-        for x in range(w):
-            if not mask[y, x] or seen[y, x]:
-                continue
-            piece = []
-            stack = [(y, x)]
-            seen[y, x] = True
-            while stack:
-                cy, cx = stack.pop()
-                piece.append((cy, cx))
-                for ny, nx in ((cy + 1, cx), (cy - 1, cx), (cy, cx + 1), (cy, cx - 1)):
-                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
-                        seen[ny, nx] = True
-                        stack.append((ny, nx))
-            if len(piece) > len(best):
-                best = piece
-    out = np.zeros_like(mask, dtype=bool)
-    for y, x in best:
-        out[y, x] = True
-    return out
+    """Keep only the biggest 4-connected piece of a mask.
+
+    Equal areas keep the lowest label. `label4` numbers pieces in row-major
+    order, so that is the piece the flood fill met first and kept.
+    """
+    labeled, n = label4(mask)
+    if n == 0:
+        return np.zeros_like(mask, dtype=bool)
+    counts = np.bincount(np.ravel(labeled))
+    counts[0] = 0
+    return labeled == int(counts.argmax())
 
 
 class Footprint:
@@ -218,6 +207,32 @@ def _clear_box(mask: np.ndarray, blocked: np.ndarray) -> tuple[int, int, int, in
 NUDGE_TILES = 5
 
 
+def _sat_sum(table: np.ndarray, y0: int, x0: int, y1: int, x1: int) -> int:
+    """Sum of one half-open window in a table from `grids.sat`."""
+    return int(table[y1, x1] - table[y0, x1] - table[y1, x0] + table[y0, x0])
+
+
+def _mask_runs(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Horizontal runs of set cells: row, start, end with end exclusive."""
+    bits = np.asarray(mask, dtype=np.uint8)
+    padded = np.pad(bits, ((0, 0), (1, 1)))
+    delta = np.diff(padded.astype(np.int8), axis=1)
+    rows, starts = np.nonzero(delta == 1)
+    _rows, ends = np.nonzero(delta == -1)
+    return rows, starts, ends
+
+
+def _runs_sum(table: np.ndarray, rows: np.ndarray, starts: np.ndarray,
+              ends: np.ndarray, y: int, x: int) -> int:
+    """Sum of every run, shifted so the mask's origin sits at `(y, x)`."""
+    if rows.size == 0:
+        return 0
+    y0 = rows + y
+    x0 = starts + x
+    return int((table[y0 + 1, ends + x] - table[y0, ends + x]
+                - table[y0 + 1, x0] + table[y0, x0]).sum())
+
+
 def _clear_of(mask: np.ndarray, x0: int, y0: int, avoid: np.ndarray,
               occupied: np.ndarray) -> tuple[int, int]:
     """Where to put a footprint so it stands off the roads.
@@ -228,16 +243,40 @@ def _clear_of(mask: np.ndarray, x0: int, y0: int, avoid: np.ndarray,
     up to NUDGE_TILES, that takes it out, without walking into another."""
     map_h, map_w = avoid.shape
     h, w = mask.shape
+    n = NUDGE_TILES
+    # Every nudge reads a window of the footprint. Pad that region with zeros
+    # off the map so a window sum counts the same tiles the clipped mask did,
+    # and nothing past the edge.
+    pad_h, pad_w = h + 2 * n, w + 2 * n
+    avoid_pad = np.zeros((pad_h, pad_w), dtype=np.int64)
+    occ_pad = np.zeros((pad_h, pad_w), dtype=np.int64)
+    map_x0, map_y0 = x0 - n, y0 - n
+    src_x0, src_y0 = max(0, map_x0), max(0, map_y0)
+    src_x1, src_y1 = min(map_w, map_x0 + pad_w), min(map_h, map_y0 + pad_h)
+    if src_x1 > src_x0 and src_y1 > src_y0:
+        dst_y, dst_x = src_y0 - map_y0, src_x0 - map_x0
+        avoid_pad[dst_y:dst_y + src_y1 - src_y0,
+                   dst_x:dst_x + src_x1 - src_x0] = avoid[src_y0:src_y1,
+                                                           src_x0:src_x1]
+        occ_pad[dst_y:dst_y + src_y1 - src_y0,
+                dst_x:dst_x + src_x1 - src_x0] = occupied[src_y0:src_y1,
+                                                          src_x0:src_x1]
+    avoid_sat = sat(avoid_pad)
+    occ_sat = sat(occ_pad)
+    solid = bool(mask.size) and bool(mask.all())
+    runs = (None if solid else _mask_runs(mask))
 
     def cost(ox, oy):
         ax0, ay0 = x0 + ox, y0 + oy
-        cx0, cy0 = max(0, ax0), max(0, ay0)
-        cx1, cy1 = min(map_w, ax0 + w), min(map_h, ay0 + h)
-        if cx1 <= cx0 or cy1 <= cy0:
+        if ax0 >= map_w or ay0 >= map_h or ax0 + w <= 0 or ay0 + h <= 0:
             return None
-        m = mask[cy0 - ay0:cy1 - ay0, cx0 - ax0:cx1 - ax0]
-        return (int(avoid[cy0:cy1, cx0:cx1][m].sum()),
-                int(occupied[cy0:cy1, cx0:cx1][m].sum()))
+        py, px = n + oy, n + ox
+        if solid:
+            return (_sat_sum(avoid_sat, py, px, py + h, px + w),
+                    _sat_sum(occ_sat, py, px, py + h, px + w))
+        rows, starts, ends = runs
+        return (_runs_sum(avoid_sat, rows, starts, ends, py, px),
+                _runs_sum(occ_sat, rows, starts, ends, py, px))
 
     here = cost(0, 0)
     if here is None or here[0] == 0:

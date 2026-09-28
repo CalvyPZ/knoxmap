@@ -41,6 +41,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import knoxstop
+import numpy as np
+from scipy.spatial import cKDTree
+
 from shapely.affinity import scale as _scale
 from shapely.geometry import Polygon
 
@@ -180,45 +184,56 @@ def _clamped(factor: float, cx: float, cy: float, width: float,
     return max(1.0, factor)
 
 
-# Both rules ask the same local question - is anything near me - and asking it
-# of everything kept so far is the slowest thing in a big build: a city of
-# forty thousand footprints is eight hundred million distance checks. What is
-# kept goes into buckets of this many tiles instead, and only the buckets
-# within reach are looked at.
-BUCKET = 48
+def _reach(width: float, widest: float) -> float:
+    """How far `near` used to look.
+
+    A neighbour past this cannot thin the candidate or cut its growth: the
+    gap test and the clamp both give up inside it. `widest` is the widest
+    thing already kept, the same term the bucket reach used.
+    """
+    return max(GAP, GROW_MAX_LANDMARK) * (width + widest) / 2.0
 
 
-class _Kept:
-    """Where everything kept stands, and how wide it ended up."""
+def _max_gap(cands: list[Candidate]) -> float:
+    """The greatest separation `_reach` can ask for on this list.
 
-    def __init__(self) -> None:
-        self._cells: dict[tuple[int, int], list] = {}
-        self.widest = 0.0
-
-    def add(self, cx: float, cy: float, width: float) -> None:
-        key = (int(cx // BUCKET), int(cy // BUCKET))
-        self._cells.setdefault(key, []).append((cx, cy, width))
-        self.widest = max(self.widest, width)
-
-    def near(self, cx: float, cy: float, width: float) -> list:
-        """Everything kept that could possibly matter to a building this wide
-        standing here - near enough to thin it, or to stop it growing.
-
-        The reach allows for the widest thing kept anywhere and for the most
-        this one could grow, so it never misses a neighbour; it is generous
-        rather than exact, and the buckets keep that cheap.
-        """
-        reach = max(GAP, GROW_MAX_LANDMARK) * (width + self.widest) / 2.0
-        span = int(reach // BUCKET) + 1
-        gx, gy = int(cx // BUCKET), int(cy // BUCKET)
-        out: list = []
-        for ix in range(gx - span, gx + span + 1):
-            for iy in range(gy - span, gy + span + 1):
-                out.extend(self._cells.get((ix, iy), ()))
-        return out
+    A kept building is never wider than its own width times the growth
+    ceiling, and a query uses the footprint's width before it grows, so
+    every pair the old reach could touch lies inside this.
+    """
+    max_width = 0.0
+    max_kept = 0.0
+    for c in cands:
+        max_width = max(max_width, c.width)
+        ceiling = GROW_MAX_LANDMARK if c.landmark else GROW_MAX_HOUSE
+        max_kept = max(max_kept, c.width * ceiling)
+    return _reach(max_width, max_kept)
 
 
-def plan(cands: list[Candidate], max_size: float) -> tuple[list[Candidate], dict]:
+def _neighbour_lists(n: int, pairs: np.ndarray) -> list[np.ndarray]:
+    """Each candidate's partners, sorted by index.
+
+    `pairs` is `(i, j)` with `i < j` from `query_pairs`. Sorting makes the
+    later walk deterministic; the keep test itself does not care about order.
+    """
+    lists = [np.empty(0, dtype=np.int64) for _ in range(n)]
+    if len(pairs) == 0:
+        return lists
+    left = np.concatenate((pairs[:, 0], pairs[:, 1]))
+    right = np.concatenate((pairs[:, 1], pairs[:, 0]))
+    order = np.lexsort((right, left))
+    left = left[order]
+    right = right[order]
+    cuts = np.flatnonzero(np.diff(left)) + 1
+    starts = np.concatenate((np.array([0], dtype=np.int64), cuts))
+    ends = np.concatenate((cuts, np.array([left.size], dtype=np.int64)))
+    for start, end in zip(starts, ends):
+        lists[int(left[start])] = right[start:end]
+    return lists
+
+
+def plan(cands: list[Candidate], max_size: float,
+         should_stop=None) -> tuple[list[Candidate], dict]:
     """Which of these to build, in the order they should claim their ground.
 
     Returns the survivors - with `px` already grown - and a count of what
@@ -232,12 +247,33 @@ def plan(cands: list[Candidate], max_size: float) -> tuple[list[Candidate], dict
     housing = sorted((c for c in cands if not c.landmark), key=by_size)
     counts["landmarks"] = len(landmarks)
 
-    kept = _Kept()
+    # Same greedy order as before: every landmark, largest first, then the
+    # housing, largest first. The tree is built on that sequence so a
+    # neighbour's index is its place in the walk.
+    ordered = landmarks + housing
     out: list[Candidate] = []
+    if not ordered:
+        return out, counts
 
-    def take(c: Candidate, cx: float, cy: float, nearby: list) -> None:
+    centres = [_centre(c.px) for c in ordered]
+    xy = np.asarray(centres, dtype=np.float64)
+    max_gap = _max_gap(ordered)
+    pairs = (cKDTree(xy).query_pairs(max_gap, output_type="ndarray")
+             if len(ordered) > 1 else np.empty((0, 2), dtype=np.int64))
+    neighbours = _neighbour_lists(len(ordered), pairs)
+    kept = np.zeros(len(ordered), dtype=bool)
+    widths = np.zeros(len(ordered), dtype=np.float64)
+
+    def nearby_of(i: int) -> list:
+        nbrs = neighbours[i]
+        alive = nbrs[kept[nbrs]] if nbrs.size else nbrs
+        return [(centres[int(j)][0], centres[int(j)][1], float(widths[int(j)]))
+                for j in alive]
+
+    def take(i: int, c: Candidate, cx: float, cy: float, nearby: list) -> None:
         factor = _clamped(_factor(c, max_size), cx, cy, c.width, nearby)
-        kept.add(cx, cy, c.width * factor)
+        widths[i] = c.width * factor
+        kept[i] = True
         if factor > 1.01:
             counts["grown"] += 1
             c = Candidate(c.index, _grown(c.px, factor), c.area * factor * factor,
@@ -247,13 +283,18 @@ def plan(cands: list[Candidate], max_size: float) -> tuple[list[Candidate], dict
     # Landmarks first and all of them: OSM says there is a police station
     # here, and what the game needs a police station to be is not the
     # surveyor's business.
-    for c in landmarks:
-        cx, cy = _centre(c.px)
-        take(c, cx, cy, kept.near(cx, cy, c.width))
+    for n, c in enumerate(landmarks):
+        if n % 64 == 0:
+            knoxstop.check(should_stop, "the buildings")
+        cx, cy = centres[n]
+        take(n, c, cx, cy, nearby_of(n))
 
-    for c in housing:
-        cx, cy = _centre(c.px)
-        nearby = kept.near(cx, cy, c.width)
+    for n, c in enumerate(housing):
+        if n % 64 == 0:
+            knoxstop.check(should_stop, "the buildings")
+        i = len(landmarks) + n
+        cx, cy = centres[i]
+        nearby = nearby_of(i)
         # Two buildings of width w1 and w2 touch when their centres are
         # (w1 + w2) / 2 apart, so that is the distance to measure the gap
         # against. Judging a house by its own width alone would let a
@@ -263,5 +304,5 @@ def plan(cands: list[Candidate], max_size: float) -> tuple[list[Candidate], dict
                for ox, oy, ow in nearby):
             counts["thinned"] += 1
             continue
-        take(c, cx, cy, nearby)
+        take(i, c, cx, cy, nearby)
     return out, counts

@@ -145,7 +145,8 @@ def place_pumps(out_dir: str, map_name: str, bdir: str, occupied: np.ndarray,
     # Canopies first: they are where the pumps really are. The ground under
     # one becomes forecourt, and its pumps stand in one row down the middle,
     # or two when it is deep enough for cars either side of each.
-    from shapely.geometry import Polygon, box
+    import shapely
+    from shapely.geometry import Polygon
     done_near: list[tuple[float, float]] = []
     for outline in canopies:
         shape = Polygon(outline)
@@ -158,11 +159,12 @@ def place_pumps(out_dir: str, map_name: str, bdir: str, occupied: np.ndarray,
         cw, ch = x1 - x0, y1 - y0
         if cw < 3 or ch < 3:
             continue
-        under = np.zeros((ch, cw), dtype=bool)
-        for yy in range(ch):
-            for xx in range(cw):
-                under[yy, xx] = shape.contains(box(x0 + xx + .25, y0 + yy + .25,
-                                                   x0 + xx + .75, y0 + yy + .75))
+        # Centres of the tiles under the roof. One contains_xy on the mesh,
+        # instead of a box test per tile.
+        xs = np.arange(cw, dtype=np.float64) + (x0 + 0.5)
+        ys = np.arange(ch, dtype=np.float64) + (y0 + 0.5)
+        xx, yy = np.meshgrid(xs, ys)
+        under = np.array(shapely.contains_xy(shape, xx, yy), dtype=bool, copy=True)
         under &= ~blocked[y0:y1, x0:x1]
         if under.sum() < 12:
             continue

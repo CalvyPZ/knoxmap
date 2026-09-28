@@ -24,6 +24,8 @@ from PIL import Image
 
 from generator import pz_colors as C
 
+from .grids import colour_mask
+
 PATH_MAX_TILES = 40
 DRIVE_WIDTH = 3
 DRIVE_EXTRA = 5          # how far the drive runs past the front of the house
@@ -83,10 +85,7 @@ def paint_paths(out_dir: str, map_name: str, rows: list[dict], occupied,
     h, w = ground.shape[:2]
 
     def match(colours):
-        mask = np.zeros((h, w), dtype=bool)
-        for c in colours:
-            mask |= np.all(ground == c, axis=2)
-        return mask
+        return colour_mask(ground, colours)
 
     paved = match(PAVED)
     crossable = match(CROSSABLE) & ~occupied

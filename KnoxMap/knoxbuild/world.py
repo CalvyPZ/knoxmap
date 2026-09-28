@@ -14,6 +14,8 @@ import os
 from dataclasses import dataclass
 from xml.sax.saxutils import quoteattr
 
+import re
+
 CELL_SIZE = 300
 
 # Where the generated map sits in the shared world, in source (300-tile) cells.
@@ -229,10 +231,22 @@ def _tool_path(path: str) -> str:
     return knoxpaths.tool_path(path)
 
 
+def project_cells(pzw: str | os.PathLike) -> set[tuple[int, int]]:
+    """Every (x, y) cell named in a WorldEd project."""
+    try:
+        with open(pzw, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return set()
+    return {(int(x), int(y))
+            for x, y in re.findall(r'<cell x="(-?\d+)" y="(-?\d+)"', text)}
+
+
 def render_pzw(cells_x: int, cells_y: int, bmp_name: str,
                placements: list[Placement], map_name: str = "",
                project_dir: str = "",
-               zones: list[Zone] | None = None) -> str:
+               zones: list[Zone] | None = None,
+               build_cells: set[tuple[int, int]] | None = None) -> str:
     # Nothing may name a cell outside the world: WorldEd rejects the whole
     # project over one ("error reading world, invalid cell coordinates").
     def on_grid(cx: int, cy: int) -> bool:
@@ -340,10 +354,15 @@ def render_pzw(cells_x: int, cells_y: int, bmp_name: str,
         here = os.path.join(base, "tmx", f"{bmp_base}_{ox + cx}_{oy + cy}.tmx")
         return _tool_path(here) if os.path.exists(here) else ""
 
-    # Every cell in the grid, not just the ones holding something: Generate Lots
-    # needs a map on each cell it is asked to export.
-    all_cells = [(cx, cy) for cy in range(cells_y) for cx in range(cells_x)]
-    for (cx, cy) in sorted(set(all_cells) | set(by_cell) | set(zones_by_cell)):
+    if build_cells is None:
+        build_cells = {(cx, cy) for cy in range(cells_y) for cx in range(cells_x)}
+
+    # Only cells that carry mapped ground or a building. Empty padding and
+    # cells that are only mapped woodland are left out; the game fills them.
+    named = build_cells | set(by_cell) | set(zones_by_cell)
+    for (cx, cy) in sorted(named):
+        if not on_grid(cx, cy):
+            continue
         out.append(f' <cell x="{cx}" y="{cy}" map={quoteattr(cell_map(cx, cy))}>')
         for p in sorted(by_cell.get((cx, cy), []),
                         key=lambda q: (q.offset_y, q.offset_x)):
