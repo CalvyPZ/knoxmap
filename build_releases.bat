@@ -23,18 +23,19 @@ where docker >nul 2>nul || (
   exit /b 1
 )
 
-set PY=
-if exist "KnoxMap\.venv\Scripts\python.exe" set PY=KnoxMap\.venv\Scripts\python.exe
-if not defined PY where py >nul 2>nul && py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) and sys.maxsize > 2**32 else 1)" >nul 2>nul && set PY=py -3
-if not defined PY python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) and sys.maxsize > 2**32 else 1)" >nul 2>nul && set PY=python
-if not defined PY (
-  echo Need 64-bit Python 3.10 or newer. Run KnoxMap\Setup.bat, or install Python, then run this again.
+rem python3 is the normal interpreter. python on this PC is the free-threaded
+rem build, and SciPy never finishes a room layout there.
+where python3 >nul 2>nul || (
+  echo Need the python3 command. python is free-threaded and SciPy does not run on it.
   exit /b 1
 )
-
+findstr /i /c:"python3.14t" /c:"freethreaded" "KnoxMap\.venv\pyvenv.cfg" >nul 2>nul && (
+  echo The Python environment is free-threaded. Recreating it with python3...
+  rmdir /s /q "KnoxMap\.venv"
+)
 if not exist "KnoxMap\.venv\Scripts\python.exe" (
-  echo Creating the Python environment...
-  %PY% -m venv KnoxMap\.venv || exit /b 1
+  echo Creating the Python environment with python3...
+  python3 -m venv KnoxMap\.venv || exit /b 1
 )
 
 if not exist "releases\temp" mkdir "releases\temp"

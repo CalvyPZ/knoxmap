@@ -25,8 +25,8 @@ these files beyond that, ask arytek.
 See [LICENSE-MIT.txt](../LICENSE-MIT.txt). Everything not listed in the other
 two sections, including:
 
-`KnoxMap/knoxbuild/` · `KnoxMap/tools/` · `KnoxMap/knoxmap.py` · `KnoxMap/knoxmap_setup.py` · `KnoxMap/knoxpaths.py` ·
-`KnoxMap/Setup.bat` · `KnoxMap/setup.sh` · `KnoxMap/knoxmap.sh` · `KnoxMap/generator/places.py` · `KnoxMap/static/js/fx.js` ·
+`KnoxMap/knoxbuild/` · `KnoxMap/tools/` · `KnoxMap/knoxmap.py` · `KnoxMap/knoxmap_setup.py` · `KnoxMap/knoxmap_cli.py` · `KnoxMap/knoxpaths.py` ·
+`KnoxMap/knoxmap.sh` · `KnoxMap/generator/places.py` · `KnoxMap/generator/geofabrik.py` · `KnoxMap/generator/localosm.py` · `KnoxMap/static/js/fx.js` ·
 `desktop/` · `docs/KNOXBUILD.md` · `docs/LICENSES.md` · `docs/CHANGELOG.md` ·
 `docs/CONTRIBUTING.md` · `.github/` · `docs/`
 
@@ -73,6 +73,14 @@ and tiles, © OpenStreetMap contributors.
   share them.
 - **Overpass API** and **Nominatim** are free community services with usage
   policies; KnoxMap identifies itself and keeps to one search a second.
+  Overpass is used for the named places inside an area. The map geometry is
+  read from Geofabrik's daily OpenStreetMap extracts with
+  [pyosmium](https://osmcode.org/pyosmium/) (BSD-2-Clause, © Sarah Hoffmann;
+  it includes [libosmium](https://osmcode.org/libosmium/), Boost Software
+  License). That library is packed inside the program file with the other
+  Python libraries. It is not a program the player installs.
+- **Overture Maps** buildings, when *Add missing buildings* is on, are fetched
+  by the player's own DuckDB install. They are not in this repository.
 - **Map tiles** in the app: OpenStreetMap standard tiles, fetched through
   KnoxMap's local server under the
   [tile usage policy](https://operations.osmfoundation.org/policies/tiles/).
@@ -80,6 +88,10 @@ and tiles, © OpenStreetMap contributors.
 - **Bundled in `static/vendor/`**, each with its licence text beside it:
   **Leaflet** 1.9.4 (BSD-2-Clause, © Volodymyr Agafonkin), **Leaflet.draw**
   1.0.4 (MIT, © Jon West, Jacob Toye and Leaflet).
+- **[SciPy](https://scipy.org/)** (BSD-3-Clause, © SciPy Developers) is a
+  required library (`scipy>=1.11`), packed inside the program file with the
+  other Python libraries. The building generator uses it for array morphology
+  and spatial indexes. It is not a program the player installs.
 
 ## Not affiliated
 

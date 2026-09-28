@@ -14,10 +14,15 @@ room indices, so we only ever paint rooms - we never emit wall objects.
 """
 from __future__ import annotations
 
+import bisect
 import random
 from dataclasses import dataclass, field
 
+import knoxstop
+import numpy as np
+
 from . import catalog as C
+from . import grids
 from .uses import FRONT_ROOMS
 from .settings import Settings
 
@@ -70,14 +75,15 @@ class Plan:
     width: int
     height: int
     rooms: list[Room] = field(default_factory=list)
-    grid: list[list[int]] = field(default_factory=list)   # 1-based room index
+    # 1-based room index, shape (height, width). Index as grid[y, x].
+    grid: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), np.int32))
     doors: list[tuple[int, int, str]] = field(default_factory=list)
     windows: list[tuple[int, int, str]] = field(default_factory=list)
     furniture: list[tuple[str, int, int, str]] = field(default_factory=list)
     # None = the building fills its rectangle; otherwise True where
     # the real footprint lies. Tiles outside it stay room 0, which is
     # how BuildingEd knows they are not part of the building.
-    mask: list[list[bool]] | None = None
+    mask: np.ndarray | None = None
     # The stair shaft, as (x0, y0, x1, y1) inclusive, identical on every
     # storey of a building. Painted last so it is always exactly one room.
     core: tuple[int, int, int, int] | None = None
@@ -97,6 +103,48 @@ class Plan:
     # Outside wall edges this storey shares with the building next door:
     # no window, shop front or door goes in them.
     party: set = field(default_factory=set)
+    # Exterior runs and the shared-wall matrix. Both describe `grid`, so any
+    # paint drops them rather than letting a later door see the old walls.
+    _runs: list | None = field(default=None, repr=False)
+    _adj: np.ndarray | None = field(default=None, repr=False)
+    # One cell per tile for furniture clearance. Bits are B_DOOR, B_STAIR,
+    # B_ITEM and B_EXTRA; 0 is free. Replaces set membership on the hot path.
+    occ: np.ndarray | None = field(default=None, repr=False)
+    # Room ids as Python ints, row-major. Dropped with the wall caches: a
+    # numpy scalar conversion on every probe was most of _room_at.
+    _ids: list | None = field(default=None, repr=False)
+    # 1-d view of occ. In-place updates of that array stay visible here.
+    _occ_flat: np.ndarray | None = field(default=None, repr=False)
+    _occ_mv: memoryview | None = field(default=None, repr=False)
+
+
+def _as_mask(mask):
+    """Bool array, or None. A list of lists from an older caller still works."""
+    if mask is None:
+        return None
+    arr = np.asarray(mask)
+    if arr.dtype != np.bool_:
+        arr = arr.astype(bool)
+    return arr
+
+
+def _invalidate(plan: Plan) -> None:
+    """The wall caches are a picture of the grid; painting makes them a lie."""
+    plan._runs = None
+    plan._adj = None
+    plan._ids = None
+
+
+def _ensure_adj(plan: Plan) -> np.ndarray:
+    if plan._adj is None:
+        plan._adj = grids.adjacency(plan.grid, len(plan.rooms))
+    return plan._adj
+
+
+def _ensure_runs(plan: Plan):
+    if plan._runs is None:
+        plan._runs = grids.runs_by_room(plan.grid)
+    return plan._runs
 
 
 # kind -> (floor tile entry index, display name, furniture wishlist)
@@ -334,16 +382,25 @@ SPECIAL_MIXES = {
 def _split(x0: int, y0: int, x1: int, y1: int, rng: random.Random,
            depth: int, out: list[Room],
            target_area: int = TARGET_ROOM_AREA,
-           mask: list[list[bool]] | None = None) -> None:
+           mask: np.ndarray | None = None,
+           _sat: np.ndarray | None = None) -> None:
     w, h = x1 - x0 + 1, y1 - y0 + 1
     can_v = w >= MIN_SPLIT
     can_h = h >= MIN_SPLIT
     # Measure the floor that is actually inside the building. On a footprint
     # turned 38 degrees half of every bounding rectangle is empty corner, and
     # sizing rooms by the rectangle kept splitting until a house had fifteen
-    # rooms a floor, most of them offices and storerooms.
-    area = w * h if mask is None else sum(
-        1 for y in range(y0, y1 + 1) for x in range(x0, x1 + 1) if mask[y][x])
+    # rooms a floor, most of them offices and storerooms. The summed-area
+    # table makes each region O(1); it is built once and handed down so the
+    # recursion does not draw any extra random numbers.
+    if mask is None:
+        area = w * h
+    else:
+        if _sat is None:
+            mask = _as_mask(mask)
+            _sat = grids.sat(mask)
+        area = int(_sat[y1 + 1, x1 + 1] - _sat[y0, x1 + 1]
+                   - _sat[y1 + 1, x0] + _sat[y0, x0])
     if depth <= 0 or not (can_v or can_h) or area <= target_area:
         out.append(Room(x0, y0, x1, y1))
         return
@@ -369,12 +426,12 @@ def _split(x0: int, y0: int, x1: int, y1: int, rng: random.Random,
                           (x1 if vertical else y1) - MIN_ROOM)
     if vertical:
         cut = rng.randint(lo, hi)
-        _split(x0, y0, cut - 1, y1, rng, depth - 1, out, target_area, mask)
-        _split(cut, y0, x1, y1, rng, depth - 1, out, target_area, mask)
+        _split(x0, y0, cut - 1, y1, rng, depth - 1, out, target_area, mask, _sat)
+        _split(cut, y0, x1, y1, rng, depth - 1, out, target_area, mask, _sat)
     else:
         cut = rng.randint(lo, hi)
-        _split(x0, y0, x1, cut - 1, rng, depth - 1, out, target_area, mask)
-        _split(x0, cut, x1, y1, rng, depth - 1, out, target_area, mask)
+        _split(x0, y0, x1, cut - 1, rng, depth - 1, out, target_area, mask, _sat)
+        _split(x0, cut, x1, y1, rng, depth - 1, out, target_area, mask, _sat)
 
 
 # What a flat contains, by how many rooms it got. The first entry goes to the
@@ -511,19 +568,25 @@ def _apartment_rooms(plan: Plan, rng: random.Random, target: int,
 
 def _neighbours(plan: Plan) -> dict[int, dict[int, int]]:
     """Room index -> {neighbour index: length of shared wall in tiles}."""
+    matrix = _ensure_adj(plan)
     adj: dict[int, dict[int, int]] = {i: {} for i in range(1, len(plan.rooms) + 1)}
-    for y in range(plan.height):
-        for x in range(plan.width):
-            a = plan.grid[y][x]
-            if not a:
-                continue
-            for bx, by in ((x + 1, y), (x, y + 1)):
-                if bx >= plan.width or by >= plan.height:
-                    continue
-                b = plan.grid[by][bx]
-                if b and b != a:
-                    adj[a][b] = adj[a].get(b, 0) + 1
-                    adj[b][a] = adj[b].get(a, 0) + 1
+    y, x, side, a, b = grids.wall_edges(plan.grid)
+    keep = (a > 0) & (b > 0)
+    if not np.any(keep):
+        return adj
+    y, x, side, a, b = y[keep], x[keep], side[keep], a[keep], b[keep]
+    # First meeting in the old row-major scan, west before north on a tile.
+    # An equal-sized neighbour is chosen by that order.
+    pri = (side != "W").astype(np.int8)
+    order = np.lexsort((pri, x, y))
+    a, b = a[order], b[order]
+    for i in range(int(a.size)):
+        ia, ib = int(a[i]), int(b[i])
+        if ib in adj[ia]:
+            continue
+        length = int(matrix[ia, ib])
+        adj[ia][ib] = length
+        adj[ib][ia] = length
     return adj
 
 
@@ -748,46 +811,48 @@ def _assign_kinds(rooms: list[Room], mix: list[str], fill: list[str]) -> None:
 
 def _renumber(plan: Plan) -> None:
     """Drop rooms that own no tiles and close the gaps in the numbering."""
-    used = {v for row in plan.grid for v in row if v}
-    if len(used) == len(plan.rooms):
+    _invalidate(plan)
+    g = plan.grid
+    if g.size == 0:
         return
-    remap = {}
+    present = np.unique(g)
+    present = present[present > 0]
+    if present.size == len(plan.rooms):
+        return
+    used = set(int(v) for v in present.tolist())
+    lut = np.zeros(int(g.max()) + 1, np.int32)
     kept = []
     for idx, room in enumerate(plan.rooms, start=1):
         if idx in used:
             kept.append(room)
-            remap[idx] = len(kept)
-    for y in range(plan.height):
-        for x in range(plan.width):
-            v = plan.grid[y][x]
-            if v:
-                plan.grid[y][x] = remap[v]
+            lut[idx] = len(kept)
+    plan.grid = lut[g]
     plan.rooms = kept
 
 
 def _refit(plan: Plan) -> None:
     """Shrink or grow each room's rectangle to the tiles it actually owns."""
-    bounds: dict[int, list[int]] = {}
-    for y in range(plan.height):
-        for x in range(plan.width):
-            v = plan.grid[y][x]
-            if v:
-                b = bounds.setdefault(v, [x, y, x, y])
-                b[0], b[1] = min(b[0], x), min(b[1], y)
-                b[2], b[3] = max(b[2], x), max(b[3], y)
+    boxes = grids.bounds(plan.grid)
     for idx, room in enumerate(plan.rooms, start=1):
-        if idx in bounds:
-            room.x0, room.y0, room.x1, room.y1 = bounds[idx]
+        if idx - 1 >= len(boxes):
+            continue
+        sl = boxes[idx - 1]
+        if sl is None:
+            continue
+        ys, xs = sl
+        room.y0, room.x0 = int(ys.start), int(xs.start)
+        room.y1, room.x1 = int(ys.stop) - 1, int(xs.stop) - 1
 
 
 def _paint(plan: Plan) -> None:
-    plan.grid = [[0] * plan.width for _ in range(plan.height)]
+    g = np.zeros((plan.height, plan.width), np.int32)
+    mask = plan.mask
     for idx, r in enumerate(plan.rooms, start=1):
-        for y in range(r.y0, r.y1 + 1):
-            for x in range(r.x0, r.x1 + 1):
-                if plan.mask is not None and not plan.mask[y][x]:
-                    continue
-                plan.grid[y][x] = idx
+        view = g[r.y0:r.y1 + 1, r.x0:r.x1 + 1]
+        if mask is None:
+            view[:] = idx
+        else:
+            view[mask[r.y0:r.y1 + 1, r.x0:r.x1 + 1]] = idx
 
     # The stair shaft is painted over whatever is beneath it, identically on
     # every storey. Stairs used to be dropped wherever five tiles happened to be
@@ -797,11 +862,10 @@ def _paint(plan: Plan) -> None:
         cx0, cy0, cx1, cy1 = plan.core
         plan.rooms.append(Room(cx0, cy0, cx1, cy1, kind="hall", unit=0,
                                is_core=True))
-        idx = len(plan.rooms)
-        for y in range(cy0, cy1 + 1):
-            for x in range(cx0, cx1 + 1):
-                plan.grid[y][x] = idx
+        g[cy0:cy1 + 1, cx0:cx1 + 1] = len(plan.rooms)
 
+    plan.grid = g
+    _invalidate(plan)
     _renumber(plan)
     _mend_fragments(plan)
     _refit(plan)
@@ -821,69 +885,66 @@ def _mend_fragments(plan: Plan) -> None:
     An irregular footprint or the stair shaft can cut one rectangle into pieces
     that no longer touch. BuildingEd treats them as one room, so the only door
     lands in one piece and the other is sealed; the game then has a room with
-    no way in. Each piece becomes a room of its own, and pieces too small to
-    be a room are given to whatever they border, preferring the same flat.
+    no way in. Each piece becomes a room of its own. A piece too small to be
+    a room joins the neighbour it shares the most wall with; the lower room
+    number wins a tie so the fold does not depend on which edge was seen first.
     """
-    for idx in range(1, len(plan.rooms) + 1):
-        cells = {(x, y) for y in range(plan.height) for x in range(plan.width)
-                 if plan.grid[y][x] == idx}
-        pieces = []
-        while cells:
-            seed = cells.pop()
-            piece = {seed}
-            stack = [seed]
-            while stack:
-                x, y = stack.pop()
-                for n in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-                    if n in cells:
-                        cells.remove(n)
-                        piece.add(n)
-                        stack.append(n)
-            pieces.append(piece)
-        if len(pieces) <= 1:
+    g = plan.grid
+    # Newly split pieces are not walked again: the old flood fill stopped at
+    # the rooms that existed when the pass started.
+    n0 = len(plan.rooms)
+    for idx in range(1, n0 + 1):
+        ys, xs = np.nonzero(g == idx)
+        if ys.size == 0:
             continue
-        pieces.sort(key=len, reverse=True)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        labeled, n = grids.label4(g[y0:y1, x0:x1] == idx)
+        if n <= 1:
+            continue
+        sizes = np.bincount(labeled.ravel(), minlength=n + 1)[1:]
+        # Largest piece keeps the number. An equal size keeps the earlier
+        # label, which is the one label4 met first reading the box row by row.
+        order = sorted(range(n), key=lambda i: (-int(sizes[i]), i))
         base = plan.rooms[idx - 1]
-        for piece in pieces[1:]:
+        view = g[y0:y1, x0:x1]
+        for i in order[1:]:
             plan.rooms.append(Room(0, 0, 0, 0, kind=base.kind, unit=base.unit))
-            new = len(plan.rooms)
-            for x, y in piece:
-                plan.grid[y][x] = new
+            view[labeled == i + 1] = len(plan.rooms)
+    _invalidate(plan)
 
-    def too_small(cells) -> bool:
-        if len(cells) < 4:
+    def too_small(idx: int) -> bool:
+        yy, xx = np.nonzero(g == idx)
+        count = int(yy.size)
+        if count == 0:
+            return False
+        if count < 4:
             return True
-        xs = {x for x, _ in cells}
-        ys = {y for _, y in cells}
+        nxs = int(np.unique(xx).size)
+        nys = int(np.unique(yy).size)
         # A whole rectangle of 3x3 or more is a real room - a small bathroom
         # is exactly that. Only the ragged wedges a diagonal wall leaves go.
-        if len(cells) == len(xs) * len(ys) and min(len(xs), len(ys)) >= 3:
+        if count == nxs * nys and min(nxs, nys) >= 3:
             return False
-        return len(cells) < SLIVER or (min(len(xs), len(ys)) <= SLIVER_THICKNESS
-                                       and len(cells) < 3 * SLIVER)
+        return count < SLIVER or (min(nxs, nys) <= SLIVER_THICKNESS
+                                  and count < 3 * SLIVER)
 
     for idx in range(1, len(plan.rooms) + 1):
         if plan.rooms[idx - 1].is_core or plan.rooms[idx - 1].is_shaft:
             continue
-        cells = [(x, y) for y in range(plan.height) for x in range(plan.width)
-                 if plan.grid[y][x] == idx]
-        if not cells or not too_small(cells):
+        if not too_small(idx):
             continue
-        unit = plan.rooms[idx - 1].unit
-        options: dict[int, int] = {}
-        for x, y in cells:
-            for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-                if 0 <= nx < plan.width and 0 <= ny < plan.height:
-                    v = plan.grid[ny][nx]
-                    if v and v != idx and not plan.rooms[v - 1].is_shaft:
-                        options[v] = options.get(v, 0) + 1
-        if not options:
+        # A sliver already given away changes the wall the next one shares.
+        counts = grids.adjacency(g, len(plan.rooms))[idx]
+        cands = [j for j in range(1, int(counts.shape[0]))
+                 if j != idx and int(counts[j]) > 0
+                 and not plan.rooms[j - 1].is_shaft]
+        if not cands:
             continue
-        home = max(options, key=lambda v: (plan.rooms[v - 1].unit == unit,
-                                           options[v]))
-        for x, y in cells:
-            plan.grid[y][x] = home
+        home = min(cands, key=lambda j: (-int(counts[j]), j))
+        g[g == idx] = home
 
+    _invalidate(plan)
     _renumber(plan)
 
 
@@ -963,41 +1024,61 @@ def _unit_touches_corridor(plan: Plan) -> None:
 
 def _boundary_edges(plan: Plan) -> dict[tuple[int, int], list[tuple[int, int, str]]]:
     """(room a, room b) with a < b -> every wall edge between them."""
+    y, x, side, a, b = grids.wall_edges(plan.grid)
+    keep = (a > 0) & (b > 0)
+    if not np.any(keep):
+        return {}
+    y, x, side, a, b = y[keep], x[keep], side[keep], a[keep], b[keep]
+    # West before north on the same tile, then row-major: that is the order
+    # the door pass used to meet each pair, and an equal-cost tie keeps the
+    # first one.
+    pri = (side != "W").astype(np.int8)
+    order = np.lexsort((pri, x, y))
+    y, x, side, a, b = y[order], x[order], side[order], a[order], b[order]
+    lo = np.minimum(a, b)
+    hi = np.maximum(a, b)
     out: dict[tuple[int, int], list[tuple[int, int, str]]] = {}
-    for y in range(plan.height):
-        for x in range(plan.width):
-            b = plan.grid[y][x]
-            if not b:
-                continue
-            if x > 0:
-                a = plan.grid[y][x - 1]
-                if a and a != b:
-                    out.setdefault((min(a, b), max(a, b)), []).append((x, y, "W"))
-            if y > 0:
-                a = plan.grid[y - 1][x]
-                if a and a != b:
-                    out.setdefault((min(a, b), max(a, b)), []).append((x, y, "N"))
+    for i in range(int(y.size)):
+        key = (int(lo[i]), int(hi[i]))
+        out.setdefault(key, []).append((int(x[i]), int(y[i]), str(side[i])))
     return out
 
 
 def _door_spot(edges: list[tuple[int, int, str]],
                min_run: int) -> tuple[tuple[int, int, str], int] | None:
     """The middle of the longest straight run of wall, and that run's length."""
+    if not edges:
+        return None
     best = None
-    for d in ("W", "N"):
-        # Along a W edge the wall runs in y; along an N edge, in x.
-        keyed = sorted((e[0], e[1]) if d == "W" else (e[1], e[0])
-                       for e in edges if e[2] == d)
-        run: list[tuple[int, int]] = []
-        for fixed, moving in keyed + [(None, None)]:
-            if run and (fixed != run[-1][0] or moving != run[-1][1] + 1):
-                if len(run) >= min_run and (best is None or len(run) > best[1]):
-                    f, m = run[len(run) // 2]
-                    spot = (f, m, "W") if d == "W" else (m, f, "N")
-                    best = (spot, len(run))
-                run = []
-            if fixed is not None:
-                run.append((fixed, moving))
+    # W before N, and within a direction the earlier run wins an equal length.
+    # Same order as lexsort by (moving, fixed): lower fixed, then lower moving.
+    for direction in ("W", "N"):
+        grouped: dict[int, list[int]] = {}
+        if direction == "W":
+            for x, y, side in edges:
+                if side == "W":
+                    grouped.setdefault(x, []).append(y)
+        else:
+            for x, y, side in edges:
+                if side == "N":
+                    grouped.setdefault(y, []).append(x)
+        for fixed in sorted(grouped):
+            moving = grouped[fixed]
+            moving.sort()
+            start = 0
+            count = len(moving)
+            for i in range(1, count + 1):
+                if i != count and moving[i] == moving[i - 1] + 1:
+                    continue
+                length = i - start
+                if length >= min_run and (best is None or length > best[1]):
+                    mid = moving[start + (length // 2)]
+                    if direction == "W":
+                        spot = (int(fixed), int(mid), "W")
+                    else:
+                        spot = (int(mid), int(fixed), "N")
+                    best = (spot, int(length))
+                start = i
     return best
 
 
@@ -1051,6 +1132,10 @@ def _doors(plan: Plan, rng: random.Random) -> None:
     sealed = {i for i, r in enumerate(rooms, 1) if r.is_shaft}
     edges = {k: v for k, v in _boundary_edges(plan).items()
              if k[0] not in sealed and k[1] not in sealed}
+    # A boundary never changes while the connectivity tree grows. Finding its
+    # longest run used to rebuild and sort three NumPy arrays every time a room
+    # was added, even though every pass asked the same question.
+    door_spots = {pair: _door_spot(wall, 1) for pair, wall in edges.items()}
 
     def start_room() -> int:
         for kind in ("hall", "lobby", "livingroom"):
@@ -1066,7 +1151,6 @@ def _doors(plan: Plan, rng: random.Random) -> None:
 
     # Each pass relaxes one rule, and only for rooms still unreached.
     for relax in range(4):
-        min_run = 1
         while True:
             best = None
             for (a, b), wall in edges.items():
@@ -1080,7 +1164,7 @@ def _doors(plan: Plan, rng: random.Random) -> None:
                             continue
                     elif flat in front and relax < 2:
                         continue
-                spot = _door_spot(wall, min_run)
+                spot = door_spots[(a, b)]
                 if spot is None:
                     continue
                 if ra.unit != rb.unit and not (ra.unit and rb.unit):
@@ -1128,14 +1212,24 @@ def _doors(plan: Plan, rng: random.Random) -> None:
             continue
         if ra.unit and (ra.kind == "hall" or rb.kind == "hall"):
             continue
-        spot = _door_spot(wall, 3)
-        if spot and rng.random() < 0.6:
+        spot = door_spots[(a, b)]
+        if spot and spot[1] >= 3 and rng.random() < 0.6:
             plan.doors.append(spot[0])
 
 
+def _bind_ids(plan: Plan) -> list:
+    ids = plan.grid.ravel().tolist()
+    plan._ids = ids
+    return ids
+
+
 def _room_at(plan: Plan, x: int, y: int) -> int:
-    if 0 <= x < plan.width and 0 <= y < plan.height:
-        return plan.grid[y][x]
+    w = plan.width
+    if 0 <= x < w and 0 <= y < plan.height:
+        ids = plan._ids
+        if ids is None:
+            ids = _bind_ids(plan)
+        return ids[y * w + x]
     return 0
 
 
@@ -1146,45 +1240,42 @@ def _side_edge(side: str, fixed: int, pos: int) -> tuple[int, int, str]:
     return (fixed, pos, "W")
 
 
+def _runs_from_positions(side: str, line: int, positions: list[int]):
+    """Split one face line into the stretches a party wall did not punch out."""
+    runs = []
+    run: list[int] = []
+    for p in positions + [None]:
+        if run and (p is None or p != run[-1] + 1):
+            if side in ("N", "S"):
+                runs.append((side, [(m, line, "N") for m in run]))
+            else:
+                runs.append((side, [(line, m, "W") for m in run]))
+            run = []
+        if p is not None:
+            run.append(p)
+    return runs
+
+
 def _outside_runs(plan: Plan, idx: int) -> list[tuple[str, list[tuple[int, int, str]]]]:
     """A room's exterior walls, as (facing, edges) straight runs, longest first.
 
     Built per room and per side so that a run is a real stretch of one wall.
     Walking the whole building's edge list instead - every tile's four sides
     interleaved - broke the side walls into runs one tile long, which is why
-    windows landed where they did.
+    windows landed where they did. The runs themselves are cached on the plan:
+    windows, the back door and the shop front all ask for them, and scanning
+    the floor once per room per caller is where the layout time went.
     """
-    sides: dict[str, dict[int, list[int]]] = {"N": {}, "S": {}, "W": {}, "E": {}}
-    for y in range(plan.height):
-        for x in range(plan.width):
-            if plan.grid[y][x] != idx:
-                continue
-            if not _room_at(plan, x, y - 1):
-                sides["N"].setdefault(y, []).append(x)
-            if not _room_at(plan, x, y + 1):
-                sides["S"].setdefault(y + 1, []).append(x)
-            if not _room_at(plan, x - 1, y):
-                sides["W"].setdefault(x, []).append(y)
-            if not _room_at(plan, x + 1, y):
-                sides["E"].setdefault(x + 1, []).append(y)
-    # A wall shared with the next building is not outside.
-    for side, lines in sides.items():
-        for fixed in list(lines):
-            lines[fixed] = [p for p in lines[fixed] if _side_edge(side, fixed, p) not in plan.party]
+    packed_all = _ensure_runs(plan)
+    if idx < 0 or idx >= len(packed_all):
+        return []
     runs: list[tuple[str, list[tuple[int, int, str]]]] = []
-    for side, lines in sides.items():
-        for fixed, positions in lines.items():
-            positions.sort()
-            run: list[int] = []
-            for p in positions + [None]:
-                if run and (p is None or p != run[-1] + 1):
-                    if side in ("N", "S"):
-                        runs.append((side, [(m, fixed, "N") for m in run]))
-                    else:
-                        runs.append((side, [(fixed, m, "W") for m in run]))
-                    run = []
-                if p is not None:
-                    run.append(p)
+    for rec in packed_all[idx]:
+        side = str(rec["side"])
+        line = int(rec["line"])
+        positions = [m for m in range(int(rec["start"]), int(rec["end"]))
+                     if _side_edge(side, line, m) not in plan.party]
+        runs.extend(_runs_from_positions(side, line, positions))
     runs.sort(key=lambda r: -len(r[1]))
     return runs
 
@@ -1362,54 +1453,60 @@ LIVED_IN = {"livingroom", "bedroom", "kidsbedroom", "kitchen", "classroom", "res
 MIN_WALL_FOR_WINDOW = 3
 
 
-def _facade_runs(grid: list[list[int]]) -> list[tuple[str, list[tuple[int, int, str, int, int]]]]:
+def _facade_runs(grid) -> list[tuple[str, list[tuple[int, int, str, int, int]]]]:
     """The building's outside walls as straight runs.
 
     Each edge is (x, y, dir, inside_x, inside_y): where BuildingEd draws the
-    wall, and the tile of the building behind it.
+    wall, and the tile of the building behind it. A straight stretch can cross
+    several rooms; the per-room runs cannot, so this is grouped from the
+    outside edges of the whole floor.
     """
-    h, w = len(grid), len(grid[0])
-
-    def inside(x, y):
-        return 0 <= x < w and 0 <= y < h and grid[y][x]
-
-    lines: dict[tuple[str, int], list[int]] = {}
-    for y in range(h):
-        for x in range(w):
-            if not grid[y][x]:
-                continue
-            if not inside(x, y - 1):
-                lines.setdefault(("N", y), []).append(x)
-            if not inside(x, y + 1):
-                lines.setdefault(("S", y + 1), []).append(x)
-            if not inside(x - 1, y):
-                lines.setdefault(("W", x), []).append(y)
-            if not inside(x + 1, y):
-                lines.setdefault(("E", x + 1), []).append(y)
+    grid = np.asarray(grid)
+    if grid.ndim != 2 or grid.size == 0:
+        return []
+    y, x, side, a, b = grids.outside_edges(grid)
+    if y.size == 0:
+        return []
+    on_b = b != 0
+    west = side == "W"
+    # 0 N, 1 S, 2 W, 3 E: the order a row-major walk used to meet each face.
+    face = np.where(west, np.where(on_b, 2, 3), np.where(on_b, 0, 1)).astype(np.int8)
+    line = np.where(west, x, y).astype(np.int32)
+    pos = np.where(west, y, x).astype(np.int32)
+    order = np.lexsort((pos, line, face))
+    face, line, pos = face[order], line[order], pos[order]
+    fresh = np.empty(pos.shape, dtype=bool)
+    fresh[0] = True
+    if pos.size > 1:
+        fresh[1:] = (
+            (face[1:] != face[:-1])
+            | (line[1:] != line[:-1])
+            | (np.diff(pos) != 1)
+        )
+    starts = np.flatnonzero(fresh)
+    ends = np.empty_like(starts)
+    ends[:-1] = starts[1:]
+    ends[-1] = pos.size
+    names = ("N", "S", "W", "E")
     runs = []
-    for (side, fixed), positions in lines.items():
-        positions.sort()
-        run: list[int] = []
-        for p in positions + [None]:
-            if run and (p is None or p != run[-1] + 1):
-                edges = []
-                for m in run:
-                    if side == "N":
-                        edges.append((m, fixed, "N", m, fixed))
-                    elif side == "S":
-                        edges.append((m, fixed, "N", m, fixed - 1))
-                    elif side == "W":
-                        edges.append((fixed, m, "W", fixed, m))
-                    else:
-                        edges.append((fixed, m, "W", fixed - 1, m))
-                runs.append((side, edges))
-                run = []
-            if p is not None:
-                run.append(p)
+    for s, e in zip(starts.tolist(), ends.tolist()):
+        which = names[int(face[s])]
+        fixed = int(line[s])
+        edges = []
+        for m in pos[s:e].tolist():
+            if which == "N":
+                edges.append((m, fixed, "N", m, fixed))
+            elif which == "S":
+                edges.append((m, fixed, "N", m, fixed - 1))
+            elif which == "W":
+                edges.append((fixed, m, "W", fixed, m))
+            else:
+                edges.append((fixed, m, "W", fixed - 1, m))
+        runs.append((which, edges))
     return runs
 
 
-def _room_edges(grid: list[list[int]]) -> set[tuple[int, int, str]]:
+def _room_edges(grid) -> set[tuple[int, int, str]]:
     """The walls BuildingEd draws between one room and the next.
 
     _facade_runs only knows about the outside of the building. These are just
@@ -1417,26 +1514,23 @@ def _room_edges(grid: list[list[int]]) -> set[tuple[int, int, str]]:
     tile, that tile carries both a west and a north wall and is drawn as one
     corner piece.
     """
-    h, w = len(grid), len(grid[0])
-    out: set[tuple[int, int, str]] = set()
-    for y in range(h):
-        for x in range(w):
-            here = grid[y][x]
-            if not here:
-                continue
-            if x > 0 and grid[y][x - 1] and grid[y][x - 1] != here:
-                out.add((x, y, "W"))
-            if y > 0 and grid[y - 1][x] and grid[y - 1][x] != here:
-                out.add((x, y, "N"))
-    return out
+    grid = np.asarray(grid)
+    if grid.size == 0:
+        return set()
+    y, x, side, a, b = grids.wall_edges(grid)
+    keep = (a > 0) & (b > 0)
+    return {(int(x[i]), int(y[i]), str(side[i])) for i in np.flatnonzero(keep)}
 
 
-def _sides_of(grid: list[list[int]], x: int, y: int, d: str) -> tuple[int, int]:
+def _sides_of(grid, x: int, y: int, d: str) -> tuple[int, int]:
     """The room ids either side of a wall edge; 0 is outside."""
-    h, w = len(grid), len(grid[0])
+    grid = np.asarray(grid)
+    h, w = grid.shape
 
     def at(px, py):
-        return grid[py][px] if 0 <= px < w and 0 <= py < h else 0
+        if 0 <= px < w and 0 <= py < h:
+            return int(grid[py, px])
+        return 0
 
     return (at(x - 1, y), at(x, y)) if d == "W" else (at(x, y - 1), at(x, y))
 
@@ -1574,10 +1668,13 @@ def _place_windows(building: "Building", kind: str | None,
     bays_by_grid: dict = {}
 
     def bays_for(grid):
-        key = tuple(tuple(bool(v) for v in row) for row in grid)
+        # The footprint, not the room numbers: two storeys with the same
+        # outside walls share bays even when the rooms inside differ.
+        g = np.asarray(grid)
+        key = (g.shape, np.ascontiguousarray(g).astype(bool).tobytes())
         if key not in bays_by_grid:
             sides: dict[str, list] = {}
-            for side, wall in _facade_runs(grid):
+            for side, wall in _facade_runs(g):
                 sides.setdefault(side, []).extend(wall)
             bays_by_grid[key] = _bays(sides, front, near, far)
         return bays_by_grid[key]
@@ -1589,8 +1686,9 @@ def _place_windows(building: "Building", kind: str | None,
         # like the shops.
         g0 = building.storeys[0]
         sales = RETAIL_ROOMS | FRONT_ROOMS | {"restaurant"}
-        glass = [b for b in glass if g0.grid[b[4]][b[3]]
-                 and g0.rooms[g0.grid[b[4]][b[3]] - 1].kind in sales]
+        glass = [b for b in glass
+                 if (rid := int(g0.grid[b[4], b[3]]))
+                 and g0.rooms[rid - 1].kind in sales]
         glass_set = set(glass)
         ground_bays = glass + [b for b in bays if b not in glass_set]
     house_like = kind in HOUSE_LIKE_KINDS
@@ -1625,21 +1723,27 @@ def _place_windows(building: "Building", kind: str | None,
         for x, y, d in storey.doors:
             for off in range(-clear, clear + 1):
                 blocked.add((x + off, y, d) if d == "N" else (x, y + off, d))
-        placed: list[tuple[int, int, str]] = []
+        # Windows already hung, sorted along each wall line, so the clearance
+        # test is a neighbour lookup rather than a walk of every window.
+        along: dict[str, dict[int, list[int]]] = {"N": {}, "W": {}}
 
         def spaced(x, y, d):
-            for px, py, pd in placed:
-                if pd != d:
-                    continue
-                if d == "N" and py == y and abs(px - x) <= clear:
-                    return False
-                if d == "W" and px == x and abs(py - y) <= clear:
-                    return False
+            line, pos = (y, x) if d == "N" else (x, y)
+            spots = along[d].get(line)
+            if not spots:
+                return True
+            i = bisect.bisect_left(spots, pos)
+            if i < len(spots) and spots[i] - pos <= clear:
+                return False
+            if i and pos - spots[i - 1] <= clear:
+                return False
             return True
 
         def add(edge):
             storey.windows.append(edge)
-            placed.append(edge)
+            x, y, d = edge
+            line, pos = (y, x) if d == "N" else (x, y)
+            bisect.insort(along[d].setdefault(line, []), pos)
 
         taken: dict[int, int] = {}
         if house_like:
@@ -1672,7 +1776,7 @@ def _place_windows(building: "Building", kind: str | None,
         for x, y, d, ix, iy in ([] if house_like else (ground_bays if level == 0 else bays_for(storey.grid))):
             if (x, y, d) in blocked:
                 continue
-            idx = storey.grid[iy][ix]
+            idx = int(storey.grid[iy, ix])
             if not idx:
                 continue
             room = storey.rooms[idx - 1]
@@ -1726,13 +1830,213 @@ def _facing(role: str, wanted: str) -> str:
     return alt if alt in have else next(iter(have))
 
 
+# Door clearance, the flight, furniture, and a temporary halo. A cell keeps
+# every reason it is blocked; checks name the bits they care about, so a
+# stair tile does not stop a piece that is allowed to stand on the flight.
+B_DOOR = 1
+B_STAIR = 2
+B_ITEM = 4
+B_EXTRA = 8
+B_CLEAR = B_DOOR | B_STAIR | B_ITEM | B_EXTRA
+
+_OFFSETS: dict[str, dict[str, tuple[tuple[int, int], ...]]] = {}
+
+
+def _offsets(role: str, orient: str) -> tuple[tuple[int, int], ...]:
+    """Tile offsets of one piece, cached. The catalog walks the same key order."""
+    by_orient = _OFFSETS.get(role)
+    if by_orient is None:
+        by_orient = {}
+        _OFFSETS[role] = by_orient
+    hit = by_orient.get(orient)
+    if hit is None:
+        keys = C.FURNITURE[role][orient]
+        hit = tuple(tuple(map(int, raw.split(","))) for raw in keys)
+        by_orient[orient] = hit
+    return hit
+
+
 def _cells_for(role: str, x: int, y: int, orient: str) -> list[tuple[int, int]]:
     """Tiles a furniture piece covers, derived from its tile-offset keys."""
-    out = []
-    for key in C.FURNITURE[role][orient]:
-        dx, dy = (int(v) for v in key.split(","))
-        out.append((x + dx, y + dy))
-    return out
+    off = _offsets(role, orient)
+    return [(x + dx, y + dy) for dx, dy in off]
+
+
+def _bind_occ(plan: Plan) -> memoryview | None:
+    occ = plan.occ
+    if occ is None:
+        plan._occ_flat = None
+        plan._occ_mv = None
+        return None
+    # A copy would stop seeing later in-place writes to plan.occ.
+    if not occ.flags.c_contiguous or occ.dtype != np.uint8:
+        occ = np.ascontiguousarray(occ, dtype=np.uint8)
+        plan.occ = occ
+    flat = occ.reshape(-1)
+    plan._occ_flat = flat
+    plan._occ_mv = memoryview(flat)
+    return plan._occ_mv
+
+
+def _occ_at(plan: Plan, x: int, y: int) -> int:
+    mv = plan._occ_mv
+    if mv is None:
+        mv = _bind_occ(plan)
+    return mv[y * plan.width + x]
+
+
+def _occ_mark(plan: Plan, cells, bit: int) -> None:
+    occ = plan.occ
+    if occ is None:
+        return
+    h, w = occ.shape
+    flag = np.uint8(bit)
+    for x, y in cells:
+        if 0 <= x < w and 0 <= y < h:
+            occ[y, x] |= flag
+
+
+def _busy(plan: Plan, x: int, y: int, bits: int, *backups) -> bool:
+    """In-bounds cells ask the occupancy grid. A tile past the edge has no
+    cell, so it still has to be looked up in the set it came from."""
+    if plan.occ is not None and 0 <= x < plan.width and 0 <= y < plan.height:
+        return bool(_occ_at(plan, x, y) & bits)
+    return any((x, y) in group for group in backups)
+
+
+def _busy_any(plan: Plan, cells, bits: int, *backups) -> bool:
+    # This is one of furnishing's innermost loops. Keep the same out-of-bounds
+    # fallback semantics without a generator and a Python function call per
+    # occupied tile.
+    if plan.occ is not None:
+        mv = plan._occ_mv
+        if mv is None:
+            mv = _bind_occ(plan)
+        w = plan.width
+        h = plan.height
+        for x, y in cells:
+            if 0 <= x < w and 0 <= y < h:
+                if mv[y * w + x] & bits:
+                    return True
+            elif any((x, y) in group for group in backups):
+                return True
+        return False
+    return any((x, y) in group for x, y in cells for group in backups)
+
+
+def _covers(plan: Plan, idx: int, x: int, y: int, offsets) -> bool:
+    """Every tile of the piece sits in room `idx`. Out of range is room 0."""
+    ids = plan._ids
+    if ids is None:
+        ids = _bind_ids(plan)
+    w = plan.width
+    h = plan.height
+    for dx, dy in offsets:
+        cx = x + dx
+        cy = y + dy
+        if cx < 0 or cy < 0 or cx >= w or cy >= h or ids[cy * w + cx] != idx:
+            return False
+    return True
+
+
+def _piece_fits(plan: Plan, idx: int, x: int, y: int, offsets, bits: int,
+                *backups) -> bool:
+    """The piece is entirely in `idx` and `_busy_any` would not reject it."""
+    ids = plan._ids
+    if ids is None:
+        ids = _bind_ids(plan)
+    occ = plan.occ
+    mv = plan._occ_mv if occ is not None else None
+    if occ is not None and mv is None:
+        mv = _bind_occ(plan)
+    w = plan.width
+    h = plan.height
+    for dx, dy in offsets:
+        cx = x + dx
+        cy = y + dy
+        if 0 <= cx < w and 0 <= cy < h:
+            if ids[cy * w + cx] != idx:
+                return False
+            if mv is not None:
+                if mv[cy * w + cx] & bits:
+                    return False
+            elif any((cx, cy) in group for group in backups):
+                return False
+        else:
+            if idx != 0 or any((cx, cy) in group for group in backups):
+                return False
+    return True
+
+
+def _clear_room_occ(plan: Plan, idx: int) -> None:
+    """Drop a neighbour's aisle spill and any halo from the room before it.
+
+    The spill is one tile into this room and is not furniture here. Leaving
+    it set would push this room's pieces off the tiles the old set, which
+    started empty, would have allowed.
+    """
+    if plan.occ is None:
+        return
+    plan.occ &= np.uint8(~B_EXTRA & 0xFF)
+    plan.occ[plan.grid == idx] &= np.uint8(~B_ITEM & 0xFF)
+
+
+def _wall_slots(plan: Plan, idx: int, room: Room,
+                stair_tiles: set[tuple[int, int]]) -> list[tuple[int, int, str]]:
+    """Tiles a piece can stand on, back to a wall, in row-major order.
+
+    Each facing is the neighbour just past that side of the cell. The box is
+    only the room's rectangle; the row outside it is read so a wall on the
+    edge of the rectangle is still a wall.
+    """
+    g = plan.grid
+    y0, x0 = room.y0, room.x0
+    y1, x1 = room.y1 + 1, room.x1 + 1
+    sub = g[y0:y1, x0:x1]
+    here = sub == idx
+    north = np.zeros(here.shape, np.int32)
+    south = np.zeros(here.shape, np.int32)
+    west = np.zeros(here.shape, np.int32)
+    east = np.zeros(here.shape, np.int32)
+    if y0 > 0:
+        north[0, :] = g[y0 - 1, x0:x1]
+    if here.shape[0] > 1:
+        north[1:, :] = sub[:-1, :]
+    if y1 < plan.height:
+        south[-1, :] = g[y1, x0:x1]
+    if here.shape[0] > 1:
+        south[:-1, :] = sub[1:, :]
+    if x0 > 0:
+        west[:, 0] = g[y0:y1, x0 - 1]
+    if here.shape[1] > 1:
+        west[:, 1:] = sub[:, :-1]
+    if x1 < plan.width:
+        east[:, -1] = g[y0:y1, x1]
+    if here.shape[1] > 1:
+        east[:, :-1] = sub[:, 1:]
+    for sx, sy in stair_tiles:
+        if y0 <= sy < y1 and x0 <= sx < x1:
+            here[sy - y0, sx - x0] = False
+    ys, xs = np.nonzero(here)
+    if ys.size == 0:
+        return []
+    n_hit = north[ys, xs] != idx
+    s_hit = south[ys, xs] != idx
+    w_hit = west[ys, xs] != idx
+    e_hit = east[ys, xs] != idx
+    slots: list[tuple[int, int, str]] = []
+    for i in range(int(ys.size)):
+        x = int(xs[i]) + x0
+        y = int(ys[i]) + y0
+        if n_hit[i]:
+            slots.append((x, y, "N"))
+        if s_hit[i]:
+            slots.append((x, y, "S"))
+        if w_hit[i]:
+            slots.append((x, y, "W"))
+        if e_hit[i]:
+            slots.append((x, y, "E"))
+    return slots
 
 
 SWITCH = "switch"
@@ -1879,10 +2183,15 @@ def _once(role: str) -> bool:
     return role in ONCE or role.startswith(("sofa_", "double_bed", "bed_", "wardrobe", "erika_vending"))
 
 
+def _by_dist(item):
+    return item[0]
+
+
 def _place_group(plan: Plan, idx: int, room: Room,
                  group: list[tuple[str, int, int, str]], repeat: int,
                  occupied: set[tuple[int, int]],
-                 keep_clear: set[tuple[int, int]]) -> int:
+                 keep_clear: set[tuple[int, int]],
+                 block_bits: int | None = None) -> int:
     """Up to `repeat` copies of one group, nearest the room's middle first."""
     if (room.x1 - room.x0) < (room.y1 - room.y0):
         # Rugs are drawn one way round whatever their orient, so a turned
@@ -1900,25 +2209,73 @@ def _place_group(plan: Plan, idx: int, room: Room,
              if C.FURNITURE_LAYERS.get(role, "Furniture") == "Furniture"
              for cx, cy in _cells_for(role, 0, 0, o)}
     mid_x, mid_y = (room.x0 + room.x1) / 2, (room.y0 + room.y1) / 2
-    spots = sorted(
-        ((x, y) for y in range(room.y0 - gy0, room.y1 - gy1 + 1)
-         for x in range(room.x0 - gx0, room.x1 - gx1 + 1)),
-        key=lambda p: abs(p[0] + (gx0 + gx1) / 2 - mid_x)
-        + abs(p[1] + (gy0 + gy1) / 2 - mid_y))
+    # Row-major candidates, stable on an equal distance so a tie lands on the
+    # same cell the old sort kept. Rooms are small; a meshgrid per group spent
+    # more time building arrays than ranking the cells.
+    y_start, y_stop = room.y0 - gy0, room.y1 - gy1 + 1
+    x_start, x_stop = room.x0 - gx0, room.x1 - gx1 + 1
+    if y_start >= y_stop or x_start >= x_stop:
+        return 0
+    half_x = (gx0 + gx1) / 2
+    half_y = (gy0 + gy1) / 2
+    ranked = []
+    for oy in range(y_start, y_stop):
+        dy = abs(oy + half_y - mid_y)
+        for ox in range(x_start, x_stop):
+            ranked.append((abs(ox + half_x - mid_x) + dy, ox, oy))
+    ranked.sort(key=_by_dist)
+    bits = B_CLEAR if block_bits is None else block_bits
+    flag = int(np.uint8(bits))
+    h, w = plan.height, plan.width
+    ids = plan._ids
+    if ids is None:
+        ids = _bind_ids(plan)
+    mv = plan._occ_mv if plan.occ is not None else None
+    if plan.occ is not None and mv is None:
+        mv = _bind_occ(plan)
     placed = 0
-    for ox, oy in spots:
+    for _dist, ox, oy in ranked:
         if placed >= repeat:
             break
-        ring = {(x, y) for y in range(oy + gy0 - 1, oy + gy1 + 2)
-                for x in range(ox + gx0 - 1, ox + gx1 + 2)}
-        if any(_room_at(plan, x, y) != idx or (x, y) in occupied
-               or (x, y) in keep_clear for x, y in ring):
+        ry0 = oy + gy0 - 1
+        ry1 = oy + gy1 + 1
+        rx0 = ox + gx0 - 1
+        rx1 = ox + gx1 + 1
+        if rx0 < 0 or ry0 < 0 or rx1 >= w or ry1 >= h:
             continue
+        blocked = False
+        for y in range(ry0, ry1 + 1):
+            base = y * w
+            for x in range(rx0, rx1 + 1):
+                if ids[base + x] != idx:
+                    blocked = True
+                    break
+            if blocked:
+                break
+        if blocked:
+            continue
+        if mv is not None:
+            for y in range(ry0, ry1 + 1):
+                base = y * w
+                for x in range(rx0, rx1 + 1):
+                    if mv[base + x] & flag:
+                        blocked = True
+                        break
+                if blocked:
+                    break
+            if blocked:
+                continue
+        elif plan.occ is None:
+            ring = {(x, y) for y in range(ry0, ry1 + 1) for x in range(rx0, rx1 + 1)}
+            if any((x, y) in occupied or (x, y) in keep_clear for x, y in ring):
+                continue
         for role, dx, dy, o in pieces:
             plan.furniture.append((role, ox + dx, oy + dy, o))
         # The whole footprint and its ring stay clear of the next copy, so
         # tables in a classroom keep an aisle between them.
-        occupied.update(ring)
+        if plan.occ is not None:
+            plan.occ[ry0:ry1 + 1, rx0:rx1 + 1] |= np.uint8(B_ITEM)
+        occupied.update((x, y) for y in range(ry0, ry1 + 1) for x in range(rx0, rx1 + 1))
         occupied.update((ox + x, oy + y) for x, y in solid)
         placed += 1
     return placed
@@ -1956,6 +2313,11 @@ def _furnish(plan: Plan, rng: random.Random,
         dx, dy = (0, 1) if sd == "N" else (1, 0)
         stair_tiles = {(sx + dx * i, sy + dy * i) for i in range(STAIR_RUN)}
 
+    plan.occ = np.zeros((plan.height, plan.width), np.uint8)
+    _bind_occ(plan)
+    _occ_mark(plan, door_tiles, B_DOOR)
+    _occ_mark(plan, stair_tiles, B_STAIR)
+
     if plan.shaft_door is not None:
         lx, ly, ld = plan.shaft_door
         plan.furniture.append(("elevator_door", lx, ly, ld))
@@ -1970,27 +2332,24 @@ def _furnish(plan: Plan, rng: random.Random,
         # A lift car has no switch and no furniture: it is a sealed box.
         if r.is_shaft:
             continue
+        # Furniture is appended room by room. Remember this room's first item
+        # so its finishing pass need not rescan every earlier room's contents.
+        room_furniture_start = len(plan.furniture)
+        _clear_room_occ(plan, idx)
         # Walls this room has, as (x, y, facing) for a piece standing on the
         # tile with its back to that wall.
-        slots = []
-        for y in range(r.y0, r.y1 + 1):
-            for x in range(r.x0, r.x1 + 1):
-                if plan.grid[y][x] != idx or (x, y) in stair_tiles:
-                    continue
-                for facing, nx, ny in (("N", x, y - 1), ("S", x, y + 1),
-                                       ("W", x - 1, y), ("E", x + 1, y)):
-                    if _room_at(plan, nx, ny) != idx:
-                        slots.append((x, y, facing))
+        slots = _wall_slots(plan, idx, r, stair_tiles)
         used_walls: set[tuple[int, int, str]] = set()
         # Outside walls are where the windows go, and the windows are laid out
         # last, in columns up the facade: a painting or switch hung there took
         # the bay and left a hole in the column. Hang things inside first.
         step = {"N": (0, -1), "S": (0, 1), "W": (-1, 0), "E": (1, 0)}
-
-        def on_facade(slot: tuple[int, int, str]) -> bool:
-            x, y, facing = slot
+        # One probe per slot. Each later sort used to ask the grid again.
+        facade: dict[tuple[int, int, str], bool] = {}
+        for slot in slots:
+            sx, sy, facing = slot
             ox, oy = step[facing]
-            return not _room_at(plan, x + ox, y + oy)
+            facade[slot] = not _room_at(plan, sx + ox, sy + oy)
 
         def hang(role: str, x: int, y: int, facing: str) -> bool:
             if role in NORTH_WEST_ONLY and facing in ("S", "E"):
@@ -2001,7 +2360,7 @@ def _furnish(plan: Plan, rng: random.Random,
             orient = _facing(role, facing)
             # Every tile of the piece in this room: a two-tile mirror hung at
             # the end of a wall reached through the outside wall.
-            if any(_room_at(plan, cx, cy) != idx for cx, cy in _cells_for(role, x, y, orient)):
+            if not _covers(plan, idx, x, y, _offsets(role, orient)):
                 return False
             plan.furniture.append((role, x, y, orient))
             used_walls.add(edge)
@@ -2011,10 +2370,21 @@ def _furnish(plan: Plan, rng: random.Random,
         # The switch: on a wall one tile from this room's door, the way people
         # actually fit them, or on any wall if the door is awkward.
         mine = [(x, y) for x, y in door_tiles if _room_at(plan, x, y) == idx]
-        by_reach = sorted(
-            slots,
-            key=lambda s: min((abs(s[0] - dx) + abs(s[1] - dy) for dx, dy in mine),
-                              default=0) + (4 if on_facade(s) else 0))
+        ranks = []
+        for slot in slots:
+            sx, sy, _facing_slot = slot
+            if mine:
+                best = abs(sx - mine[0][0]) + abs(sy - mine[0][1])
+                for dx, dy in mine[1:]:
+                    dist = abs(sx - dx) + abs(sy - dy)
+                    if dist < best:
+                        best = dist
+            else:
+                best = 0
+            if facade[slot]:
+                best += 4
+            ranks.append(best)
+        by_reach = [slots[i] for i in sorted(range(len(slots)), key=ranks.__getitem__)]
         # The game hangs one ceiling light off each switch, and that light
         # only reaches so far, so a sales floor or a warehouse lit by the one
         # switch beside its door was dark everywhere else - "lighting seems
@@ -2042,7 +2412,7 @@ def _furnish(plan: Plan, rng: random.Random,
         if r.is_core:
             # Nothing standing, but the walls are fair game: Knox County's
             # halls carry 7 pieces per 10 m2 and ours carried none.
-            for n, (x, y, facing) in enumerate(sorted(slots, key=on_facade)):
+            for n, (x, y, facing) in enumerate(sorted(slots, key=facade.__getitem__)):
                 if n % 3 == 0:
                     hang(("painting", "mirror", "painting")[n % 9 // 3], x, y, facing)
             continue
@@ -2070,6 +2440,10 @@ def _furnish(plan: Plan, rng: random.Random,
         elif r.kind == "bathroom" and plan.kind not in HOUSE_LIKE_KINDS | {"apartment"}:
             # A shop's or an office's toilet, not a family bathroom with a bath.
             base = ["toilet", "sink", "mirror", "toilet"]
+        # The dining halo blocked the counter and the tables. It is not
+        # clearance for the pieces hung afterwards.
+        if plan.occ is not None:
+            plan.occ &= np.uint8(~B_EXTRA & 0xFF)
         base = [pal.get(role, role) for role in base]
         if _erika_ready():
             # With Erika's Tiles installed, pictures and plants come from its
@@ -2121,7 +2495,7 @@ def _furnish(plan: Plan, rng: random.Random,
         rng.shuffle(floor_slots)
         for role in wishlist:
             if _is_wall_piece(role):
-                for x, y, facing in sorted(floor_slots, key=on_facade):
+                for x, y, facing in sorted(floor_slots, key=facade.__getitem__):
                     if hang(role, x, y, facing):
                         break
                 continue
@@ -2129,21 +2503,24 @@ def _furnish(plan: Plan, rng: random.Random,
                 if role in NORTH_WEST_ONLY and wanted in ("S", "E"):
                     continue
                 orient = _facing(role, wanted)
-                cells = _cells_for(role, x, y, orient)
-                if any(c in occupied or c in door_tiles for c in cells):
+                off = _offsets(role, orient)
+                if not _piece_fits(plan, idx, x, y, off, B_DOOR | B_ITEM,
+                                   occupied, door_tiles):
                     continue
-                if any(_room_at(plan, cx, cy) != idx for cx, cy in cells):
-                    continue
+                cells = [(x + dx, y + dy) for dx, dy in off]
                 front = set()
                 if _needs_front(role):
                     # A fridge, a stove or a wardrobe is opened from the tile
                     # in front of it; that tile stays floor.
                     fx, fy = {"N": (0, 1), "S": (0, -1), "W": (1, 0), "E": (-1, 0)}[wanted]
                     front = {(cx + fx, cy + fy) for cx, cy in cells} - set(cells)
-                    if any(c in occupied or _room_at(plan, *c) != idx for c in front):
+                    if any(_busy(plan, c[0], c[1], B_ITEM, occupied)
+                           or _room_at(plan, *c) != idx for c in front):
                         continue
                 occupied.update(cells)
                 occupied.update(front)
+                _occ_mark(plan, cells, B_ITEM)
+                _occ_mark(plan, front, B_ITEM)
                 plan.furniture.append((role, x, y, orient))
                 break
 
@@ -2154,7 +2531,7 @@ def _furnish(plan: Plan, rng: random.Random,
         elif r.kind in KITCHENS:
             _counter_runs(plan, idx, slots, occupied, door_tiles, stair_tiles,
                           pal.get("counter", "counter"))
-        _stand_on_something(plan, idx, r, pal)
+        _stand_on_something(plan, idx, r, pal, room_furniture_start)
 
 
 # Pieces drawn at worktop height: a sink, a television, a table lamp, a pot
@@ -2179,12 +2556,14 @@ def _needs_surface(role: str) -> bool:
     return role in SURFACE_ROLES or role.startswith("erika_plant")
 
 
-def _stand_on_something(plan: Plan, idx: int, room: Room, palette: dict) -> None:
+def _stand_on_something(plan: Plan, idx: int, room: Room, palette: dict,
+                        start: int = 0) -> None:
     """A counter, a cabinet or a small table under every piece of this room
     that needs one and does not have one."""
     standing: set[tuple[int, int]] = set()
     mine = []
-    for n, (role, x, y, o) in enumerate(plan.furniture):
+    for n in range(start, len(plan.furniture)):
+        role, x, y, o = plan.furniture[n]
         if _room_at(plan, x, y) != idx or _is_wall_piece(role):
             continue
         mine.append(n)
@@ -2228,12 +2607,14 @@ def _counter_runs(plan: Plan, idx: int, slots, occupied: set,
         for x, y, _f in by_wall[facing]:
             orient = _facing(counter, facing)
             cells = _cells_for(counter, x, y, orient)
-            if any(c in occupied or c in door_tiles or c in stair_tiles for c in cells):
+            if _busy_any(plan, cells, B_DOOR | B_STAIR | B_ITEM,
+                         occupied, door_tiles, stair_tiles):
                 continue
             if any(_room_at(plan, cx, cy) != idx for cx, cy in cells):
                 continue
             # A corner tile is on two walls; one counter is enough.
             occupied.update(cells)
+            _occ_mark(plan, cells, B_ITEM)
             plan.furniture.append((counter, x, y, orient))
 
     # Cupboards on the wall above the counters, and a microwave on one - the
@@ -2274,11 +2655,11 @@ class Building:
     def rooms(self) -> list[Room]:
         return [r for s in self.storeys for r in s.rooms]
 
-    def grid_for(self, level: int) -> list[list[int]]:
+    def grid_for(self, level: int) -> np.ndarray:
         """That storey's grid, renumbered into the shared room list."""
         offset = sum(len(s.rooms) for s in self.storeys[:level])
-        grid = self.storeys[level].grid
-        return [[v + offset if v else 0 for v in row] for row in grid]
+        g = np.asarray(self.storeys[level].grid)
+        return np.where(g > 0, g + np.int32(offset), np.int32(0)).astype(np.int32, copy=False)
 
 
 STAIR_RUN = 5      # tiles a staircase occupies, from Stairs::bounds
@@ -2288,8 +2669,8 @@ CORE_WIDE = 3      # the shaft is the flight plus a landing beside it
 CORRIDOR_WIDE = 3   # a landing wide enough to be circulation, not a cupboard
 
 
-def _pick_corridor(width: int, height: int, mask: list[list[bool]] | None,
-                   rng: random.Random) -> tuple[int, int, int, int] | None:
+def _pick_corridor(width: int, height: int, mask: np.ndarray | None,
+                   _rng: random.Random) -> tuple[int, int, int, int] | None:
     """A corridor through the floor, with room for the stairs inside it.
 
     Flats need something to open onto, and it has to reach all of them: a
@@ -2304,45 +2685,64 @@ def _pick_corridor(width: int, height: int, mask: list[list[bool]] | None,
     footprint is taken, as long as it runs most of the building's length;
     flats beyond its ends are folded into neighbours that do reach it.
     """
+    # `rng` is unused. The strip is the best score, not a random one, and a
+    # draw here would shift every later storey.
     along_y = height >= width
     span = height if along_y else width
     across = width if along_y else height
     if span < STAIR_RUN + 2 or across < CORRIDOR_WIDE + 2 * MIN_ROOM:
         return None
-
-    def inside(a: int, b: int) -> bool:
-        x, y = (b, a) if along_y else (a, b)
-        return mask is None or mask[y][x]
-
-    # How far the building actually extends along its length.
-    extent = [a for a in range(span) if any(inside(a, b) for b in range(across))]
-    if not extent:
+    if mask is None:
+        mask_arr = np.ones((height, width), dtype=bool)
+    else:
+        mask_arr = _as_mask(mask)
+    table = grids.sat(mask_arr)
+    if along_y:
+        extent = np.flatnonzero(mask_arr.any(axis=1))
+        ys, xs = grids.window_full(table, 1, CORRIDOR_WIDE)
+    else:
+        extent = np.flatnonzero(mask_arr.any(axis=0))
+        ys, xs = grids.window_full(table, CORRIDOR_WIDE, 1)
+    if extent.size == 0:
         return None
-    needed = max(STAIR_RUN + 2, int(0.6 * (extent[-1] - extent[0] + 1)))
+    needed = max(STAIR_RUN + 2, int(0.6 * (int(extent[-1]) - int(extent[0]) + 1)))
+
+    def consider(best, positions: np.ndarray, start: int):
+        if positions.size == 0:
+            return best
+        cuts = np.flatnonzero(np.diff(positions) != 1) + 1
+        starts_at = np.concatenate((np.zeros(1, np.int32), cuts))
+        ends_at = np.concatenate((cuts, np.array([positions.size], np.int32)))
+        for s, e in zip(starts_at.tolist(), ends_at.tolist()):
+            length = e - s
+            if length < needed:
+                continue
+            run_start = int(positions[s])
+            # `a` is the first tile past the run, as the old scan left it.
+            a = run_start + length
+            centre = abs((start + CORRIDOR_WIDE / 2) - across / 2)
+            score = (-length, centre)
+            if best is not None and score >= best[0]:
+                continue
+            if along_y:
+                rect = (start, run_start, start + CORRIDOR_WIDE - 1, a - 1)
+            else:
+                rect = (run_start, start, a - 1, start + CORRIDOR_WIDE - 1)
+            best = (score, rect)
+        return best
 
     best = None
-    for start in range(MIN_ROOM, across - CORRIDOR_WIDE - MIN_ROOM + 1):
-        run_start = None
-        for a in range(span + 1):
-            ok = a < span and all(inside(a, b) for b in range(start, start + CORRIDOR_WIDE))
-            if ok and run_start is None:
-                run_start = a
-            if not ok and run_start is not None:
-                length = a - run_start
-                if length >= needed:
-                    centre = abs((start + CORRIDOR_WIDE / 2) - across / 2)
-                    score = (-length, centre)
-                    if best is None or score < best[0]:
-                        if along_y:
-                            rect = (start, run_start, start + CORRIDOR_WIDE - 1, a - 1)
-                        else:
-                            rect = (run_start, start, a - 1, start + CORRIDOR_WIDE - 1)
-                        best = (score, rect)
-                run_start = None
+    last = across - CORRIDOR_WIDE - MIN_ROOM
+    for start in range(MIN_ROOM, last + 1):
+        if along_y:
+            positions = ys[xs == start]
+        else:
+            positions = xs[ys == start]
+        best = consider(best, positions, start)
     return best[1] if best else None
 
 
-def _pick_core(width: int, height: int, mask: list[list[bool]] | None,
+def _pick_core(width: int, height: int, mask: np.ndarray | None,
                rng: random.Random, street: str | None = None
                ) -> tuple[int, int, int, int] | None:
     """Reserve a stair shaft: the same rectangle on every storey.
@@ -2356,35 +2756,56 @@ def _pick_core(width: int, height: int, mask: list[list[bool]] | None,
     a terrace of narrow shops had a flight of stairs in the middle of every one.
     """
     shapes = [(CORE_WIDE, STAIR_RUN + 1), (STAIR_RUN + 1, CORE_WIDE)]
-    best: list[tuple[int, int, int, int]] = []
-    best_score = None
+    table = None if mask is None else grids.sat(_as_mask(mask))
+    scores: list[np.ndarray] = []
+    rects: list[np.ndarray] = []
     for cw, ch in shapes:
         if cw > width or ch > height:
             continue
-        for y0 in range(height - ch + 1):
-            for x0 in range(width - cw + 1):
-                if mask is not None and not all(
-                        mask[y][x]
-                        for y in range(y0, y0 + ch)
-                        for x in range(x0, x0 + cw)):
-                    continue
-                # Central, so the flight is not jammed against the windows.
-                score = (abs((x0 + cw / 2) - width / 2)
-                         + abs((y0 + ch / 2) - height / 2))
-                if street in STEP_OF:
-                    # Back and side: distance from the wall opposite the
-                    # street, then from the nearer side wall.
-                    back = {"S": y0, "N": height - (y0 + ch), "E": x0,
-                            "W": width - (x0 + cw)}[street]
-                    side = min(x0, width - (x0 + cw)) if street in ("N", "S") \
-                        else min(y0, height - (y0 + ch))
-                    score = back * 2 + side
-                if best_score is None or score < best_score - 1e-9:
-                    best_score, best = score, [(x0, y0, x0 + cw - 1,
-                                                y0 + ch - 1)]
-                elif abs(score - best_score) < 1e-9:
-                    best.append((x0, y0, x0 + cw - 1, y0 + ch - 1))
-    return rng.choice(best) if best else None
+        if table is None:
+            yy, xx = np.meshgrid(
+                np.arange(height - ch + 1, dtype=np.int32),
+                np.arange(width - cw + 1, dtype=np.int32),
+                indexing="ij")
+            ys, xs = yy.ravel(), xx.ravel()
+        else:
+            ys, xs = grids.window_full(table, ch, cw)
+        if ys.size == 0:
+            continue
+        ys_f = ys.astype(np.float64)
+        xs_f = xs.astype(np.float64)
+        if street in STEP_OF:
+            # Back and side: distance from the wall opposite the street,
+            # then from the nearer side wall.
+            if street == "S":
+                back = ys_f
+            elif street == "N":
+                back = height - (ys_f + ch)
+            elif street == "E":
+                back = xs_f
+            else:
+                back = width - (xs_f + cw)
+            if street in ("N", "S"):
+                side = np.minimum(xs_f, width - (xs_f + cw))
+            else:
+                side = np.minimum(ys_f, height - (ys_f + ch))
+            score = back * 2 + side
+        else:
+            # Central, so the flight is not jammed against the windows.
+            score = (np.abs((xs_f + cw / 2) - width / 2)
+                     + np.abs((ys_f + ch / 2) - height / 2))
+        scores.append(np.asarray(score, dtype=np.float64))
+        rects.append(np.stack((xs, ys, xs + cw - 1, ys + ch - 1), axis=1))
+    if not scores:
+        return None
+    all_scores = np.concatenate(scores)
+    all_rects = np.concatenate(rects)
+    best_score = float(all_scores.min())
+    # The same band the old running comparison kept, in row-major order, so
+    # the one rng.choice still sees the ties in the order it used to.
+    tied = np.flatnonzero(np.abs(all_scores - best_score) < 1e-9)
+    choices = [tuple(int(v) for v in all_rects[i]) for i in tied.tolist()]
+    return rng.choice(choices)
 
 
 STEP_OF = {"N": (0, -1), "S": (0, 1), "W": (-1, 0), "E": (1, 0)}
@@ -2420,8 +2841,7 @@ def _pick_shaft(core: tuple[int, int, int, int], width: int, height: int,
     def inside(x0, y0):
         if x0 < 0 or y0 < 0 or x0 + s > width or y0 + s > height:
             return False
-        return mask is None or all(mask[y][x] for y in range(y0, y0 + s)
-                                   for x in range(x0, x0 + s))
+        return mask is None or bool(np.asarray(mask)[y0:y0 + s, x0:x0 + s].all())
 
     options = []
     if (cy1 - cy0) >= (cx1 - cx0):
@@ -2457,12 +2877,10 @@ def _carve_shaft(plan: Plan, shaft: tuple[int, int, int, int],
     """Paint the elevator shaft over the storey as a sealed room of its own."""
     x0, y0, x1, y1 = shaft
     plan.rooms.append(Room(x0, y0, x1, y1, kind="elevator", unit=0, is_shaft=True))
-    idx = len(plan.rooms)
-    for y in range(y0, y1 + 1):
-        for x in range(x0, x1 + 1):
-            plan.grid[y][x] = idx
+    plan.grid[y0:y1 + 1, x0:x1 + 1] = len(plan.rooms)
     plan.shaft = shaft
     plan.shaft_door = door
+    _invalidate(plan)
     _renumber(plan)
     _mend_fragments(plan)
     _refit(plan)
@@ -2502,7 +2920,8 @@ def build_building(width: int, height: int, levels: int = 1,
                    retail: bool = False,
                    uses: list[tuple[str, str]] | None = None,
                    hotel: bool = False,
-                   party: dict | None = None) -> Building:
+                   party: dict | None = None,
+                   should_stop=None) -> Building:
     """Lay out a building of `levels` storeys.
 
     `retail` puts shops on the ground floor of a block of flats, as on any
@@ -2515,6 +2934,7 @@ def build_building(width: int, height: int, levels: int = 1,
     staircase has to line up, and it does because the shaft is reserved first.
     """
     levels = max(1, levels)
+    mask = _as_mask(mask)
     rng = random.Random(seed ^ 0x5745)
 
     # A block of flats gets a corridor whether or not it is tall enough to
@@ -2542,18 +2962,21 @@ def build_building(width: int, height: int, levels: int = 1,
     # shop, a restaurant or a bank in a building that is more than one.
     shops = kind in ("apartment", "civic") and core is not None and (
         (retail and kind == "apartment" and levels >= 3) or (bool(uses) and levels >= 2))
-    storeys = [
-        build_plan(width, height, commercial=commercial or (shops and lvl == 0),
-                   seed=seed + 977 * lvl,
-                   kind="retail" if shops and lvl == 0 else kind,
-                   mask=upper_mask if setback_at and lvl >= setback_at else mask,
-                   ground=(lvl == 0), settings=settings,
-                   core=core, level=lvl, levels=levels, stairs=stairs,
-                   corridor=corridor, shaft=shaft, shaft_door=shaft_door,
-                   street=street, uses=uses, hotel=hotel,
-                   party={e for e, up in (party or {}).items() if lvl < up})
-        for lvl in range(levels)
-    ]
+    storeys = []
+    for lvl in range(levels):
+        # Between storeys, so Stop is not stuck inside one tall building.
+        if should_stop is not None and should_stop():
+            raise knoxstop.Stopped("the buildings")
+        storeys.append(
+            build_plan(width, height, commercial=commercial or (shops and lvl == 0),
+                       seed=seed + 977 * lvl,
+                       kind="retail" if shops and lvl == 0 else kind,
+                       mask=upper_mask if setback_at and lvl >= setback_at else mask,
+                       ground=(lvl == 0), settings=settings,
+                       core=core, level=lvl, levels=levels, stairs=stairs,
+                       corridor=corridor, shaft=shaft, shaft_door=shaft_door,
+                       street=street, uses=uses, hotel=hotel,
+                       party={e for e, up in (party or {}).items() if lvl < up}))
     building = Building(width=width, height=height, storeys=storeys)
     if stairs is not None:
         for lvl in range(levels - 1):
@@ -2580,33 +3003,24 @@ def _setback(width: int, height: int, mask, levels: int, core, shaft,
     """(the upper storeys' mask, the storey the step is at) or (None, 0)."""
     if levels < SETBACK_FROM_LEVELS or core is None:
         return None, 0
-    base = mask or [[True] * width for _ in range(height)]
-    k = SETBACK_TILES
+    base = np.ones((height, width), dtype=bool) if mask is None else _as_mask(mask)
     # A block of flats has a corridor end to end: it steps in along its long
-    # sides only, so the corridor still reaches both ends.
+    # sides only, so the corridor still reaches both ends. The erosion
+    # footprint is that step: a square, or a line when only one axis moves.
     x0, y0, x1, y1 = core
     along_x = corridor and (x1 - x0) >= (y1 - y0)
     along_y = corridor and not along_x
-
-    def kept(x, y):
-        for dx in range(-k, k + 1):
-            for dy in range(-k, k + 1):
-                if along_x and dx:
-                    continue
-                if along_y and dy:
-                    continue
-                nx, ny = x + dx, y + dy
-                if not (0 <= nx < width and 0 <= ny < height and base[ny][nx]):
-                    return False
-        return True
-
-    upper = [[base[y][x] and kept(x, y) for x in range(width)] for y in range(height)]
+    if along_x:
+        structure = np.ones((2 * SETBACK_TILES + 1, 1), dtype=bool)
+    elif along_y:
+        structure = np.ones((1, 2 * SETBACK_TILES + 1), dtype=bool)
+    else:
+        structure = None
+    upper = grids.erode(base, structure)
     for rx0, ry0, rx1, ry1 in [core] + ([shaft] if shaft else []):
-        for y in range(ry0, ry1 + 1):
-            for x in range(rx0, rx1 + 1):
-                if not upper[y][x]:
-                    return None, 0
-    if sum(map(sum, upper)) < SETBACK_MIN_KEEP * sum(map(sum, base)):
+        if not bool(upper[ry0:ry1 + 1, rx0:rx1 + 1].all()):
+            return None, 0
+    if int(upper.sum()) < SETBACK_MIN_KEEP * int(base.sum()):
         return None, 0
     return upper, round(levels * SETBACK_SHARE)
 
@@ -2682,6 +3096,7 @@ def build_plan(width: int, height: int, commercial: bool = False,
     a five-metre drop, and the game will happily let a zombie walk through it.
     """
     settings = settings or Settings()
+    mask = _as_mask(mask)
     rng = random.Random(seed)
     plan = Plan(width=width, height=height, mask=mask, core=core,
                 corridor=corridor, kind=kind, party=set(party or ()))
@@ -2697,7 +3112,7 @@ def build_plan(width: int, height: int, commercial: bool = False,
     # A factory floor 160 tiles across split into house-sized rooms would be
     # hundreds of cupboards. However big the building, keep it to a number of
     # rooms a person could walk through.
-    floor_tiles = sum(map(sum, mask)) if mask is not None else width * height
+    floor_tiles = int(mask.sum()) if mask is not None else width * height
     target = min(max(target, floor_tiles / MAX_ROOMS_PER_FLOOR), MAX_ROOM_AREA)
 
     if kind == "apartment":
@@ -2746,33 +3161,38 @@ def build_plan(width: int, height: int, commercial: bool = False,
     return plan
 
 
-def _largest_rectangle(todo: list[list[bool]]) -> tuple[int, int, int, int] | None:
+def _largest_rectangle(todo) -> tuple[int, int, int, int] | None:
     """Biggest all-True rectangle as (x0, y0, width, height), by histogram."""
-    h = len(todo)
-    w = len(todo[0]) if h else 0
-    heights = [0] * w
+    todo = np.asarray(todo, dtype=bool)
+    h, w = todo.shape
+    if h == 0 or w == 0:
+        return None
+    # One conversion, then the histogram stays on Python ints. Building a new
+    # height array and copying it out on every row cost more than the scan.
+    rows = todo.tolist()
+    heights = [0] * (w + 1)
     best = None
     best_area = 0
     for y in range(h):
+        row = rows[y]
         for x in range(w):
-            heights[x] = heights[x] + 1 if todo[y][x] else 0
+            heights[x] = heights[x] + 1 if row[x] else 0
         stack: list[int] = []
         for x in range(w + 1):
-            cur = heights[x] if x < w else 0
-            start = x
+            cur = heights[x]
             while stack and heights[stack[-1]] >= cur:
                 top = stack.pop()
                 left = stack[-1] + 1 if stack else 0
-                area = heights[top] * (x - left)
+                hh = heights[top]
+                area = hh * (x - left)
                 if area > best_area:
                     best_area = area
-                    best = (left, y - heights[top] + 1, x - left, heights[top])
-                start = left
+                    best = (left, y - hh + 1, x - left, hh)
             stack.append(x)
     return best
 
 
-def roof_rects(grid: list[list[int]]) -> list[tuple[int, int, int, int, dict]]:
+def roof_rects(grid) -> list[tuple[int, int, int, int, dict]]:
     """Flat roofs covering exactly a storey's footprint.
 
     A BuildingEd roof is a rectangle, and every building here used to get one
@@ -2786,29 +3206,51 @@ def roof_rects(grid: list[list[int]]) -> list[tuple[int, int, int, int, dict]]:
     building. Where one roof meets another the rim would draw a ridge across
     the middle of a flat roof, so that side is left open.
     """
-    h = len(grid)
-    w = len(grid[0]) if h else 0
-    inside = [[bool(grid[y][x]) for x in range(w)] for y in range(h)]
-    todo = [row[:] for row in inside]
+    grid = np.asarray(grid)
+    if grid.ndim != 2 or grid.shape[0] == 0 or grid.shape[1] == 0:
+        return []
+    inside = grid != 0
+    todo = inside.copy()
+    h, w = inside.shape
     rects = []
     while True:
-        found = _largest_rectangle(todo)
+        occupied_rows = np.flatnonzero(np.any(todo, axis=1))
+        occupied_cols = np.flatnonzero(np.any(todo, axis=0))
+        if occupied_rows.size == 0 or occupied_cols.size == 0:
+            break
+        crop_y0, crop_y1 = int(occupied_rows[0]), int(occupied_rows[-1]) + 1
+        crop_x0, crop_x1 = int(occupied_cols[0]), int(occupied_cols[-1]) + 1
+        remaining = todo[crop_y0:crop_y1, crop_x0:crop_x1]
+        if bool(np.all(remaining)):
+            # Common after taking the main body of an L or notched footprint.
+            found = (0, 0, crop_x1 - crop_x0, crop_y1 - crop_y0)
+        else:
+            found = _largest_rectangle(remaining)
         if found is None:
             break
-        x0, y0, rw, rh = found
-        for y in range(y0, y0 + rh):
-            for x in range(x0, x0 + rw):
-                todo[y][x] = False
+        local_x, local_y, rw, rh = found
+        x0, y0 = crop_x0 + local_x, crop_y0 + local_y
+        if rw <= 0 or rh <= 0:
+            break
+        todo[y0:y0 + rh, x0:x0 + rw] = False
 
-        def open_side(cells) -> bool:
-            return all(0 <= cx < w and 0 <= cy < h and inside[cy][cx]
-                       for cx, cy in cells)
+        def open_side(xs, ys) -> bool:
+            xs = np.asarray(xs, dtype=np.int32)
+            ys = np.asarray(ys, dtype=np.int32)
+            ok = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            if not bool(np.all(ok)):
+                return False
+            return bool(np.all(inside[ys, xs]))
 
         caps = {
-            "cappedW": not open_side([(x0 - 1, y) for y in range(y0, y0 + rh)]),
-            "cappedE": not open_side([(x0 + rw, y) for y in range(y0, y0 + rh)]),
-            "cappedN": not open_side([(x, y0 - 1) for x in range(x0, x0 + rw)]),
-            "cappedS": not open_side([(x, y0 + rh) for x in range(x0, x0 + rw)]),
+            "cappedW": not open_side(np.full(rh, x0 - 1, np.int32),
+                                     np.arange(y0, y0 + rh)),
+            "cappedE": not open_side(np.full(rh, x0 + rw, np.int32),
+                                     np.arange(y0, y0 + rh)),
+            "cappedN": not open_side(np.arange(x0, x0 + rw),
+                                     np.full(rw, y0 - 1, np.int32)),
+            "cappedS": not open_side(np.arange(x0, x0 + rw),
+                                     np.full(rw, y0 + rh, np.int32)),
         }
         rects.append((x0, y0, rw, rh, caps))
     return rects

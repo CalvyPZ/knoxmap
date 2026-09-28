@@ -13,6 +13,7 @@ folder the window uses when both files sit together.
 """
 from __future__ import annotations
 
+import multiprocessing
 import sys
 
 # (help, module, how that module reads argv)
@@ -60,4 +61,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # A frozen Windows build re-enters this file in each worker. This has to
+    # run before main(), and only under the guard, or those workers start the app.
+    multiprocessing.freeze_support()
     raise SystemExit(main())
