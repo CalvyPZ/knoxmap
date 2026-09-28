@@ -2,9 +2,10 @@
 # releases/ by build_releases.bat.
 /KnoxMap.exe
 
-# Electron dependencies. Packager output and PyInstaller scratch are written
-# under releases/ (releases/dist and releases/temp). These stay ignored so an
-# older desktop build is not committed.
+# Electron dependencies. install_requirements.bat runs npm install here.
+# Packager output and PyInstaller scratch are written under releases/
+# (releases/dist and releases/temp). These stay ignored so an older desktop
+# build is not committed.
 desktop/node_modules/
 desktop/out/
 desktop/pybuild/
@@ -17,7 +18,7 @@ desktop/pybuild/
 /releases/*
 /released/
 
-# Python
+# Python. install_requirements.bat and debug_run.bat create KnoxMap/.venv.
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -30,8 +31,9 @@ dist/
 build/
 
 # Generated maps, OpenStreetMap downloads and compiled lots. Large, and built
-# from OSM data rather than source.
-KnoxMap/output/*
+# from OSM data rather than source. debug_run.bat creates this folder on
+# startup, before any map exists.
+KnoxMap/output/
 
 # Setup installs the map tools here and writes local paths here.
 /vendor/
