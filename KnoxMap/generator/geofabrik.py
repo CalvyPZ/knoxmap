@@ -12,11 +12,14 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 
 import requests
 
-INDEX_URL = "https://download.geofabrik.de/index-v1-nogeom.json"
+# The nogeom index has no geometry and no bbox, so every region would be
+# skipped. The full index is a few MB and carries each region's outline.
+INDEX_URL = "https://download.geofabrik.de/index-v1.json"
 _HEADERS = {"User-Agent": "KnoxMap/1.0 (+https://github.com/CalvyPZ/knoxmap) local map generator"}
 
 
@@ -27,6 +30,7 @@ class Region:
     parent: str | None
     url: str
     bbox: tuple[float, float, float, float]  # south, west, north, east
+    geometry: dict | None = field(default=None, repr=False, compare=False)
 
     @property
     def slug(self) -> str:
@@ -39,14 +43,38 @@ def cache_dir(root: str) -> str:
     return path
 
 
+def _outline_box(coords) -> tuple[float, float, float, float] | None:
+    lons: list[float] = []
+    lats: list[float] = []
+    stack = [coords]
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, (list, tuple)) or not item:
+            continue
+        if isinstance(item[0], (int, float)):
+            if len(item) >= 2:
+                lons.append(float(item[0]))
+                lats.append(float(item[1]))
+            continue
+        stack.extend(item)
+    if not lons:
+        return None
+    return min(lats), min(lons), max(lats), max(lons)
+
+
 def _box_of(feature: dict) -> tuple[float, float, float, float] | None:
     raw = feature.get("bbox") or (feature.get("properties") or {}).get("bbox")
-    if not (isinstance(raw, (list, tuple)) and len(raw) == 4):
-        return None
-    west, south, east, north = (float(v) for v in raw)
+    if isinstance(raw, (list, tuple)) and len(raw) == 4:
+        west, south, east, north = (float(v) for v in raw)
+        box = (south, west, north, east)
+    else:
+        box = _outline_box((feature.get("geometry") or {}).get("coordinates"))
+        if box is None:
+            return None
+    south, west, north, east = box
     if not south < north or not west < east:
         return None
-    return south, west, north, east
+    return box
 
 
 def _parse_index(payload: dict) -> list[Region]:
@@ -65,6 +93,9 @@ def _parse_index(payload: dict) -> list[Region]:
             parent=str(parent) if parent else None,
             url=url,
             bbox=box,
+            geometry=feature.get("geometry")
+                     if (feature.get("geometry") or {}).get("type")
+                     in ("Polygon", "MultiPolygon") else None,
         ))
     return out
 
@@ -72,7 +103,7 @@ def _parse_index(payload: dict) -> list[Region]:
 def load_index(root: str, refresh: bool = True, timeout: int = 60) -> list[Region]:
     """The published region list, refreshed when the server copy is newer."""
     folder = cache_dir(root)
-    path = os.path.join(folder, "index-v1-nogeom.json")
+    path = os.path.join(folder, "index-v1.json")
     meta_path = path + ".meta.json"
     if refresh:
         _refresh(INDEX_URL, path, meta_path, timeout)
@@ -86,6 +117,34 @@ def load_index(root: str, refresh: bool = True, timeout: int = 60) -> list[Regio
     if not regions:
         raise RuntimeError("The Geofabrik region list had no downloadable areas.")
     return regions
+
+
+_CONTINENT_IDS = {
+    "africa": "africa",
+    "asia": "asia",
+    "europe": "europe",
+    "north america": "north-america",
+    "south america": "south-america",
+    "oceania": "australia-oceania",
+    "australia and oceania": "australia-oceania",
+}
+
+
+def continent_outline(root: str, name: str) -> dict | None:
+    """Geofabrik's OSM extract outline for a named continent.
+
+    OSM represents continents as points rather than administrative boundary
+    relations. Geofabrik's published OSM region index supplies the polygon
+    used by its continent extracts, so continent selection can still have an
+    outline instead of degenerating to Nominatim's rectangular extent.
+    """
+    wanted = _CONTINENT_IDS.get(" ".join((name or "").lower().split()))
+    if not wanted:
+        return None
+    for region in load_index(root):
+        if region.id == wanted:
+            return region.geometry
+    return None
 
 
 def _meta(path: str) -> dict:
@@ -124,9 +183,32 @@ def _remote_changed(url: str, meta: dict, timeout: int) -> requests.Response | N
     return head
 
 
-def _refresh(url: str, path: str, meta_path: str, timeout: int) -> bool:
+class _Rate:
+    """Bytes a second over the last few seconds, so one stall or burst does
+    not swing the estimate."""
+
+    WINDOW = 4.0
+
+    def __init__(self):
+        self.samples: deque[tuple[float, int]] = deque()
+
+    def add(self, now: float, done: int) -> float:
+        self.samples.append((now, done))
+        while len(self.samples) > 2 and now - self.samples[0][0] > self.WINDOW:
+            self.samples.popleft()
+        first_time, first_done = self.samples[0]
+        span = now - first_time
+        return (done - first_done) / span if span > 0 else 0.0
+
+
+def _refresh(url: str, path: str, meta_path: str, timeout: int,
+             on_bytes=None) -> bool:
     """Download url over path when the server copy is newer. Returns True
-    when the file on disk changed."""
+    when the file on disk changed.
+
+    on_bytes(done, total, bytes_per_second) is called about twice a second
+    while the file comes down. total is 0 when the server does not say.
+    """
     meta = _meta(meta_path)
     if os.path.exists(path) and _remote_changed(url, meta, timeout) is None and meta:
         return False
@@ -135,10 +217,29 @@ def _refresh(url: str, path: str, meta_path: str, timeout: int) -> bool:
         with requests.get(url, headers=_HEADERS, timeout=timeout, stream=True) as response:
             response.raise_for_status()
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            try:
+                total = int(response.headers.get("Content-Length") or 0)
+            except ValueError:
+                total = 0
+            done = 0
+            rate = _Rate()
+            last = 0.0
+            if on_bytes:
+                on_bytes(0, total, 0.0)
             with open(tmp, "wb") as fh:
                 for chunk in response.iter_content(1 << 16):
-                    if chunk:
-                        fh.write(chunk)
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if on_bytes:
+                        now = time.monotonic()
+                        speed = rate.add(now, done)
+                        if now - last >= 0.5:
+                            last = now
+                            on_bytes(done, total, speed)
+            if on_bytes:
+                on_bytes(done, total or done, 0.0)
             stamp = _stamp(response)
     except requests.RequestException:
         if os.path.exists(tmp):
@@ -158,12 +259,14 @@ def pbf_path(root: str, region: Region) -> str:
 
 def ensure_pbf(root: str, region: Region, timeout: int = 120,
                progress=None) -> str:
-    """The region's latest daily PBF, downloaded when the cache is older."""
+    """The region's latest daily PBF, downloaded when the cache is older.
+
+    progress(done, total, bytes_per_second) follows the download, if there
+    is one; a copy that is already current never calls it.
+    """
     path = pbf_path(root, region)
     meta_path = path + ".meta.json"
-    if progress:
-        progress(region.name)
-    changed = _refresh(region.url, path, meta_path, timeout)
+    changed = _refresh(region.url, path, meta_path, timeout, on_bytes=progress)
     if changed:
         folder = cache_dir(root)
         for name in os.listdir(folder):
