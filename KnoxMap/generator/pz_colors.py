@@ -83,6 +83,26 @@ BIN = (12, 36, 210)
 SPEED_SIGNS = {(25, "S"): (12, 38, 200), (25, "E"): (12, 38, 201),
                (35, "S"): (12, 38, 202), (35, "E"): (12, 38, 203),
                (45, "S"): (12, 38, 204), (45, "E"): (12, 38, 205)}
+# Junction controls (generator/intersections.py). Facings match the sprites:
+# stop-sign fronts are south and east, backs north and west; signal poles
+# follow the lamp arms on the same row (8 north, 9 east, 10 south, 11 west,
+# so 12-15 are the same four). Stop lines and crosswalks use the same edge
+# names as the centre lines: N runs east-west, W runs north-south.
+STOP_SIGN_N = (12, 39, 200)
+STOP_SIGN_E = (12, 39, 201)
+STOP_SIGN_S = (12, 39, 202)
+STOP_SIGN_W = (12, 39, 203)
+SIGNAL_N = (12, 39, 204)
+SIGNAL_E = (12, 39, 205)
+SIGNAL_S = (12, 39, 206)
+SIGNAL_W = (12, 39, 207)
+STOP_LINE_N = (12, 39, 208)
+STOP_LINE_W = (12, 39, 209)
+STOP_LINE_E = (12, 39, 210)
+STOP_LINE_S = (12, 39, 211)
+CROSSWALK_N = (12, 39, 212)
+CROSSWALK_W = (12, 39, 213)
+STREET_NAME_SIGN = (12, 39, 214)
 # Back yards (knoxbuild/yards.py): a grill, patio table and chairs, a
 # clothesline and a raised planting bed, each tile of each its own colour.
 GRILL = (12, 37, 200)

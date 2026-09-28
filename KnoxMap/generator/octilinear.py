@@ -206,9 +206,17 @@ def _round_together(moved: np.ndarray, segs: np.ndarray, normals: np.ndarray) ->
     return out
 
 
-def straighten_roads(features: list, proj, classify, is_polygon) -> int:
+def straighten_roads(features: list, proj, classify, is_polygon,
+                     moved: dict | None = None) -> int:
     """Redraw the roads in `features` and move the rest of the town with them,
-    in place. Returns how many roads were redrawn."""
+    in place. Returns how many roads were redrawn.
+
+    When `moved` is given, it is filled with `{old_key: (x, y)}` for every
+    shared junction vertex, in the snapped tile coordinates. The intersection
+    pass collected those keys before the roads moved. The name is taken at
+    once: the solver below reuses it for the shifted points.
+    """
+    reported = moved
     roads = [f for f in features
              if f.kind == "way" and len(f.geometry) >= 2 and not is_polygon(f)
              and classify(f.tags) in ROAD_CATEGORIES]
@@ -275,6 +283,9 @@ def straighten_roads(features: list, proj, classify, is_polygon) -> int:
 
     # --- the roads, from the moved points ---------------------------------
     snapped = _round_together(moved, segs, normals)
+    if reported is not None:
+        for key, index in junction.items():
+            reported[key] = (int(snapped[index][0]), int(snapped[index][1]))
     for f, verts in zip(roads, road_vertices):
         path = [snapped[verts[0]]]
         for v in verts[1:]:
