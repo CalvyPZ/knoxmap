@@ -1,0 +1,133 @@
+/* The debug profiler window. Shares the app's colours and stands apart by the green bar. */
+
+body.profiler {
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+  border-top: 3px solid var(--accent);
+}
+body.profiler h1 { font-size: 16px; }
+body.profiler .topbar { flex: none; flex-wrap: wrap; }
+
+.profiler-tools {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.scope {
+  display: inline-flex;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.scope button {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.scope button[aria-pressed="true"] {
+  color: var(--accent-ink);
+  background: var(--accent);
+}
+.profiler-tools input[type="search"] {
+  width: 240px;
+  margin: 0;
+}
+.profiler-status,
+.profiler-log {
+  flex: none;
+  margin: 0;
+  padding: 6px 16px 0;
+}
+.profiler-log {
+  padding-bottom: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  user-select: text;
+}
+.profiler-status.is-paused { color: var(--warn); }
+
+.profiler-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+.profiler-table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.profiler-table-wrap th,
+.profiler-table-wrap td {
+  padding: 4px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.profiler-table-wrap th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  z-index: 1;
+  font-weight: 600;
+}
+.profiler-table-wrap td.num,
+.profiler-table-wrap th:nth-child(-n+4) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+button.sort {
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+button.sort[aria-sort="descending"] { color: var(--accent); }
+.profiler-table-wrap tbody tr:hover { background: var(--hover); }
+.profiler-table-wrap tr.lib td { color: var(--muted); }
+.fn { display: block; font-weight: 600; }
+.where {
+  display: block;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.profiler-table-wrap td.empty {
+  color: var(--muted);
+  text-align: left;
+  font-family: var(--font);
+}
+
+.profiler-slow {
+  flex: none;
+  max-height: 28vh;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  padding: 8px 16px 12px;
+}
+.profiler-slow h2 { font-size: 13px; margin-bottom: 6px; }
+.profiler-slow ul { list-style: none; margin: 0; padding: 0; }
+.profiler-slow li {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 2px 0;
+  white-space: nowrap;
+}
+.profiler-slow .ms { color: var(--warn); }
+.profiler-slow .empty { color: var(--muted); font-family: var(--font); }

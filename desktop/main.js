@@ -73,6 +73,7 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) app.exit(ALREADY_OPEN);
 
 let mainWindow = null;
+let profilerWindow = null;
 let quitting = false;
 let userClosed = false;
 
@@ -206,6 +207,7 @@ function createWindow() {
   win.on('closed', () => {
     userClosed = true;
     if (mainWindow === win) mainWindow = null;
+    closeProfiler();
   });
 
   win.loadURL(pageUrl);
@@ -287,6 +289,50 @@ function parentDied() {
   app.exit(1);
 }
 
+function closeProfiler() {
+  const win = profilerWindow;
+  if (win && !win.isDestroyed()) win.close();
+}
+
+function createProfilerWindow() {
+  // Only a launch from debug_run.bat sets this. The page is the same server.
+  if (process.env.KNOXMAP_DEBUG !== '1' || !pageUrl) return;
+  if (profilerWindow && !profilerWindow.isDestroyed()) return;
+  let url;
+  try {
+    url = new URL('/debug', pageUrl).href;
+  } catch (_) {
+    return;
+  }
+  const area = screen.getPrimaryDisplay().workArea;
+  const width = Math.min(1080, Math.max(760, area.width - 80));
+  const height = Math.min(780, Math.max(480, area.height - 80));
+  const win = new BrowserWindow({
+    width,
+    height,
+    x: area.x + Math.max(0, area.width - width - 24),
+    y: area.y + 24,
+    minWidth: 760,
+    minHeight: 480,
+    show: false,
+    backgroundColor: '#151714',
+    title: 'KnoxMap Profiler',
+    autoHideMenuBar: true,
+    icon: windowIcon(),
+    webPreferences: webPreferences(),
+  });
+  profilerWindow = win;
+  win.once('ready-to-show', () => win.show());
+  win.on('closed', () => {
+    if (profilerWindow === win) profilerWindow = null;
+  });
+  win.webContents.on('did-fail-load', (_event, code, desc, _url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return;
+    dialog.showErrorBox('KnoxMap Profiler', `The profiler could not open (${desc}).`);
+  });
+  win.loadURL(url);
+}
+
 function quitNow() {
   quitting = true;
   userClosed = true;
@@ -294,6 +340,7 @@ function quitNow() {
     saveBounds(mainWindow);
     mainWindow.close();
   } else {
+    closeProfiler();
     app.quit();
   }
 }
@@ -571,6 +618,11 @@ if (gotLock) {
     });
     watchParent();
     createWindow();
+    try {
+      createProfilerWindow();
+    } catch (err) {
+      dialog.showErrorBox('KnoxMap Profiler', String(err && err.message || err));
+    }
     if (process.env.KNOXMAP_DEVTOOLS === '1' && mainWindow) {
       mainWindow.webContents.openDevTools({ mode: 'detach' });
     }

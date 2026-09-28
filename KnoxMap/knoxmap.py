@@ -13,18 +13,32 @@ The window is Electron, packed inside the program file players download.
 A source checkout starts the Electron binary from desktop/. Set
 KNOXMAP_BROWSER=1 to use the browser instead.
 
-Compiling uses the patched PZWorldEd_cli.exe that Setup installs (see
-worlded/README.md); without it the app opens WorldEd on the project instead.
+Compiling uses the patched PZWorldEd_cli.exe. The program file asks before
+downloading it when WorldEd is not beside the executable (see worlded/README.md);
+without it the app opens WorldEd on the project instead.
 
 Run it with:  .venv\Scripts\pythonw.exe knoxmap.py   (from the KnoxMap folder, or double-click KnoxMap.exe)
 On Linux or macOS:  ./knoxmap.sh
 """
 from __future__ import annotations
 
+import multiprocessing
 import os
+import sys
+
+if __name__ == "__main__":
+    # A packed build starts this file again for every layout worker. This has
+    # to run before the imports below, or those workers load the app and then
+    # wait instead of laying out rooms.
+    multiprocessing.freeze_support()
+
+# OpenBLAS starts a pool of workers, and that pool can wait forever when the
+# map is drawn on a request thread. One thread does the same arithmetic.
+# This has to be set before numpy loads.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 import socket
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -192,6 +206,8 @@ def show_in_electron(cmd: list[str], url: str, token: str) -> int | None:
     env["KNOXMAP_TITLE"] = f"{TITLE} ({knoxlog.version()})"
     env["KNOXMAP_DATA"] = str(data)
     env["KNOXMAP_PID"] = str(os.getpid())
+    if os.environ.get("KNOXMAP_DEBUG") == "1":
+        env["KNOXMAP_DEBUG"] = "1"
     updater.set_before_restart(close_electron)
 
     proc, err, reader = _start_electron(cmd, env)
@@ -242,6 +258,7 @@ def serve_for_shell() -> int:
     os.environ.setdefault("KNOXMAP_WINDOW", "1")
 
     import app  # noqa: F401
+    app.warm_buildings()
 
     port = free_port()
     threading.Thread(target=serve, args=(port,), daemon=True).start()
@@ -299,6 +316,12 @@ def main() -> int:
         updater.relaunch()
         return 0
 
+    # debug_run.bat sets this. The profiler window and logs/debug-log.log
+    # exist only for that launch.
+    if os.environ.get("KNOXMAP_DEBUG") == "1":
+        import knoxprofile
+        knoxprofile.start()
+
     import secrets
     if not os.environ.get("KNOXMAP_TOKEN"):
         os.environ["KNOXMAP_TOKEN"] = secrets.token_urlsafe(24)
@@ -313,6 +336,10 @@ def main() -> int:
         os.environ["KNOXMAP_WINDOW"] = "0"
 
     import app  # noqa: F401 - fail here, where it can be reported, not in the thread
+    app.warm_buildings()
+    if os.environ.get("KNOXMAP_DEBUG") == "1":
+        import knoxprofile
+        knoxprofile.attach(app.app)
 
     port = free_port()
     threading.Thread(target=serve, args=(port,), daemon=True).start()
@@ -364,6 +391,8 @@ def show_in_browser(url: str) -> int:
     print("Leave this window open while you use it; press Ctrl+C to stop.", flush=True)
     try:
         webbrowser.open(url)
+        if os.environ.get("KNOXMAP_DEBUG") == "1":
+            webbrowser.open(url + "debug", new=1)
     except Exception:        # noqa: BLE001 - no browser configured; the URL is printed
         pass
     try:
@@ -405,6 +434,9 @@ def report_crash() -> None:
 
 
 if __name__ == "__main__":
+    # A frozen Windows build re-enters this file in each worker. This has to
+    # run before main(), and only under the guard, or those workers start the app.
+    multiprocessing.freeze_support()
     try:
         raise SystemExit(main())
     except SystemExit:

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script>
+(function () {
+  function apply() {
+    var theme = 'dark';
+    try { if (localStorage.getItem('knoxmap.base') === 'streets') theme = 'light'; } catch (e) {}
+    document.documentElement.setAttribute('data-theme', theme);
+  }
+  apply();
+  window.addEventListener('storage', function (e) {
+    if (e.key === 'knoxmap.base') apply();
+  });
+})();
+</script>
+<title>KnoxMap Profiler</title>
+<link rel="icon" type="image/svg+xml" href="/static/logo.svg"/>
+<link rel="stylesheet" href="/static/css/app.css"/>
+<link rel="stylesheet" href="/static/css/profiler.css"/>
+</head>
+<body class="profiler">
+<header class="topbar">
+  <h1>Profiler</h1>
+  <span class="byline">Every Python function in this debug launch. Closing this window leaves KnoxMap running.</span>
+</header>
+<div class="profiler-tools">
+  <div class="scope" role="group" aria-label="Which functions">
+    <button type="button" id="scopeKnox" aria-pressed="true">KnoxMap</button>
+    <button type="button" id="scopeAll" aria-pressed="false">All</button>
+  </div>
+  <input type="search" id="filter" placeholder="Filter by function or file" aria-label="Filter by function or file"/>
+  <button type="button" class="btn btn-small" id="pause">Pause</button>
+  <button type="button" class="btn btn-small" id="clear">Clear</button>
+  <button type="button" class="btn btn-small" id="openLog">Open log</button>
+</div>
+<p class="hint profiler-status" id="status">Waiting for function calls.</p>
+<p class="hint profiler-log" id="logPath"></p>
+<div class="profiler-table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th><button type="button" class="sort" data-sort="calls">Calls</button></th>
+        <th><button type="button" class="sort" data-sort="self" title="Time in the function, including built-ins it calls">Self</button></th>
+        <th><button type="button" class="sort" data-sort="cum" title="Time from the call until the function returns">Total</button></th>
+        <th><button type="button" class="sort" data-sort="each" title="Total time divided by the number of calls">Each</button></th>
+        <th>Function</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+<section class="profiler-slow" aria-labelledby="slowHeading">
+  <h2 id="slowHeading">Calls of 50 ms and longer</h2>
+  <ul id="slow"></ul>
+</section>
+<script src="/static/js/profiler.js"></script>
+</body>
+</html>
