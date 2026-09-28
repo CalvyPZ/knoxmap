@@ -76,7 +76,7 @@ command-line switches so KnoxMap can compile maps without the editor's menus.
 SHA-256 of PZWorldEd_cli.exe: {digest}
 
 Use it by copying it into the bin folder of PZ Mapping Tools release
-43.00B260909 (KnoxMap's Setup.bat does this for you). It needs that release's
+43.00B260909 (KnoxMap's first-run setup does this for you). It needs that release's
 Qt and editor libraries beside it.
 
 LICENCE
