@@ -2,16 +2,20 @@
 
 Real-world areas → Project Zomboid maps.
 
-Run from the KnoxMap directory (setup creates .venv there):
+Run from the KnoxMap directory (a checkout's `.venv` lives there):
     python app.py
 
 Then open http://127.0.0.1:5000/ in a browser.
 """
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
+# Before numpy or SciPy. See knoxmap.py: a worker pool deadlocks the draw.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 import re
 import shutil
 import sys
@@ -28,7 +32,7 @@ from flask import (Flask, jsonify, render_template, request, send_file,
 import knoxlog
 import knoxpaths
 import knoxstop
-from generator import localosm, osm, places, renderer
+from generator import geofabrik, localosm, osm, places, renderer
 from knoxbuild import mapstate, modgrid
 from knoxbuild.settings import PRESETS, Settings
 
@@ -42,6 +46,9 @@ BASE_DIR = knoxpaths.BASE_DIR
 CODE_DIR = knoxpaths.BUNDLE_DIR
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
+# Downsampled frames of a map while it is being painted. Kept out of output/
+# so a download of the map does not pick them up.
+PAINT_DIR = BASE_DIR / "cache" / "paint"
 
 app = Flask(__name__,
              template_folder=str(CODE_DIR / "templates"),
@@ -114,6 +121,24 @@ def _log_refusals(response):
             data["errorId"] = eid
             response.set_data(json.dumps(data))
     return response
+
+
+@app.route("/api/tutorial", methods=["GET", "POST"])
+def api_tutorial():
+    """Whether the first-run tutorial has already been dismissed.
+
+    Kept with the user account, not in the window. The window's storage is
+    tied to the local port, which changes every launch, so a skip there was
+    forgotten the next time KnoxMap opened, and again after an update.
+    """
+    if request.method == "POST":
+        try:
+            knoxpaths.mark_tutorial_seen()
+        except OSError:
+            log.exception("could not remember that the tutorial was dismissed")
+            return jsonify({"error": "Could not remember that."}), 500
+        log.info("tutorial dismissed")
+    return jsonify({"seen": knoxpaths.tutorial_seen()})
 
 
 @app.route("/api/client-error", methods=["POST"])
@@ -296,11 +321,11 @@ BIG_AREA_KM2 = 400.0
 OVERPASS_TILE_KM2 = 30.0       # size of each sub-query; overshoot re-splits
 BIG_TILES_PER_SIDE = 9000      # 30 cells at 300 tiles each
 # A scale still has to be a scale: zero or a negative divides the world by
-# nothing. The range the window offers is 0.5 to 8; outside it is allowed and
+# nothing. The range the window offers is 0.5 to 10; outside it is allowed and
 # said to be unusual.
 MIN_METERS_PER_TILE = 0.01
 MAX_METERS_PER_TILE = 100.0
-USUAL_METERS_PER_TILE = (0.5, 8.0)
+USUAL_METERS_PER_TILE = (0.5, 10.0)
 
 # Landmark lookup asks for far more tag keys than the terrain query, so it is
 # the first thing to get slow.
@@ -353,6 +378,113 @@ def _set_progress(map_name: str, **fields) -> None:
         _PROGRESS.setdefault(map_name, {}).update(fields)
 
 
+def _paint_corners(window) -> list:
+    """Image corners as lat, lon: north-west, north-east, south-east, south-west."""
+    w, h = window.width, window.height
+    corners = []
+    for x, y in ((0, 0), (w, 0), (w, h), (0, h)):
+        lat, lon = window.to_latlon(x, y)
+        corners.append([round(float(lat), 6), round(float(lon), 6)])
+    return corners
+
+
+def _save_paint_view(image, name: str, max_longest: int = 2048) -> None:
+    """A small copy of the bitmap the window can show while the real one is drawn."""
+    from PIL import Image
+
+    w, h = image.size
+    longest = max(w, h, 1)
+    max_longest = max(1, int(max_longest))
+    if longest > max_longest:
+        scale = max_longest / longest
+        image = image.resize(
+            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+            Image.Resampling.BOX)
+    PAINT_DIR.mkdir(parents=True, exist_ok=True)
+    path = PAINT_DIR / f"{name}.png"
+    tmp = path.with_suffix(".png.tmp")
+    image.save(tmp, format="PNG")
+    tmp.replace(path)
+
+
+def _bump_paint(map_name: str, index: int) -> None:
+    with _PROGRESS_LOCK:
+        pieces = (_PROGRESS.get(map_name) or {}).get("pieces")
+        if not pieces or not (0 <= index < len(pieces)):
+            return
+        pieces[index]["rev"] = int(pieces[index].get("rev") or 0) + 1
+
+
+def _bump_paint_named(map_name: str, piece_name: str) -> None:
+    with _PROGRESS_LOCK:
+        pieces = (_PROGRESS.get(map_name) or {}).get("pieces") or []
+        for piece in pieces:
+            if piece.get("name") == piece_name:
+                piece["rev"] = int(piece.get("rev") or 0) + 1
+                return
+
+
+def _note_piece_layers(map_name: str, piece_name: str, mod_dir: Path) -> None:
+    """Which finished-area overlays this piece can draw."""
+    name = mod_dir.name
+    flags = {
+        "biomes": (mod_dir / f"{name}_biome_overlay.png").is_file(),
+        "zones": (mod_dir / f"{name}_zones.geojson").is_file(),
+        "streets": (mod_dir / f"{name}_roads.geojson").is_file(),
+    }
+    with _PROGRESS_LOCK:
+        for piece in (_PROGRESS.get(map_name) or {}).get("pieces") or []:
+            if piece.get("name") == piece_name:
+                piece.setdefault("layers", {}).update(flags)
+                return
+
+
+def _save_buildings_overlay(image, piece_name: str, map_name: str) -> None:
+    """Red footprints of buildings that have finished, for the generate tab."""
+    try:
+        _save_paint_view(image, f"{piece_name}_buildings")
+    except OSError:
+        return
+    with _PROGRESS_LOCK:
+        for piece in (_PROGRESS.get(map_name) or {}).get("pieces") or []:
+            if piece.get("name") == piece_name:
+                piece["buildingsRev"] = int(piece.get("buildingsRev") or 0) + 1
+                piece.setdefault("layers", {})["buildings"] = True
+                return
+
+
+def _bbox_corners(mod_dir: Path):
+    """Axis-aligned corners when generate did not already lay the piece out."""
+    try:
+        with open(mod_dir / f"{mod_dir.name}_info.json", encoding="utf-8") as f:
+            bbox = json.load(f).get("bbox") or {}
+        north, south = float(bbox["north"]), float(bbox["south"])
+        west, east = float(bbox["west"]), float(bbox["east"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return [[north, west], [north, east], [south, east], [south, west]]
+
+
+def _ensure_paint_piece(map_name: str, mod_dir: Path) -> None:
+    """A piece entry the window can hang a build preview on.
+
+    Generate records corners before it draws. A build started on its own
+    still needs one, or the bitmap it writes has nowhere to go.
+    """
+    with _PROGRESS_LOCK:
+        pieces = _PROGRESS.setdefault(map_name, {}).setdefault("pieces", [])
+        if any(piece.get("name") == mod_dir.name for piece in pieces):
+            return
+    corners = _bbox_corners(mod_dir)
+    if not corners:
+        return
+    with _PROGRESS_LOCK:
+        pieces = _PROGRESS.setdefault(map_name, {}).setdefault("pieces", [])
+        if any(piece.get("name") == mod_dir.name for piece in pieces):
+            return
+        pieces.append({"name": mod_dir.name, "corners": corners, "rev": 0})
+
+
 # Maps the window has asked to stop. A long job looks at this between the
 # pieces of work it can be interrupted between (knoxstop.py); the name comes
 # off the list when the job it stopped notices, so the next run is not
@@ -402,7 +534,36 @@ def api_stop():
 @app.route("/api/progress")
 def api_progress():
     with _PROGRESS_LOCK:
-        return jsonify(_PROGRESS.get(request.args.get("map", ""), {}))
+        snap = copy.deepcopy(_PROGRESS.get(request.args.get("map", ""), {}))
+    # Elapsed and the time left are worked out here, on the poll, so a stage
+    # that sits on one counter still moves the clock. `started` is the
+    # building pass; terrain progress has neither field.
+    if snap:
+        snap["now"] = time.time()
+    started = snap.get("started")
+    fraction = snap.get("fraction")
+    if (snap.get("stage") not in ("stopping", "stopped", "done", "error", None)
+            and isinstance(started, (int, float))
+            and isinstance(fraction, (int, float))):
+        elapsed = max(0.0, time.time() - float(started))
+        snap["elapsed"] = elapsed
+        if 0 < float(fraction) < 1 and elapsed >= 1:
+            snap["eta"] = elapsed * (1.0 - float(fraction)) / float(fraction)
+    return jsonify(snap)
+
+
+@app.route("/paint/<name>.png")
+def paint_view(name: str):
+    """The painted piece, as last written, for the map shown while generating."""
+    safe = SAFE_NAME.sub("_", name).strip("_")
+    if not safe or safe != name:
+        return ("", 404)
+    path = PAINT_DIR / f"{safe}.png"
+    if not path.is_file():
+        return ("", 404)
+    resp = send_file(path, mimetype="image/png", max_age=0)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 @app.route("/")
@@ -548,19 +709,68 @@ def api_search():
     except (KeyError, ValueError):
         pass
     bounded = request.args.get("bounded") == "1"
+    regions_only = request.args.get("regions") == "1"
 
-    key = (q.strip().lower(), viewbox and tuple(round(v, 3) for v in viewbox), bounded)
+    key = (q.strip().lower(), viewbox and tuple(round(v, 3) for v in viewbox),
+           bounded, regions_only)
     cached = _SEARCH_CACHE.get(key)
     if cached and time.time() - cached[0] < SEARCH_CACHE_SECONDS:
         return jsonify({"results": cached[1]})
     try:
-        results = places.search(q, viewbox=viewbox, bounded=bounded)
+        results = places.search(q, viewbox=viewbox, bounded=bounded,
+                                regions_only=regions_only)
+        if regions_only:
+            for result in results:
+                if result.get("outline") or result.get("region_type") != "Continent":
+                    continue
+                boundary = geofabrik.continent_outline(
+                    str(BASE_DIR), result.get("name") or "")
+                result["outline"] = places.normalise_outline(boundary)
+            # Region mode promises border selection, so point-only place
+            # records must not fall through to the ordinary rectangle action.
+            results = [result for result in results if result.get("outline")]
     except Exception as exc:  # network, rate limit, bad JSON
         return jsonify({"error": f"Search failed: {exc}"}), 502
     if len(_SEARCH_CACHE) > 500:
         _SEARCH_CACHE.clear()
     _SEARCH_CACHE[key] = (time.time(), results)
     return jsonify({"results": results})
+
+
+def _wipe_cache_dir(path: Path) -> bool:
+    """Remove one cache folder. True when it is gone afterwards."""
+    if not path.exists():
+        return True
+    shutil.rmtree(path, ignore_errors=True)
+    return not path.exists()
+
+
+@app.route("/api/cache/clear", methods=["POST"])
+def clear_local_cache():
+    """Delete downloaded map caches. User maps and the game install stay.
+
+    Tiles are the street-map pictures kept under cache/tiles. Geofabrik is
+    the regional OpenStreetMap extracts under cache/geofabrik, including the
+    clipped pieces cut from them. Search is the in-memory place list the
+    search box reuses for a day.
+    """
+    targets = {
+        "tiles": TILE_CACHE,
+        "geofabrik": BASE_DIR / "cache" / "geofabrik",
+    }
+    cleared = []
+    stuck = []
+    for name, path in targets.items():
+        if _wipe_cache_dir(path):
+            cleared.append(name)
+        else:
+            stuck.append(name)
+    _SEARCH_CACHE.clear()
+    cleared.append("search")
+    if stuck:
+        return jsonify({"error": "Could not clear the cache", "cleared": cleared,
+                        "stuck": stuck}), 500
+    return jsonify({"cleared": cleared})
 
 
 @app.route("/api/landmarks", methods=["POST"])
@@ -785,17 +995,30 @@ def generate():
     _save_settings(map_dir, settings)
 
     # The daily extracts have to cover the map at any turn, because the street
-    # angle is only known once the roads are in. One regional file serves
-    # every mod cut from this selection.
+    # angle is only known once the roads are in. The cut is this box, not the
+    # whole region: the circle the map sweeps when it is turned, otherwise the
+    # selection plus the cell it is rounded up to. Every mod is a piece of it.
     turned = bool(settings.align_streets) or bool(settings.rotate_degrees)
     fetch_box = (renderer.cover_bbox(south, west, north, east, meters_per_tile)
-                 if turned else bbox)
+                 if turned else renderer.bbox_for_cells(
+                     south, west, north, east, meters_per_tile))
     _set_progress(map_name, stage="regions", done=0, total=1,
                   message="Checking daily map extracts")
 
-    def _region_progress(name, index, total):
+    region_steps = {
+        "check": "Checking daily map extracts",
+        "download": "Downloading a daily map extract",
+        "filter": "Picking the roads and buildings in the selected area",
+    }
+
+    def _region_progress(name, index, total, step, download=None):
+        shown = None
+        if download is not None:
+            got, size, speed = download
+            shown = {"done": got, "total": size, "speed": speed}
         _set_progress(map_name, stage="regions", done=index - 1, total=total,
-                      message="Checking daily map extracts", detail=name)
+                      message=region_steps.get(step, region_steps["check"]),
+                      detail=name, download=shown)
 
     try:
         regions = localosm.ensure_regions(
@@ -856,13 +1079,27 @@ def generate():
     shown_result = None
     shown = planned[0]["name"]
     osm_time = time.time() - t0
+    windows = [
+        parent.window(tile.x0, tile.y0, tile.tiles_w, tile.tiles_h) for tile in tiles
+    ]
+    # The window lays these out before any of them is drawn, then fills each
+    # one in as the bitmap is painted.
+    _set_progress(map_name, stage="mod", done=0, total=len(tiles),
+                  message="Drawing a map piece",
+                  rotation=round(rotation, 1),
+                  pieces=[{
+                      "name": record["name"],
+                      "corners": _paint_corners(window),
+                      "rev": 0,
+                  } for record, window in zip(planned, windows)])
+    street_houses = 0
     try:
-        for index, (tile, record) in enumerate(zip(tiles, planned), start=1):
+        for index, record in enumerate(planned, start=1):
             knoxstop.check(_stopper(map_name), "the download")
             _set_progress(map_name, stage="mod", done=index - 1, total=len(tiles),
                           message="Drawing a map piece",
                           detail=f"{record['name']} ({index} of {len(tiles)})")
-            window = parent.window(tile.x0, tile.y0, tile.tiles_w, tile.tiles_h)
+            window = windows[index - 1]
             piece = window.latlon_bbox()
             features = localosm.features_for_bbox(
                 str(BASE_DIR), regions, *piece, should_stop=_stopper(map_name))
@@ -883,10 +1120,30 @@ def generate():
             gaps["added"] = gaps.get("added", 0) + piece_gaps.get("added", 0)
             if piece_gaps.get("error") and not gaps.get("error"):
                 gaps["error"] = piece_gaps["error"]
+            if piece_gaps.get("why") and not gaps.get("why"):
+                gaps["why"] = piece_gaps["why"]
+                log.warning("overture %s: %s", record["name"], piece_gaps["why"])
             feature_total += len(features)
             mod_dir = OUTPUT_DIR / record["name"]
             mod_dir.mkdir(parents=True, exist_ok=True)
             _save_settings(mod_dir, settings)
+            log.info("generate %s: drawing %s (%d of %d), %d features",
+                     map_name, record["name"], index, len(planned), len(features))
+            _set_progress(map_name, stage="mod", done=index - 1, total=len(tiles),
+                          message="Drawing a map piece",
+                          detail=f"{record['name']} ({index} of {len(tiles)})")
+
+            def on_view(image, stage=None, _name=record["name"], _index=index - 1):
+                if stage:
+                    _set_progress(map_name, view=stage)
+                if image is None:
+                    return
+                try:
+                    _save_paint_view(image, _name)
+                except OSError:
+                    return
+                _bump_paint(map_name, _index)
+
             result = renderer.render(
                 features, piece[0], piece[1], piece[2], piece[3],
                 meters_per_tile=meters_per_tile,
@@ -900,8 +1157,15 @@ def generate():
                 straight_roads=bool(settings.straight_roads),
                 should_stop=_stopper(map_name),
                 proj=window,
+                on_view=on_view,
             )
+            _note_piece_layers(map_name, record["name"], mod_dir)
             _stamp_mod(mod_dir, record, map_name)
+            try:
+                with open(mod_dir / f"{record['name']}_info.json", encoding="utf-8") as fh:
+                    street_houses += int(json.load(fh).get("houses_from_streets") or 0)
+            except (OSError, ValueError, TypeError):
+                pass
             _write_readme(mod_dir, record["name"], result)
             if shown_result is None:
                 shown_result = result
@@ -936,9 +1200,9 @@ def generate():
         pass
     log.info("generate %s: done, %d features, %d mods, %dx%d tiles each, "
              "rotation %.1f, %d houses from addresses, %d from Overture, "
-             "%.1fs (download %.1fs)",
+             "%d houses along empty streets, %.1fs (download %.1fs)",
              map_name, feature_total, len(planned), result.width, result.height,
-             rotation, from_addresses, gaps.get("added", 0),
+             rotation, from_addresses, gaps.get("added", 0), street_houses,
              time.time() - t0, osm_time)
 
     return jsonify({
@@ -960,6 +1224,7 @@ def generate():
         # so it can say so beside the finished map too.
         "heavy": heavy,
         "fromOverture": gaps.get("added", 0),
+        "fromStreets": street_houses,
         "overtureError": gaps.get("error") or gaps.get("why") or "",
         "files": {
             "landscape": f"/output/{shown}/{Path(result.landscape_path).name}",
@@ -1085,16 +1350,130 @@ def api_maps():
     return jsonify({"maps": maps, "current": knoxlog.version()})
 
 
+def _is_knoxmap_project(folder: Path) -> bool:
+    """A map folder KnoxMap wrote: its info file, or the step record beside it."""
+    if not folder.is_dir():
+        return False
+    if (folder / mapstate.STATE_FILE).is_file():
+        return True
+    return any(folder.glob("*_info.json"))
+
+
+def _find_project(start: Path) -> Path | None:
+    """The project at this folder, or the one a file inside it belongs to."""
+    current = start.resolve()
+    if current.is_file():
+        current = current.parent
+    output = OUTPUT_DIR.resolve()
+    for _ in range(6):
+        if _is_knoxmap_project(current):
+            return current
+        if current == output or current.parent == current:
+            break
+        current = current.parent
+    return None
+
+
+def _place_in_output(folder: Path) -> Path:
+    """A project the window can open: already in output/, or copied there."""
+    output = OUTPUT_DIR.resolve()
+    folder = folder.resolve()
+    if folder.parent == output:
+        return folder
+    safe = SAFE_NAME.sub("_", folder.name).strip("_") or "map"
+    dest = output / safe
+    if dest.exists():
+        if dest.resolve() == folder:
+            return dest
+        raise ValueError("A map with that name is already in KnoxMap.")
+    log.info("load map: copying %s to %s", folder, dest)
+    shutil.copytree(folder, dest)
+    return dest
+
+
+def _pick_project_folder() -> str | None:
+    """A folder the player picked, '' if they cancelled, or None if no folder
+    window could be opened."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        chosen = filedialog.askdirectory(
+            title="Select a KnoxMap project", initialdir=str(OUTPUT_DIR))
+        root.destroy()
+        return chosen or ""
+    except Exception:
+        log.exception("folder window failed")
+    if os.name != "nt":
+        return None
+    import subprocess
+
+    start = str(OUTPUT_DIR).replace("'", "''")
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+        "$d.Description = 'Select a KnoxMap project'; "
+        "$d.ShowNewFolderButton = $false; "
+        f"$d.SelectedPath = '{start}'; "
+        "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }"
+    )
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True, text=True, timeout=180, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        log.exception("folder window failed")
+        return None
+    if done.returncode != 0:
+        return None
+    return (done.stdout or "").strip()
+
+
+def _opened_map(map_dir: Path) -> dict:
+    summary = _map_summary(map_dir)
+    summary["settings"] = _load_settings(map_dir).to_dict()
+    summary["population"] = _population(map_dir)
+    return summary
+
+
+@app.route("/api/maps/load", methods=["POST"])
+def api_maps_load():
+    """Open a KnoxMap project the player picked.
+
+    A project is a map folder: the one in output/, or a copy of one they kept
+    somewhere else. Cancelling the folder window leaves the launch screen up.
+    """
+    chosen = _pick_project_folder()
+    if chosen is None:
+        return jsonify({"error": "Could not open a folder window."}), 500
+    if not chosen:
+        return jsonify({"cancelled": True})
+    project = _find_project(Path(chosen))
+    if project is None:
+        return jsonify({"error": "That folder is not a KnoxMap project."}), 400
+    try:
+        placed = _place_in_output(project)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except OSError as exc:
+        return failed(f"Could not copy that map: {exc}", 500, exc)
+    log.info("load map: %s", placed.name)
+    return jsonify(_opened_map(placed))
+
+
 @app.route("/api/maps/<map_name>")
 def api_map(map_name: str):
     """One map, in the shape the page shows a freshly generated one in."""
     map_dir = _map_dir(map_name)
     if map_dir is None:
         return jsonify({"error": "Unknown map."}), 404
-    summary = _map_summary(map_dir)
-    summary["settings"] = _load_settings(map_dir).to_dict()
-    summary["population"] = _population(map_dir)
-    return jsonify(summary)
+    return jsonify(_opened_map(map_dir))
 
 
 @app.route("/output/<path:relpath>")
@@ -1121,6 +1500,12 @@ def api_pictures():
         return jsonify({"error": "Compile the map first - there is nothing to "
                                  "draw until then."}), 400
     name = map_dir.name
+    raw_shots = data.get("shots")
+    shots = None
+    if isinstance(raw_shots, list):
+        shots = tuple(s for s in raw_shots if s in {"town", "close", "inside"})
+        if not shots:
+            return jsonify({"error": "Pick at least one picture."}), 400
     with _PROGRESS_LOCK:
         if _PICTURES.get(name, {}).get("state") == "running":
             return jsonify({"started": False, "state": "running"})
@@ -1130,7 +1515,7 @@ def api_pictures():
         log.info("pictures %s: started", name)
         t0 = time.time()
         try:
-            made = pictures.pictures_of(map_dir)
+            made = pictures.pictures_of(map_dir, shots=shots)
             files = [f"/output/{map_dir.name}/pictures/{p.name}" for p in made]
             log.info("pictures %s: %d in %.0fs", name, len(files), time.time() - t0)
             with _PROGRESS_LOCK:
@@ -1166,20 +1551,34 @@ def _worlded_exe(cli: bool = False) -> Path | None:
 
 
 def _pack_mod_dirs(map_dir: Path) -> list[Path]:
-    """The pieces of a pack, in the order they were drawn. Empty for a map
-    that is already a single piece."""
+    """The pieces of a pack, left to right and top to bottom.
+
+    That is the order the map was drawn in. Empty for a map that is already
+    a single piece. Buildings are generated one piece at a time, in this
+    order, never several pieces at once.
+    """
     data = modgrid.read_pack(str(map_dir))
     if not data:
         return []
+
+    def _coord(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     found = []
     for item in data.get("mods") or []:
-        name = item.get("name") if isinstance(item, dict) else None
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
         if not isinstance(name, str):
             continue
         path = (OUTPUT_DIR / name).resolve()
         if str(path).startswith(str(OUTPUT_DIR.resolve())) and path.is_dir():
-            found.append(path)
-    return found
+            found.append((_coord(item.get("row")), _coord(item.get("col")), path))
+    found.sort()
+    return [path for _row, _col, path in found]
 
 
 def _map_dir(map_name: str) -> Path | None:
@@ -1194,45 +1593,197 @@ def _map_dir(map_name: str) -> Path | None:
     return d
 
 
+def warm_buildings() -> None:
+    """Import the building generator on the thread that is about to serve.
+
+    SciPy's libraries wait forever if that first import happens on a request
+    thread. Buildings then never starts: the window stays where it was, and
+    zooming the map does nothing because the server no longer answers.
+    """
+    log.info("loading the building generator")
+    knoxlog.flush()
+    started = time.time()
+    from knoxbuild.build import LayoutPool, build as _build_buildings  # noqa: F401
+    log.info("building generator ready in %.1fs", time.time() - started)
+    knoxlog.flush()
+
+
 @app.route("/api/buildings", methods=["POST"])
 def api_buildings():
     """Run knoxbuild over a generated map."""
-    from knoxbuild.build import build as build_buildings
-
     data = _json_body()
     map_dir = _map_dir(data.get("mapName", ""))
     if map_dir is None:
         return jsonify({"error": "Unknown map."}), 404
-    settings = Settings.from_dict(data.get("settings"))         if data.get("settings") else _load_settings(map_dir)
-    _save_settings(map_dir, settings)
-    targets = _pack_mod_dirs(map_dir) or [map_dir]
-    log.info("buildings %s: started (%d piece%s)", map_dir.name, len(targets),
-             "" if len(targets) == 1 else "s")
+    # Said here, before the building code is imported. That import is the
+    # first heavy step, and until something is reported the window stays on
+    # "estimating…" with nothing to show what is happening.
     t0 = time.time()
-    out = io.StringIO()
-    total = 0
+    phase = {"text": "request received"}
+    stop_beat = threading.Event()
+
+    def _beat() -> None:
+        last = ""
+        last_at = 0.0
+        while not stop_beat.wait(20):
+            text = phase["text"]
+            now = time.time()
+            # A phase that is still the same line a minute later is the one
+            # the run is stuck in. A phase that just changed is logged too,
+            # so the file shows the walk through the mods.
+            if text == last and now - last_at < 60:
+                continue
+            last, last_at = text, now
+            log.info("buildings %s: working — %s (%.0fs)",
+                     map_dir.name, text, now - t0)
+            knoxlog.flush()
+
+    threading.Thread(target=_beat, name="buildings-heartbeat", daemon=True).start()
     try:
-        from contextlib import redirect_stdout
-        for target in targets:
-            _save_settings(target, settings)
-            with redirect_stdout(out):
-                build_buildings(str(target), settings=settings,
-                                should_stop=_stopper(map_dir.name))
-            total += len(list((target / "buildings").glob("*.tbx")))
-            mapstate.stamp(str(target), "build")
-    except knoxstop.Stopped:
-        return _stopped(map_dir.name, "buildings")
+        log.info("buildings %s: request received", map_dir.name)
+        knoxlog.flush()
+        _set_progress(map_dir.name, stage="start", done=0, total=0,
+                      message="Starting buildings", process=1, processes=1,
+                      eta=None, fraction=0, started=t0, mod=0, mods=0, detail="")
+        phase["text"] = "importing the building generator"
+        log.info("buildings %s: importing the building generator", map_dir.name)
+        knoxlog.flush()
+        from knoxbuild.build import LayoutPool, build as build_buildings
+        log.info("buildings %s: building generator imported in %.1fs",
+                 map_dir.name, time.time() - t0)
+        knoxlog.flush()
+
+        settings = Settings.from_dict(data.get("settings"))             if data.get("settings") else _load_settings(map_dir)
+        paper_map = data.get("paperMap", True) is not False
+        _save_settings(map_dir, settings)
+        targets = _pack_mod_dirs(map_dir) or [map_dir]
+        log.info("buildings %s: started (%d piece%s)", map_dir.name, len(targets),
+                 "" if len(targets) == 1 else "s")
+        knoxlog.flush()
+        _set_progress(map_dir.name, stage="start", done=0, total=len(targets),
+                      message="Starting buildings", process=1, processes=1,
+                      eta=None, fraction=0, started=t0,
+                      mod=1, mods=len(targets),
+                      detail=targets[0].name if targets else "")
+        out = io.StringIO()
+        total = 0
+        # One layout pool for every piece of this run. Closed when the run
+        # ends; Stop kills it so the next run starts a fresh one.
+        pool = LayoutPool(_stopper(map_dir.name))
+        try:
+            from contextlib import redirect_stdout
+            for index, target in enumerate(targets, start=1):
+                knoxstop.check(_stopper(map_dir.name), "the buildings")
+                phase["text"] = (f"mod {index} of {len(targets)} "
+                                 f"{target.name}: starting")
+                log.info("buildings %s: piece %d of %d (%s)",
+                         map_dir.name, index, len(targets), target.name)
+                knoxlog.flush()
+
+                def on_progress(stage, done, total_n, message, process, processes, eta,
+                                fraction=0.0, _index=index):
+                    stopping = map_dir.name in _STOPPING
+                    share = max(0.0, min(1.0, float(fraction or 0)))
+                    overall = ((_index - 1) + share) / len(targets)
+                    phase["text"] = (
+                        f"mod {_index} of {len(targets)} {target.name}: "
+                        f"{message} {done}/{total_n}"
+                    )
+                    _set_progress(
+                        map_dir.name,
+                        stage="stopping" if stopping else stage,
+                        done=done, total=total_n,
+                        message="Stopping" if stopping else message,
+                        process=process, processes=processes,
+                        eta=None if stopping else eta,
+                        fraction=overall,
+                        started=t0,
+                        mod=_index, mods=len(targets),
+                        detail=target.name,
+                    )
+
+                def on_phase(text, _index=index, _name=target.name):
+                    phase["text"] = (f"mod {_index} of {len(targets)} "
+                                     f"{_name}: {text}")
+
+                _set_progress(map_dir.name, stage="load", done=0, total=4,
+                              message="Loading building data", process=1, processes=1,
+                              eta=None, fraction=(index - 1) / len(targets),
+                              started=t0, mod=index, mods=len(targets),
+                              detail=target.name)
+                _save_settings(target, settings)
+                _ensure_paint_piece(map_dir.name, target)
+
+                def on_view(image, stage=None, _name=target.name):
+                    try:
+                        # Room-layout previews are transient status images. At
+                        # half-size they encode at roughly one quarter the pixel
+                        # cost while remaining clear in the progress panel.
+                        longest = 1024 if stage == "Laying out rooms" else 2048
+                        _save_paint_view(image, _name, longest)
+                    except OSError:
+                        return
+                    _bump_paint_named(map_dir.name, _name)
+                    if stage:
+                        _set_progress(map_dir.name, view=stage)
+
+                def on_overlay(image, _name=target.name):
+                    _save_buildings_overlay(image, _name, map_dir.name)
+
+                with redirect_stdout(out):
+                    code = build_buildings(str(target), settings=settings,
+                                           should_stop=_stopper(map_dir.name),
+                                           on_progress=on_progress, on_view=on_view,
+                                           on_overlay=on_overlay,
+                                           pool=pool, paper_map=paper_map,
+                                           on_phase=on_phase)
+                if code:
+                    log.info("buildings %s: piece %s stopped early (%s)",
+                             map_dir.name, target.name, code)
+                    knoxlog.flush()
+                piece_count = len(list((target / "buildings").glob("*.tbx")))
+                total += piece_count
+                log.info("buildings %s: piece %s wrote %d buildings (%.0fs)",
+                         map_dir.name, target.name, piece_count, time.time() - t0)
+                knoxlog.flush()
+                mapstate.stamp(str(target), "build")
+        except knoxstop.Stopped:
+            pool.kill()
+            for target in targets:
+                folder = target / "buildings"
+                if not folder.is_dir():
+                    continue
+                for part in folder.glob("*.part"):
+                    try:
+                        part.unlink()
+                    except OSError:
+                        pass
+            return _stopped(map_dir.name, "buildings")
+        except Exception as exc:
+            log.info("buildings %s failed during %s\n%s", map_dir.name,
+                     phase["text"], out.getvalue()[-4000:])
+            knoxlog.flush()
+            return failed(f"Building generation failed: {exc}", 500, exc)
+        finally:
+            pool.close()
+        mapstate.stamp(str(map_dir), "build")
+        _set_progress(map_dir.name, stage="done", done=total, total=max(total, 1),
+                      message="Buildings ready", process=1, processes=1, eta=0,
+                      fraction=1, started=t0,
+                      mod=len(targets), mods=len(targets))
+        log.info("buildings %s: %d files in %.1fs\n%s", map_dir.name, total,
+                 time.time() - t0, out.getvalue()[-3000:])
+        knoxlog.flush()
+        return jsonify({"count": total,
+                        "pzw": f"{targets[-1].name}.pzw",
+                        "settings": settings.to_dict(),
+                        "population": _population(targets[-1])})
     except Exception as exc:
-        log.info("buildings %s output before the error:\n%s", map_dir.name,
-                 out.getvalue()[-4000:])
+        log.exception("buildings %s failed during %s", map_dir.name, phase["text"])
+        knoxlog.flush()
         return failed(f"Building generation failed: {exc}", 500, exc)
-    mapstate.stamp(str(map_dir), "build")
-    log.info("buildings %s: %d files in %.1fs\n%s", map_dir.name, total,
-             time.time() - t0, out.getvalue()[-3000:])
-    return jsonify({"count": total,
-                    "pzw": f"{targets[-1].name}.pzw",
-                    "settings": settings.to_dict(),
-                    "population": _population(targets[-1])})
+    finally:
+        stop_beat.set()
 
 
 def _population(map_dir: Path) -> dict | None:
@@ -1241,6 +1792,1344 @@ def _population(map_dir: Path) -> dict | None:
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+# ---- Edit tab: read the generated pieces, write the overlay, apply it ----
+#
+# Edits live in each piece directory (`<name>_edits.json`), never on the pack
+# parent. A map that is already one piece is that directory. The feature
+# replies are viewport-sized and cached; nothing here rewrites the GeoJSON.
+
+_EDIT_LAYERS = ("buildings", "areas", "roads", "fences", "places")
+_EDIT_CAP = 4000
+_EDIT_CACHE: dict = {}
+_EDIT_CACHE_ORDER: list = []
+_EDIT_CACHE_LOCK = threading.Lock()
+_EDIT_CACHE_MAX = 32
+_PACK_CLEAR = {"all", "regions", "added_areas"}
+_PACK_INFO_KEYS = ("role", "pack", "world_origin", "mod_row", "mod_col")
+
+
+def _read_json(path: Path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def _file_mtime(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _edit_cache_get(key):
+    with _EDIT_CACHE_LOCK:
+        if key not in _EDIT_CACHE:
+            return None
+        _EDIT_CACHE_ORDER.remove(key)
+        _EDIT_CACHE_ORDER.append(key)
+        return _EDIT_CACHE[key]
+
+
+def _edit_cache_put(key, value) -> None:
+    with _EDIT_CACHE_LOCK:
+        if key in _EDIT_CACHE_ORDER:
+            _EDIT_CACHE_ORDER.remove(key)
+        _EDIT_CACHE[key] = value
+        _EDIT_CACHE_ORDER.append(key)
+        while len(_EDIT_CACHE_ORDER) > _EDIT_CACHE_MAX:
+            _EDIT_CACHE.pop(_EDIT_CACHE_ORDER.pop(0), None)
+
+
+def _edit_pieces(map_dir: Path) -> list[Path]:
+    """Pieces of a pack, or the map directory when it is a single piece."""
+    return _pack_mod_dirs(map_dir) or [map_dir]
+
+
+def _edit_piece(map_dir: Path, name) -> Path | None:
+    pieces = _edit_pieces(map_dir)
+    if not isinstance(name, str) or not name.strip():
+        return pieces[0] if len(pieces) == 1 else None
+    for piece in pieces:
+        if piece.name == name:
+            return piece
+    return None
+
+
+def _piece_info(piece_dir: Path) -> dict:
+    data = _read_json(piece_dir / f"{piece_dir.name}_info.json")
+    return data if isinstance(data, dict) else {}
+
+
+def _geo_features(data) -> list:
+    if not isinstance(data, dict):
+        return []
+    features = data.get("features")
+    return features if isinstance(features, list) else []
+
+
+def _layer_path(piece_dir: Path, layer: str) -> Path:
+    name = piece_dir.name
+    suffix = {
+        "buildings": f"{name}_buildings.geojson",
+        "areas": f"{name}_areas.geojson",
+        "roads": f"{name}_roads.geojson",
+        "fences": f"{name}_fences.geojson",
+        "places": f"{name}_places.json",
+    }[layer]
+    return piece_dir / suffix
+
+
+def _grid_projector(info: dict):
+    """Projector for a piece that was drawn on a stored metre grid."""
+    grid = info.get("grid") if isinstance(info.get("grid"), dict) else None
+    if not grid or not grid.get("epsg"):
+        return None
+    try:
+        return renderer.Projector.from_grid(grid)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _piece_projector(info: dict):
+    """The projector build() would use for this piece."""
+    proj = _grid_projector(info)
+    if proj is not None:
+        return proj
+    bbox = info.get("bbox") if isinstance(info.get("bbox"), dict) else None
+    if not bbox:
+        return None
+    try:
+        return renderer.Projector.build(
+            float(bbox["south"]), float(bbox["west"]),
+            float(bbox["north"]), float(bbox["east"]),
+            float(info.get("meters_per_tile") or 1.0),
+            float(info.get("rotation") or 0.0))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _saved_bbox(info: dict):
+    bbox = info.get("bbox") if isinstance(info.get("bbox"), dict) else None
+    if not bbox:
+        return None
+    try:
+        return (float(bbox["south"]), float(bbox["west"]),
+                float(bbox["north"]), float(bbox["east"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _piece_bounds(piece_dir: Path):
+    """(south, west, north, east) of a piece, from its grid when it has one."""
+    info = _piece_info(piece_dir)
+    proj = _grid_projector(info)
+    if proj is not None:
+        try:
+            south, west, north, east = proj.latlon_bbox()
+            return (float(south), float(west), float(north), float(east))
+        except (TypeError, ValueError):
+            pass
+    return _saved_bbox(info)
+
+
+def _piece_corners(piece_dir: Path, info: dict):
+    if _grid_projector(info) is not None:
+        try:
+            return _paint_corners(renderer.Projector.from_grid(info["grid"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return _bbox_corners(piece_dir)
+
+
+def _piece_preview(name: str) -> str | None:
+    if (PAINT_DIR / f"{name}.png").is_file():
+        return f"/paint/{name}.png"
+    rel = f"{name}/{name}_preview.png"
+    if (OUTPUT_DIR / rel).is_file():
+        return "/output/" + rel
+    return None
+
+
+def _piece_layer_flags(piece_dir: Path) -> dict:
+    return {layer: _layer_path(piece_dir, layer).is_file() for layer in _EDIT_LAYERS}
+
+
+def _edit_pending(map_dir: Path) -> list[str]:
+    from knoxbuild.edits import Edits
+
+    stages: set[str] = set()
+    for piece in _edit_pieces(map_dir):
+        edits = Edits.load(str(piece), piece.name)
+        stages.update(edits.pending_stages(str(piece)))
+    return sorted(stages)
+
+
+def _stable_ids(piece_dir: Path) -> bool:
+    data = _read_json(_layer_path(piece_dir, "buildings"))
+    for feat in _geo_features(data):
+        if isinstance(feat, dict) and feat.get("id") not in (None, ""):
+            return True
+    return False
+
+
+def _collect_coords(coords, lons: list, lats: list) -> None:
+    if not isinstance(coords, (list, tuple)):
+        return
+    if (len(coords) >= 2 and not isinstance(coords[0], (list, tuple, bool))
+            and isinstance(coords[0], (int, float))):
+        try:
+            lons.append(float(coords[0]))
+            lats.append(float(coords[1]))
+        except (TypeError, ValueError):
+            return
+        return
+    for item in coords:
+        _collect_coords(item, lons, lats)
+
+
+def _geom_bounds(geometry):
+    """(south, west, north, east) of a GeoJSON geometry, or None."""
+    if not isinstance(geometry, dict):
+        return None
+    lons: list[float] = []
+    lats: list[float] = []
+    _collect_coords(geometry.get("coordinates"), lons, lats)
+    if not lons:
+        return None
+    return min(lats), min(lons), max(lats), max(lons)
+
+
+def _bounds_hit(feature_box, view) -> bool:
+    if view is None:
+        return True
+    if feature_box is None:
+        return False
+    south, west, north, east = feature_box
+    view_s, view_w, view_n, view_e = view
+    return south <= view_n and north >= view_s and west <= view_e and east >= view_w
+
+
+def _outer_lonlats(geometry) -> list[tuple[float, float]]:
+    """Points of each outer ring, without a repeated closing vertex."""
+    if not isinstance(geometry, dict):
+        return []
+    kind = geometry.get("type")
+    coords = geometry.get("coordinates")
+    rings = []
+    if kind == "Polygon" and isinstance(coords, list) and coords:
+        rings.append(coords[0])
+    elif kind == "MultiPolygon" and isinstance(coords, list):
+        for poly in coords:
+            if isinstance(poly, list) and poly:
+                rings.append(poly[0])
+    if not rings:
+        return []
+    points = []
+    for ring in rings:
+        if not isinstance(ring, list):
+            continue
+        use = ring[:-1] if len(ring) > 1 and ring[0] == ring[-1] else ring
+        for pair in use:
+            if (isinstance(pair, (list, tuple)) and len(pair) >= 2
+                    and not isinstance(pair[0], (list, tuple))):
+                try:
+                    points.append((float(pair[0]), float(pair[1])))
+                except (TypeError, ValueError):
+                    continue
+    return points
+
+
+def _centroid_px(geometry, proj):
+    """Average of the outer ring in tile pixels, or None."""
+    points = _outer_lonlats(geometry)
+    if not points:
+        return None
+    xs = []
+    ys = []
+    for lon, lat in points:
+        x, y = proj.to_px(lat, lon)
+        xs.append(x)
+        ys.append(y)
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+
+def _low_zoom_building(geometry):
+    points = _outer_lonlats(geometry)
+    if not points:
+        return geometry
+    lon = sum(point[0] for point in points) / len(points)
+    lat = sum(point[1] for point in points) / len(points)
+    return {"type": "Point", "coordinates": [lon, lat]}
+
+
+def _feature(fid: str, props: dict, geometry) -> dict:
+    return {"type": "Feature", "id": fid, "properties": props, "geometry": geometry}
+
+
+def _edit_feature_id(feat, index: int) -> str:
+    """The id build() reads: the GeoJSON feature's own id, else i<index>."""
+    from knoxbuild.edits import feature_id
+    return feature_id(feat, index)
+
+
+def _building_feature(feat, index: int, edits, low: bool, skip_deleted: bool):
+    if not isinstance(feat, dict):
+        return None
+    fid = _edit_feature_id(feat, index)
+    rec = edits.building(fid)
+    if skip_deleted and rec and rec.get("deleted"):
+        return None
+    props = dict(feat.get("properties") or {})
+    props["layer"] = "building"
+    props["fid"] = fid
+    if rec:
+        if "name" in rec:
+            props["name"] = rec["name"]
+        if rec.get("deleted"):
+            props["deleted"] = True
+        props["edited"] = True
+    geometry = feat.get("geometry")
+    if low:
+        geometry = _low_zoom_building(geometry)
+    return _feature(fid, props, geometry)
+
+
+def _area_feature(feat, index: int, edits, skip_deleted: bool):
+    if not isinstance(feat, dict):
+        return None
+    fid = _edit_feature_id(feat, index)
+    rec = edits.area(fid)
+    if skip_deleted and rec and rec.get("deleted"):
+        return None
+    props = dict(feat.get("properties") or {})
+    props["layer"] = "area"
+    props["fid"] = fid
+    if rec:
+        if "category" in rec:
+            props["category"] = rec["category"]
+        if "name" in rec:
+            props["name"] = rec["name"]
+        if rec.get("deleted"):
+            props["deleted"] = True
+        props["edited"] = True
+    return _feature(fid, props, feat.get("geometry"))
+
+
+def _added_id(item: dict, index: int) -> str:
+    if item.get("id") not in (None, ""):
+        return str(item["id"])
+    return f"u{index}"
+
+
+def _added_feature(item: dict, index: int) -> dict | None:
+    geometry = item.get("geometry")
+    if not isinstance(geometry, dict):
+        return None
+    fid = _added_id(item, index)
+    props = {"layer": "area", "fid": fid, "edited": True}
+    if "category" in item:
+        props["category"] = item["category"]
+    if "name" in item:
+        props["name"] = item["name"]
+    return _feature(fid, props, geometry)
+
+
+def _road_feature(feat, index: int, edits, omit_hidden: bool):
+    if not isinstance(feat, dict):
+        return None
+    fid = _edit_feature_id(feat, index)
+    props = dict(feat.get("properties") or {})
+    original = props.get("name") if isinstance(props.get("name"), str) else ""
+    name = original
+    edited = False
+    streets = edits.streets if isinstance(edits.streets, dict) else {}
+    ways = streets.get("ways") if isinstance(streets.get("ways"), dict) else {}
+    way = ways.get(fid)
+    if isinstance(way, dict) and isinstance(way.get("name"), str):
+        name = way["name"]
+        edited = True
+    rename = streets.get("rename") if isinstance(streets.get("rename"), dict) else {}
+    if isinstance(rename.get(name), str):
+        name = rename[name]
+        edited = True
+    hide = streets.get("hide") if isinstance(streets.get("hide"), list) else []
+    if omit_hidden and name and name in hide:
+        return None
+    props["layer"] = "road"
+    props["fid"] = fid
+    props["name"] = name
+    if edited:
+        props["edited"] = True
+    return _feature(fid, props, feat.get("geometry"))
+
+
+def _fence_feature(feat, index: int):
+    if not isinstance(feat, dict):
+        return None
+    fid = _edit_feature_id(feat, index)
+    props = dict(feat.get("properties") or {})
+    props["layer"] = "fence"
+    props["fid"] = fid
+    return _feature(fid, props, feat.get("geometry"))
+
+
+def _place_features(piece_dir: Path, edits, info: dict, skip_deleted: bool) -> list:
+    data = _read_json(_layer_path(piece_dir, "places"))
+    if not isinstance(data, list):
+        return []
+    proj = _grid_projector(info)
+    if proj is None:
+        return []
+    features = []
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        try:
+            lat, lon = proj.to_latlon(float(item["tile_x"]), float(item["tile_y"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        original = item.get("name") if isinstance(item.get("name"), str) else ""
+        rec = edits.place(original)
+        if skip_deleted and rec and rec.get("deleted"):
+            continue
+        props = {
+            "name": rec["name"] if rec and "name" in rec else original,
+            "place": item.get("place"),
+            "population": rec["population"] if rec and "population" in rec else item.get("population"),
+            "layer": "place",
+            "fid": original,
+        }
+        if rec:
+            props["edited"] = True
+            if rec.get("deleted"):
+                props["deleted"] = True
+        features.append(_feature(
+            original or f"p{index}", props,
+            {"type": "Point", "coordinates": [round(float(lon), 6), round(float(lat), 6)]}))
+    return features
+
+
+def _keep_feature(feature, view) -> bool:
+    if feature is None:
+        return False
+    return _bounds_hit(_geom_bounds(feature.get("geometry")), view)
+
+
+def _cap_features(grouped: dict, order: list[str]) -> tuple[list, bool]:
+    """At most 4000 features. Buildings are dropped before roads, areas last."""
+    buckets = {name: list(grouped.get(name) or []) for name in order}
+    total = sum(len(rows) for rows in buckets.values())
+    truncated = total > _EDIT_CAP
+    for name in ("buildings", "roads", "fences", "areas", "places"):
+        rows = buckets.get(name)
+        if not rows or total <= _EDIT_CAP:
+            continue
+        extra = total - _EDIT_CAP
+        if len(rows) > extra:
+            del rows[len(rows) - extra:]
+            total = _EDIT_CAP
+        else:
+            total -= len(rows)
+            rows.clear()
+    kept = []
+    for name in order:
+        kept.extend(buckets.get(name) or [])
+    return kept, truncated
+
+
+def _edit_view():
+    """Viewport, None when the query has no bbox, or 'bad' when it is broken."""
+    raw = [request.args.get(key) for key in ("south", "west", "north", "east")]
+    if all(value in (None, "") for value in raw):
+        return None
+    try:
+        return tuple(float(value) for value in raw)
+    except (TypeError, ValueError):
+        return "bad"
+
+
+def _edit_layer_names(raw) -> list[str]:
+    if raw in (None, ""):
+        return list(_EDIT_LAYERS)
+    chosen = []
+    for part in str(raw).split(","):
+        name = part.strip()
+        if name in _EDIT_LAYERS and name not in chosen:
+            chosen.append(name)
+    return chosen
+
+
+def _zoom_band(raw) -> str:
+    if raw in (None, ""):
+        return "high"
+    try:
+        return "low" if float(raw) < 16 else "high"
+    except (TypeError, ValueError):
+        return "high"
+
+
+def _layer_mtimes(piece_dir: Path) -> tuple:
+    return tuple(_file_mtime(_layer_path(piece_dir, layer)) for layer in _EDIT_LAYERS)
+
+
+def _collect_layer_features(piece_dir: Path, edits, info: dict, layers: list[str],
+                            view, low: bool) -> dict:
+    grouped = {layer: [] for layer in layers}
+    if "buildings" in grouped:
+        data = _read_json(_layer_path(piece_dir, "buildings"))
+        for index, feat in enumerate(_geo_features(data)):
+            # Hit-test the footprint. A zoomed-out point is only the reply.
+            feature = _building_feature(feat, index, edits, False, True)
+            if not _keep_feature(feature, view):
+                continue
+            if low and feature is not None:
+                feature["geometry"] = _low_zoom_building(
+                    feat.get("geometry") if isinstance(feat, dict) else None)
+            grouped["buildings"].append(feature)
+    if "areas" in grouped:
+        data = _read_json(_layer_path(piece_dir, "areas"))
+        for index, feat in enumerate(_geo_features(data)):
+            feature = _area_feature(feat, index, edits, True)
+            if _keep_feature(feature, view):
+                grouped["areas"].append(feature)
+        for index, item in enumerate(edits.added_areas):
+            if isinstance(item, dict):
+                feature = _added_feature(item, index)
+                if _keep_feature(feature, view):
+                    grouped["areas"].append(feature)
+    if "roads" in grouped:
+        data = _read_json(_layer_path(piece_dir, "roads"))
+        for index, feat in enumerate(_geo_features(data)):
+            feature = _road_feature(feat, index, edits, True)
+            if _keep_feature(feature, view):
+                grouped["roads"].append(feature)
+    if "fences" in grouped:
+        data = _read_json(_layer_path(piece_dir, "fences"))
+        for index, feat in enumerate(_geo_features(data)):
+            feature = _fence_feature(feat, index)
+            if _keep_feature(feature, view):
+                grouped["fences"].append(feature)
+    if "places" in grouped:
+        for feature in _place_features(piece_dir, edits, info, True):
+            if _keep_feature(feature, view):
+                grouped["places"].append(feature)
+    return grouped
+
+
+@app.route("/api/edit/map")
+def api_edit_map():
+    """Pieces, corners and which overlay files exist, for the Edit tab."""
+    map_dir = _map_dir(request.args.get("map", ""))
+    if map_dir is None:
+        return jsonify({"error": "Unknown map."}), 404
+    info = _piece_info(map_dir)
+    pieces = []
+    for piece in _edit_pieces(map_dir):
+        piece_info = _piece_info(piece)
+        grid = piece_info.get("grid") if isinstance(piece_info.get("grid"), dict) else None
+        try:
+            cells_x = int(piece_info.get("cells_x") or 0)
+            cells_y = int(piece_info.get("cells_y") or 0)
+        except (TypeError, ValueError):
+            cells_x, cells_y = 0, 0
+        pieces.append({
+            "name": piece.name,
+            "corners": _piece_corners(piece, piece_info),
+            "grid": grid,
+            "bbox": piece_info.get("bbox") if isinstance(piece_info.get("bbox"), dict) else None,
+            "cellsX": cells_x,
+            "cellsY": cells_y,
+            "preview": _piece_preview(piece.name),
+            "layers": _piece_layer_flags(piece),
+        })
+    first = _edit_pieces(map_dir)[0]
+    return jsonify({
+        "mapName": map_dir.name,
+        "role": info.get("role") or "map",
+        "stableIds": _stable_ids(first),
+        "pendingStages": _edit_pending(map_dir),
+        "pieces": pieces,
+    })
+
+
+@app.route("/api/edit/features")
+def api_edit_features():
+    """Overlay-applied features for one viewport. The GeoJSON on disk is not written."""
+    from knoxbuild.edits import Edits
+
+    map_dir = _map_dir(request.args.get("map", ""))
+    if map_dir is None:
+        return jsonify({"error": "Unknown map."}), 404
+    piece_dir = _edit_piece(map_dir, request.args.get("piece", ""))
+    if piece_dir is None:
+        return jsonify({"error": "Unknown piece."}), 404
+    view = _edit_view()
+    if view == "bad":
+        return jsonify({"error": "Missing or invalid bbox."}), 400
+    layers = _edit_layer_names(request.args.get("layers"))
+    band = _zoom_band(request.args.get("zoom"))
+    rounded = None if view is None else tuple(round(float(value), 4) for value in view)
+    edits_path = piece_dir / f"{piece_dir.name}_edits.json"
+    key = (str(piece_dir), _layer_mtimes(piece_dir), _file_mtime(edits_path),
+           rounded, band, ",".join(layers))
+    cached = _edit_cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+    edits = Edits.load(str(piece_dir), piece_dir.name)
+    info = _piece_info(piece_dir)
+    grouped = _collect_layer_features(
+        piece_dir, edits, info, layers, view, band == "low")
+    features, truncated = _cap_features(grouped, layers)
+    body = {"type": "FeatureCollection", "features": features}
+    if truncated:
+        body["truncated"] = True
+    _edit_cache_put(key, body)
+    return jsonify(body)
+
+
+def _placement_for(piece_dir: Path, index: int) -> dict | None:
+    """The placements.csv row for buildings geojson index, plus unit rows."""
+    import csv
+
+    path = piece_dir / f"{piece_dir.name}_placements.csv"
+    if not path.is_file():
+        return None
+    base = f"{piece_dir.name}_{index:04d}.tbx"
+    prefix = f"{piece_dir.name}_{index:04d}_"
+    base_row = None
+    units = []
+    try:
+        with open(path, newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                filename = row.get("file") or ""
+                if filename == base:
+                    base_row = dict(row)
+                elif filename.startswith(prefix) and filename.endswith(".tbx"):
+                    units.append(dict(row))
+    except OSError:
+        return None
+    if base_row is None and not units:
+        return None
+    placement = dict(base_row) if base_row else {"file": base}
+    if units:
+        units.sort(key=lambda row: row.get("file") or "")
+        placement["units"] = units
+    return placement
+
+
+def _overlay_record(edits, layer: str, fid: str):
+    if layer == "building":
+        return edits.building(fid)
+    if layer == "area":
+        rec = edits.area(fid)
+        if rec:
+            return rec
+        for index, item in enumerate(edits.added_areas):
+            if isinstance(item, dict) and _added_id(item, index) == fid:
+                return copy.deepcopy(item)
+        return None
+    if layer == "road":
+        streets = edits.streets if isinstance(edits.streets, dict) else {}
+        ways = streets.get("ways") if isinstance(streets.get("ways"), dict) else {}
+        way = ways.get(fid)
+        return dict(way) if isinstance(way, dict) else None
+    if layer == "place":
+        return edits.place(fid)
+    return None
+
+
+@app.route("/api/edit/feature")
+def api_edit_feature():
+    """One feature: tags, the placements row, and the overlay record."""
+    from knoxbuild.edits import Edits
+
+    map_dir = _map_dir(request.args.get("map", ""))
+    if map_dir is None:
+        return jsonify({"error": "Unknown map."}), 404
+    piece_dir = _edit_piece(map_dir, request.args.get("piece", ""))
+    if piece_dir is None:
+        return jsonify({"error": "Unknown piece."}), 404
+    wanted = request.args.get("id", "")
+    if wanted in (None, ""):
+        return jsonify({"error": "Unknown feature."}), 404
+    wanted = str(wanted)
+    edits = Edits.load(str(piece_dir), piece_dir.name)
+    info = _piece_info(piece_dir)
+
+    data = _read_json(_layer_path(piece_dir, "buildings"))
+    for index, feat in enumerate(_geo_features(data)):
+        feature = _building_feature(feat, index, edits, False, False)
+        if feature is None or str(feature["id"]) != wanted:
+            continue
+        fid = str(feature["id"])
+        return jsonify({
+            "id": fid,
+            "layer": "building",
+            "properties": feature["properties"],
+            "placement": _placement_for(piece_dir, index),
+            "edit": _overlay_record(edits, "building", fid),
+        })
+
+    data = _read_json(_layer_path(piece_dir, "areas"))
+    for index, feat in enumerate(_geo_features(data)):
+        feature = _area_feature(feat, index, edits, False)
+        if feature is None or str(feature["id"]) != wanted:
+            continue
+        fid = str(feature["id"])
+        return jsonify({
+            "id": fid,
+            "layer": "area",
+            "properties": feature["properties"],
+            "placement": None,
+            "edit": _overlay_record(edits, "area", fid),
+        })
+
+    for index, item in enumerate(edits.added_areas):
+        if not isinstance(item, dict):
+            continue
+        feature = _added_feature(item, index)
+        if feature is None or str(feature["id"]) != wanted:
+            continue
+        fid = str(feature["id"])
+        return jsonify({
+            "id": fid,
+            "layer": "area",
+            "properties": feature["properties"],
+            "placement": None,
+            "edit": _overlay_record(edits, "area", fid),
+        })
+
+    for layer, builder in (
+            ("roads", lambda feat, index: _road_feature(feat, index, edits, False)),
+            ("fences", lambda feat, index: _fence_feature(feat, index))):
+        data = _read_json(_layer_path(piece_dir, layer))
+        for index, feat in enumerate(_geo_features(data)):
+            feature = builder(feat, index)
+            if feature is None or str(feature["id"]) != wanted:
+                continue
+            fid = str(feature["id"])
+            kind = "road" if layer == "roads" else "fence"
+            return jsonify({
+                "id": fid,
+                "layer": kind,
+                "properties": feature["properties"],
+                "placement": None,
+                "edit": _overlay_record(edits, kind, fid),
+            })
+
+    for feature in _place_features(piece_dir, edits, info, False):
+        raw = feature["properties"].get("fid")
+        lookup = raw if isinstance(raw, str) else str(feature["id"])
+        if str(feature["id"]) != wanted and lookup != wanted:
+            continue
+        return jsonify({
+            "id": str(feature["id"]),
+            "layer": "place",
+            "properties": feature["properties"],
+            "placement": None,
+            "edit": _overlay_record(edits, "place", lookup),
+        })
+    return jsonify({"error": "Unknown feature."}), 404
+
+
+def _style_names(value, found: set) -> None:
+    if isinstance(value, dict):
+        name = value.get("name")
+        if isinstance(name, str) and name:
+            found.add(name)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                name = item.get("name")
+                if isinstance(name, str) and name:
+                    found.add(name)
+
+
+@app.route("/api/edit/vocab")
+def api_edit_vocab():
+    """Kinds, area categories and style names, read from the build code."""
+    map_dir = _map_dir(request.args.get("map", ""))
+    if map_dir is None:
+        return jsonify({"error": "Unknown map."}), 404
+    kinds: list[str] = []
+    categories: list[str] = []
+    styles: list[str] = []
+    try:
+        from knoxbuild.build import SPECIAL_BY_VALUE, STYLE_AS
+        kinds = sorted(set(SPECIAL_BY_VALUE.values()) | set(STYLE_AS) | {"house"})
+    except Exception:  # noqa: BLE001 - a missing dict is an empty list, not a 500
+        kinds = []
+    try:
+        from generator.renderer import AREA_CATEGORIES
+        categories = sorted(AREA_CATEGORIES)
+    except Exception:  # noqa: BLE001
+        categories = []
+    try:
+        from knoxbuild import catalog
+        found: set[str] = set()
+        for entry in catalog.HOUSE_STYLES:
+            _style_names(entry, found)
+        for entry in catalog.SPECIAL_STYLES.values():
+            _style_names(entry, found)
+        for entry in getattr(catalog, "SPECIAL_STYLE_VARIANTS", {}).values():
+            _style_names(entry, found)
+        styles = sorted(found)
+    except Exception:  # noqa: BLE001
+        styles = []
+    return jsonify({"kinds": kinds, "categories": categories, "styles": styles})
+
+
+def _edits_body(edits, piece_dir: Path, note: str | None = None) -> dict:
+    data = edits._as_dict()
+    data.setdefault("saved_at", None)
+    data["pendingStages"] = edits.pending_stages(str(piece_dir))
+    if note:
+        data["message"] = note
+    return data
+
+
+@app.route("/api/edit/edits")
+def api_edit_edits():
+    """The overlay for one piece."""
+    from knoxbuild.edits import Edits
+
+    map_dir = _map_dir(request.args.get("map", ""))
+    if map_dir is None:
+        return jsonify({"error": "Unknown map."}), 404
+    piece_dir = _edit_piece(map_dir, request.args.get("piece", ""))
+    if piece_dir is None:
+        return jsonify({"error": "Unknown piece."}), 404
+    edits = Edits.load(str(piece_dir), piece_dir.name)
+    data = edits._as_dict()
+    data.setdefault("saved_at", None)
+    return jsonify(data)
+
+
+def _polygonal_parts(geom) -> list:
+    kind = geom.geom_type
+    if kind == "Polygon":
+        return [geom] if geom.area > 0 else []
+    if kind == "MultiPolygon":
+        return [part for part in geom.geoms if part.area > 0]
+    if kind == "GeometryCollection":
+        parts = []
+        for part in geom.geoms:
+            parts.extend(_polygonal_parts(part))
+        return parts
+    return []
+
+
+def _clip_polygon(geometry, bounds):
+    """Clip a lon/lat polygon to a piece box.
+
+    Returns (geometry or None, fallback). None with fallback False means the
+    shape misses the box. fallback True means the clip failed and `geometry`
+    is the original, kept only when the boxes meet.
+    """
+    hit = _bounds_hit(_geom_bounds(geometry), bounds)
+    try:
+        from shapely.errors import GEOSException
+        from shapely.geometry import MultiPolygon, box, mapping, shape
+    except ImportError:
+        return (copy.deepcopy(geometry) if hit else None), bool(hit)
+    south, west, north, east = bounds
+    try:
+        geom = shape(geometry)
+        if geom.is_empty:
+            return None, False
+        if not geom.is_valid:
+            geom = geom.buffer(0)
+        clipped = geom.intersection(box(west, south, east, north))
+        parts = _polygonal_parts(clipped)
+    except (GEOSException, ValueError, TypeError, KeyError, AttributeError):
+        return (copy.deepcopy(geometry) if hit else None), True
+    if not parts:
+        return None, False
+    merged = parts[0] if len(parts) == 1 else MultiPolygon(parts)
+    try:
+        data = mapping(merged)
+        cleaned = json.loads(json.dumps(
+            {"type": data["type"], "coordinates": data["coordinates"]}))
+    except (TypeError, ValueError, KeyError):
+        return (copy.deepcopy(geometry) if hit else None), True
+    return cleaned, False
+
+
+def _split_items(items, pieces: list[Path], geom_key: str):
+    """Clip each shape onto the pieces it meets. The second value is True
+    when a shape could not be intersected and was copied whole."""
+    assigned = {piece: [] for piece in pieces}
+    fallback = False
+    if not isinstance(items, list):
+        return assigned, False
+    bounds = {piece: _piece_bounds(piece) for piece in pieces}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        geometry = item.get(geom_key)
+        if not isinstance(geometry, dict):
+            continue
+        for piece, box in bounds.items():
+            if box is None:
+                continue
+            clipped, fell = _clip_polygon(geometry, box)
+            if clipped is None:
+                continue
+            if fell:
+                fallback = True
+            cloned = copy.deepcopy(item)
+            cloned[geom_key] = clipped
+            assigned[piece].append(cloned)
+    return assigned, fallback
+
+
+def _dropped_ids(existing, patch_items) -> set[str]:
+    """Ids that were on this piece and are absent from the replacement list."""
+    old = set()
+    for item in existing or []:
+        if isinstance(item, dict) and item.get("id") not in (None, ""):
+            old.add(str(item["id"]))
+    new = set()
+    if isinstance(patch_items, list):
+        for item in patch_items:
+            if isinstance(item, dict) and item.get("id") not in (None, ""):
+                new.add(str(item["id"]))
+    return old - new
+
+
+def _geom_token(item: dict, geom_key: str) -> str | None:
+    try:
+        return json.dumps(item.get(geom_key), sort_keys=True)
+    except TypeError:
+        return None
+
+
+def _graft_shapes(existing, incoming, removed: set[str], geom_key: str) -> list:
+    """Keep this piece's shapes, drop ids the editor removed, and replace
+    any id the new list still covers. A shape that no longer meets this
+    piece is left as it was, so saving an already-clipped piece does not
+    wipe the other half of a region."""
+    kept = []
+    pos = {}
+    seen = set()
+    for item in existing or []:
+        if not isinstance(item, dict):
+            continue
+        ident = item.get("id")
+        if ident not in (None, "") and str(ident) in removed:
+            continue
+        cloned = copy.deepcopy(item)
+        kept.append(cloned)
+        if ident not in (None, ""):
+            pos[str(ident)] = len(kept) - 1
+        else:
+            token = _geom_token(cloned, geom_key)
+            if token:
+                seen.add(token)
+    for item in incoming:
+        if not isinstance(item, dict):
+            continue
+        ident = item.get("id")
+        if ident not in (None, "") and str(ident) in pos:
+            kept[pos[str(ident)]] = item
+            continue
+        if ident in (None, ""):
+            token = _geom_token(item, geom_key)
+            if token and token in seen:
+                continue
+            if token:
+                seen.add(token)
+        kept.append(item)
+    return kept
+
+
+def _json_same(left, right) -> bool:
+    try:
+        return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+    except TypeError:
+        return False
+
+
+def _edit_merge_patch(map_dir: Path, piece_dir: Path, patch: dict):
+    """Merge onto the named piece. Regions and drawn areas are clipped onto
+    every pack piece they cross; other keys stay on the named piece."""
+    from knoxbuild.edits import Edits
+
+    pieces = _edit_pieces(map_dir)
+    fan = len(pieces) > 1 and ("regions" in patch or "added_areas" in patch)
+    if not fan:
+        edits = Edits.load(str(piece_dir), piece_dir.name)
+        edits.merge(patch).save()
+        return edits, None
+
+    note = None
+    region_split = added_split = None
+    if "regions" in patch:
+        region_split, fell = _split_items(patch.get("regions"), pieces, "shape")
+        if fell:
+            note = "Region shapes were copied whole onto each piece they cross."
+    if "added_areas" in patch:
+        added_split, fell = _split_items(patch.get("added_areas"), pieces, "geometry")
+        if fell and note is None:
+            note = "Area shapes were copied whole onto each piece they cross."
+
+    before = Edits.load(str(piece_dir), piece_dir.name)
+    removed_regions = (_dropped_ids(before.regions, patch.get("regions"))
+                       if region_split is not None else set())
+    removed_areas = (_dropped_ids(before.added_areas, patch.get("added_areas"))
+                     if added_split is not None else set())
+    named = None
+    for piece in pieces:
+        if piece == piece_dir:
+            local = dict(patch)
+            if region_split is not None:
+                local["regions"] = region_split[piece]
+            if added_split is not None:
+                local["added_areas"] = added_split[piece]
+            edits = Edits.load(str(piece), piece.name)
+            edits.merge(local).save()
+            named = edits
+            continue
+        current = Edits.load(str(piece), piece.name)
+        extra = {}
+        if region_split is not None:
+            grafted = _graft_shapes(current.regions, region_split[piece],
+                                    removed_regions, "shape")
+            if not _json_same(grafted, current.regions):
+                extra["regions"] = grafted
+        if added_split is not None:
+            grafted = _graft_shapes(current.added_areas, added_split[piece],
+                                    removed_areas, "geometry")
+            if not _json_same(grafted, current.added_areas):
+                extra["added_areas"] = grafted
+        if extra:
+            current.merge(extra).save()
+    return named, note
+
+
+def _edit_commit(map_dir: Path, piece_dir: Path, patch: dict):
+    """Save a patch. Clearing regions, drawn areas, or everything also
+    clears the copies that were split onto the other pieces of a pack."""
+    from knoxbuild.edits import Edits
+
+    pieces = _edit_pieces(map_dir)
+    clear = patch.get("clear")
+    if clear in _PACK_CLEAR and len(pieces) > 1:
+        for piece in pieces:
+            Edits.load(str(piece), piece.name).merge({"clear": clear}).save()
+        patch = {key: value for key, value in patch.items() if key != "clear"}
+        if not patch:
+            return Edits.load(str(piece_dir), piece_dir.name), None
+    return _edit_merge_patch(map_dir, piece_dir, patch)
+
+
+@app.route("/api/edit/edits", methods=["POST"])
+def api_edit_edits_save():
+    """Merge a patch into the named piece and fan regions across the pack."""
+    data = _json_body()
+    map_dir = _map_dir(data.get("mapName", ""))
+    if map_dir is None:
+        return jsonify({"error": "Unknown map."}), 404
+    piece_dir = _edit_piece(map_dir, data.get("piece", ""))
+    if piece_dir is None:
+        return jsonify({"error": "Unknown piece."}), 404
+    patch = data.get("patch")
+    if not isinstance(patch, dict):
+        return jsonify({"error": "Missing edit."}), 400
+    try:
+        edits, note = _edit_commit(map_dir, piece_dir, patch)
+    except Exception as exc:  # noqa: BLE001 - reported to the window
+        return failed(f"Could not save edits: {exc}", 500, exc)
+    return jsonify(_edits_body(edits, piece_dir, note))
+
+
+@app.route("/api/edit/revert", methods=["POST"])
+def api_edit_revert():
+    """Drop one section, or merge a patch that undoes an edit."""
+    data = _json_body()
+    map_dir = _map_dir(data.get("mapName", ""))
+    if map_dir is None:
+        return jsonify({"error": "Unknown map."}), 404
+    piece_dir = _edit_piece(map_dir, data.get("piece", ""))
+    if piece_dir is None:
+        return jsonify({"error": "Unknown piece."}), 404
+    if "clear" not in data and not isinstance(data.get("patch"), dict):
+        return jsonify({"error": "Missing edit."}), 400
+    patch = dict(data["patch"]) if isinstance(data.get("patch"), dict) else {}
+    if "clear" in data:
+        patch["clear"] = data.get("clear")
+    try:
+        edits, note = _edit_commit(map_dir, piece_dir, patch)
+    except Exception as exc:  # noqa: BLE001 - reported to the window
+        return failed(f"Could not revert edits: {exc}", 500, exc)
+    return jsonify(_edits_body(edits, piece_dir, note))
+
+
+def _restore_pack_fields(piece_dir: Path, kept: dict) -> None:
+    """render() rewrites _info.json. Put the pack's piece fields back."""
+    if not kept:
+        return
+    path = piece_dir / f"{piece_dir.name}_info.json"
+    info = _read_json(path)
+    if not isinstance(info, dict):
+        return
+    info.update(kept)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(info, handle, indent=2)
+
+
+def _repaint_piece(map_name: str, piece_dir: Path, settings, stop) -> None:
+    """Draw this piece again from the Geofabrik cut generate already made."""
+    from generator.geofabrik import cover, load_index
+
+    info = _piece_info(piece_dir)
+    box = _saved_bbox(info) or _piece_bounds(piece_dir)
+    if box is None:
+        raise RuntimeError(f"{piece_dir.name} has no bbox to repaint.")
+    kept = {key: info[key] for key in _PACK_INFO_KEYS if key in info}
+    fetch = info.get("osm_bbox")
+    cover_box = box
+    if isinstance(fetch, (list, tuple)) and len(fetch) == 4:
+        try:
+            cover_box = tuple(float(value) for value in fetch)
+        except (TypeError, ValueError):
+            cover_box = box
+    regions = cover(load_index(str(BASE_DIR), refresh=False), *cover_box)
+    features = localosm.features_for_bbox(
+        str(BASE_DIR), regions, *box, should_stop=stop)
+    if settings.fill_gaps:
+        from generator import overture
+        try:
+            features, piece_gaps = overture.add_missing(
+                features, box, str(piece_dir), piece_dir.name, should_stop=stop)
+            if piece_gaps.get("why"):
+                log.warning("overture %s: %s", piece_dir.name, piece_gaps["why"])
+        except knoxstop.Stopped:
+            raise
+        except Exception as exc:  # noqa: BLE001 - OSM alone still makes a map
+            log.warning("overture %s: %s", piece_dir.name, exc)
+    proj = _grid_projector(info)
+    meters = float(info.get("meters_per_tile") or 1.0)
+    rotation = float(info.get("rotation") or 0.0)
+    shape = info.get("shape") if isinstance(info.get("shape"), dict) else None
+    osm_bbox = cover_box if isinstance(fetch, (list, tuple)) else None
+
+    def on_view(image, stage=None, _name=piece_dir.name):
+        if image is not None:
+            try:
+                _save_paint_view(image, _name)
+            except OSError:
+                return
+            _bump_paint_named(map_name, _name)
+        if stage:
+            _set_progress(map_name, view=stage)
+
+    renderer.render(
+        features, box[0], box[1], box[2], box[3],
+        meters_per_tile=meters,
+        output_dir=str(piece_dir),
+        map_name=piece_dir.name,
+        spawn_density=settings.spawn_density,
+        tree_density=settings.tree_density,
+        rotation=rotation,
+        osm_cache=info.get("osm_cache"),
+        osm_bbox=osm_bbox,
+        shape=shape,
+        straight_roads=bool(settings.straight_roads or info.get("straight_roads")),
+        should_stop=stop,
+        proj=proj,
+        on_view=on_view,
+    )
+    _restore_pack_fields(piece_dir, kept)
+
+
+def _ensure_edit_paint(map_name: str, piece_dir: Path, info: dict) -> None:
+    """A progress entry the build preview can draw on, with rotated corners."""
+    with _PROGRESS_LOCK:
+        pieces = _PROGRESS.setdefault(map_name, {}).setdefault("pieces", [])
+        if any(piece.get("name") == piece_dir.name for piece in pieces):
+            return
+    corners = _piece_corners(piece_dir, info)
+    if not corners:
+        return
+    with _PROGRESS_LOCK:
+        pieces = _PROGRESS.setdefault(map_name, {}).setdefault("pieces", [])
+        if any(piece.get("name") == piece_dir.name for piece in pieces):
+            return
+        pieces.append({"name": piece_dir.name, "corners": corners, "rev": 0})
+
+
+def _reroll_ids(piece_dir: Path, edits) -> set[str]:
+    """Building ids with their own seed, plus any centroid a reroll region covers.
+
+    regions_px has to run before seed_nudge_at, or every nudge reads as zero.
+    """
+    ids = set(edits.explicit_reroll_ids())
+    proj = _piece_projector(_piece_info(piece_dir))
+    if proj is None:
+        return ids
+    edits.regions_px(proj)
+    data = _read_json(_layer_path(piece_dir, "buildings"))
+    for index, feat in enumerate(_geo_features(data)):
+        if not isinstance(feat, dict):
+            continue
+        fid = _edit_feature_id(feat, index)
+        rec = edits.building(fid)
+        if rec and rec.get("deleted"):
+            continue
+        point = _centroid_px(feat.get("geometry") or {}, proj)
+        if point is None:
+            continue
+        if edits.seed_nudge_at(point[0], point[1]) > 0:
+            ids.add(fid)
+    return ids
+
+
+def _edit_mode(stages: set[str]) -> str | None:
+    if "repaint" in stages:
+        return "repaint"
+    if "rebuild" in stages:
+        return "rebuild"
+    if "reroll" in stages:
+        return "reroll"
+    if "labels" in stages:
+        return "labels"
+    return None
+
+
+@app.route("/api/edit/apply", methods=["POST"])
+def api_edit_apply():
+    """Run the cheapest stage the overlays still need, on the stale pieces."""
+    from knoxbuild.build import LayoutPool, build as build_buildings
+    from knoxbuild.edits import Edits
+
+    data = _json_body()
+    map_dir = _map_dir(data.get("mapName", ""))
+    if map_dir is None:
+        return jsonify({"error": "Unknown map."}), 404
+    affected = []
+    union: set[str] = set()
+    for piece in _edit_pieces(map_dir):
+        edits = Edits.load(str(piece), piece.name)
+        stages = edits.pending_stages(str(piece))
+        if not stages:
+            continue
+        union.update(edits.needs())
+        affected.append((piece, edits, stages))
+    mode = _edit_mode(union)
+    if mode is None or not affected:
+        return jsonify({"started": False, "mode": None, "pendingStages": []})
+
+    log.info("edit apply %s: %s (%d piece%s)", map_dir.name, mode, len(affected),
+             "" if len(affected) == 1 else "s")
+    t0 = time.time()
+    out = io.StringIO()
+    total = 0
+    pool = LayoutPool(_stopper(map_dir.name))
+    stop = _stopper(map_dir.name)
+    try:
+        from contextlib import redirect_stdout
+        for index, (target, edits, stages) in enumerate(affected, start=1):
+            knoxstop.check(stop, "the buildings")
+            settings = _load_settings(target)
+            _save_settings(target, settings)
+            info = _piece_info(target)
+            _ensure_edit_paint(map_dir.name, target, info)
+            if mode == "repaint" and "repaint" in stages:
+                _set_progress(map_dir.name, stage="mod", done=index - 1,
+                              total=len(affected), message="Drawing a map piece",
+                              fraction=(index - 1) / len(affected), started=t0,
+                              mod=index, mods=len(affected), detail=target.name)
+                _repaint_piece(map_dir.name, target, settings, stop)
+
+            def on_progress(stage, done, total_n, message, process, processes, eta,
+                            fraction=0.0, _index=index, _detail=target.name):
+                stopping = map_dir.name in _STOPPING
+                share = max(0.0, min(1.0, float(fraction or 0)))
+                overall = ((_index - 1) + share) / len(affected)
+                _set_progress(
+                    map_dir.name,
+                    stage="stopping" if stopping else stage,
+                    done=done, total=total_n,
+                    message="Stopping" if stopping else message,
+                    process=process, processes=processes,
+                    eta=None if stopping else eta,
+                    fraction=overall,
+                    started=t0,
+                    mod=_index, mods=len(affected),
+                    detail=_detail,
+                )
+
+            def on_view(image, stage=None, _name=target.name):
+                try:
+                    _save_paint_view(image, _name)
+                except OSError:
+                    return
+                _bump_paint_named(map_dir.name, _name)
+                if stage:
+                    _set_progress(map_dir.name, view=stage)
+
+            def on_overlay(image, _name=target.name):
+                _save_buildings_overlay(image, _name, map_dir.name)
+
+            if mode in ("repaint", "rebuild"):
+                relayout_ids = None
+            elif mode == "reroll":
+                relayout_ids = _reroll_ids(target, edits)
+            else:
+                relayout_ids = set()
+            _set_progress(map_dir.name, stage="index", done=0, total=1,
+                          message="Reading footprints", process=1, processes=1,
+                          eta=None, fraction=(index - 1) / len(affected),
+                          started=t0, mod=index, mods=len(affected),
+                          detail=target.name)
+            with redirect_stdout(out):
+                code = build_buildings(
+                    str(target), settings=settings, should_stop=stop,
+                    on_progress=on_progress, on_view=on_view,
+                    on_overlay=on_overlay, pool=pool,
+                    relayout_ids=relayout_ids)
+            if code:
+                raise RuntimeError(f"Building generation failed ({code}).")
+            total += len(list((target / "buildings").glob("*.tbx")))
+            mapstate.stamp(str(target), "build")
+    except knoxstop.Stopped:
+        pool.kill()
+        for target, _edits, _stages in affected:
+            folder = target / "buildings"
+            if not folder.is_dir():
+                continue
+            for part in folder.glob("*.part"):
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+        return _stopped(map_dir.name, "buildings")
+    except Exception as exc:
+        log.info("edit apply %s output before the error:\n%s", map_dir.name,
+                 out.getvalue()[-4000:])
+        return failed(f"Building generation failed: {exc}", 500, exc)
+    finally:
+        pool.close()
+    mapstate.stamp(str(map_dir), "build")
+    _set_progress(map_dir.name, stage="done", done=total, total=max(total, 1),
+                  message="Buildings ready", process=1, processes=1, eta=0,
+                  fraction=1, started=t0, mod=len(affected), mods=len(affected))
+    log.info("edit apply %s: %s, %d files in %.1fs\n%s", map_dir.name, mode,
+             total, time.time() - t0, out.getvalue()[-3000:])
+    return jsonify({
+        "started": True,
+        "count": total,
+        "mode": mode,
+        "pendingStages": _edit_pending(map_dir),
+        "pzw": f"{affected[-1][0].name}.pzw",
+        "settings": _load_settings(affected[-1][0]).to_dict(),
+        "population": _population(affected[-1][0]),
+    })
 
 
 @app.route("/api/zombies", methods=["POST"])
@@ -1459,23 +3348,104 @@ def api_worlded_tools():
     return jsonify({"started": True, "state": "running"})
 
 
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _export_target(map_dir: Path, dest: str) -> Path | None:
+    """Map folder under the chosen location, or None when it is already there.
+
+    The path shown in the window is the project folder next to KnoxMap
+    (output/). The map itself lives in a subfolder of that. Choosing that
+    same folder does not copy the tree into itself.
+    """
+    raw = (dest or "").strip().strip('"')
+    if not raw:
+        return None
+    chosen = Path(os.path.expanduser(raw))
+    try:
+        chosen_r = chosen.resolve()
+        map_r = map_dir.resolve()
+        out_r = OUTPUT_DIR.resolve()
+    except OSError:
+        chosen_r = Path(os.path.abspath(chosen))
+        map_r = Path(os.path.abspath(map_dir))
+        out_r = Path(os.path.abspath(OUTPUT_DIR))
+    if _same_path(chosen_r, map_r) or _same_path(chosen_r, out_r) or _same_path(chosen_r, map_r.parent):
+        return None
+    if str(chosen_r).startswith(str(map_r) + os.sep):
+        return None
+    target = chosen_r / map_dir.name
+    if _same_path(target, map_r) or str(target).startswith(str(map_r) + os.sep):
+        return None
+    return target
+
+
+def _deliver_compiled(map_dir: Path, dest: str) -> str:
+    """Copy the compiled project to the chosen output folder."""
+    target = _export_target(map_dir, dest)
+    if target is None:
+        return str(map_dir)
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(map_dir, target)
+    log.info("compile output %s -> %s", map_dir, target)
+    return str(target)
+
+
+def _deliver_worlded(map_dir: Path, dest: str) -> str:
+    """Copy the WorldEd project (not the installed mod) to the chosen folder."""
+    target = _export_target(map_dir, dest)
+    if target is None:
+        return str(map_dir)
+    from tools.make_map_mod import _copy_editable
+
+    holder = Path(tempfile.mkdtemp(prefix="knox-worlded-"))
+    try:
+        _copy_editable(str(map_dir), str(holder))
+        src = holder / "editable"
+        if not src.is_dir():
+            raise FileNotFoundError("The WorldEd project has no files to copy.")
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(src, target)
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+    log.info("worlded project %s -> %s", map_dir, target)
+    return str(target)
+
+
 @app.route("/api/worlded", methods=["POST"])
 def api_worlded():
-    """Open the generated project in PZWorldEd."""
+    """Open the generated project in PZWorldEd, or copy it to an output folder.
+
+    An output path writes the WorldEd project there and does not launch the
+    editor. No path is the existing Open in WorldEd action.
+    """
     import subprocess
 
     data = _json_body()
     map_dir = _map_dir(data.get("mapName", ""))
     if map_dir is None:
         return jsonify({"error": "Unknown map."}), 404
+    pzw = map_dir / f"{map_dir.name}.pzw"
+    if not pzw.exists():
+        return jsonify({"error": "No .pzw yet — generate the buildings first."}), 400
+    output = data.get("output") if isinstance(data.get("output"), str) else ""
+    if output.strip():
+        try:
+            placed = _deliver_worlded(map_dir, output)
+        except Exception as exc:
+            return failed(f"Could not write the WorldEd project: {exc}", 500, exc)
+        return jsonify({"project": placed})
 
     exe = _worlded_exe()
     if exe is None:
         return jsonify({"error": "PZWorldEd not found. Set the PZWORLDED "
                                  "environment variable to its full path."}), 400
-    pzw = map_dir / f"{map_dir.name}.pzw"
-    if not pzw.exists():
-        return jsonify({"error": "No .pzw yet — generate the buildings first."}), 400
     subprocess.Popen(knoxpaths.command_for(exe) + [str(pzw)])
     return jsonify({"launched": str(pzw)})
 
@@ -1523,13 +3493,20 @@ def api_setup_status():
     tiles = 0
     if tools and (tools / "Tiles" / "2x").is_dir():
         tiles = sum(1 for _ in (tools / "Tiles" / "2x").glob("*.png"))
+    waiting = knoxmap_setup.worlded_choice_needed()
+    tools_fix = ("Cannot find WorldEd. Choose Download or Find."
+                 if waiting else
+                 "KnoxMap downloads these the first time it opens. If this stays "
+                 "missing, the details are in logs/setup.log.")
+    compiler_fix = ("Cannot find WorldEd. Choose Download or Find."
+                    if waiting else
+                    "KnoxMap downloads this the first time it opens. You can also "
+                    "compile by hand with Open in WorldEd.")
     checks = [
         {"id": "tools", "ok": bool(tools), "label": "PZ Mapping Tools",
-         "fix": "KnoxMap downloads these the first time it opens. If this stays "
-                "missing, the details are in logs/setup.log."},
+         "fix": tools_fix},
         {"id": "compiler", "ok": bool(cli), "label": "Patched map compiler",
-         "fix": "KnoxMap downloads this the first time it opens. You can also "
-                "compile by hand with Open in WorldEd."},
+         "fix": compiler_fix},
         {"id": "game", "ok": bool(game) and bool(knoxpaths.pz_jar(game)),
          "label": "Project Zomboid install",
          "fix": ("Choose the game folder under Game location, the one that "
@@ -1576,19 +3553,23 @@ def api_setup_status():
          "fix": "Subscribe to it on the Steam Workshop to start at any landmark of your map."},
         {"id": "overture", "ok": _overture_ready(),
          "label": "Overture Maps data (optional)",
-         "fix": "Needed only for Fill gaps from Overture, which adds the buildings "
-                "OpenStreetMap has not got. Install DuckDB into the Python inside "
-                "KnoxMap's own .venv folder: python -m pip install duckdb. Worth it "
-                "where your town is half missing from OSM; nothing else needs it."},
+         "fix": "Needed for Add missing buildings, which fills in the houses "
+                "OpenStreetMap has not drawn. A packaged KnoxMap includes DuckDB. "
+                "From a source checkout, install it into KnoxMap's own .venv: "
+                "python -m pip install duckdb."},
         {"id": "erikas_tiles", "ok": knoxpaths.erikas_tiles_ready(),
          "label": "Erika's Tiles (optional)",
          "fix": "Subscribe to it on the Steam Workshop and open KnoxMap again for glass shop "
                 "fronts and signs, street signs, and far more varied pictures, posters and "
                 "plants. Maps made with it require it."},
     ]
+    status = knoxmap_setup.progress()
     return jsonify({"ready": all(c["ok"] for c in checks), "checks": checks,
-                    "optional": optional, "busy": knoxmap_setup.busy(),
-                    "mods_dir": str(knoxpaths.zomboid_user_dir() / "mods")})
+                    "optional": optional, "busy": status["busy"],
+                    "first_time": status["first_time"],
+                    "step": status["step"], "total": status["total"],
+                    "mods_dir": _default_mods_dir(),
+                    "output_dir": str(OUTPUT_DIR)})
 
 
 def _game_location_payload() -> dict:
@@ -1601,9 +3582,60 @@ def _game_location_payload() -> dict:
             "jar": jar.name if jar else ""}
 
 
-def _pick_game_folder() -> str | None:
-    """A folder the player picked, '' if they cancelled, or None if no folder
-    window could be opened."""
+_CHOICE_LOCK = threading.Lock()
+_CHOICE = {"state": "idle", "message": "", "error": None}
+
+
+def _choice_progress(msg: str) -> None:
+    with _CHOICE_LOCK:
+        _CHOICE["message"] = msg
+
+
+def _choice_worker(download: bool) -> None:
+    import knoxmap_setup
+
+    knoxmap_setup.claim_busy()
+    try:
+        knoxmap_setup.continue_after_choice(download, _choice_progress)
+        with _CHOICE_LOCK:
+            _CHOICE["state"] = "done"
+            _CHOICE["error"] = None
+            _CHOICE["message"] = ""
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - shown on the prompt
+        log.exception("worlded setup failed")
+        with _CHOICE_LOCK:
+            _CHOICE["state"] = "error"
+            _CHOICE["error"] = str(exc) or "WorldEd setup failed."
+            _CHOICE["message"] = ""
+    finally:
+        knoxmap_setup.release_busy()
+
+
+def _begin_worlded_choice(download: bool) -> bool:
+    with _CHOICE_LOCK:
+        if _CHOICE["state"] == "running":
+            return False
+        _CHOICE["state"] = "running"
+        _CHOICE["error"] = None
+        _CHOICE["message"] = "Downloading WorldEd…" if download else "Setting up WorldEd…"
+    threading.Thread(target=_choice_worker, args=(download,), name="worlded-choice",
+                     daemon=True).start()
+    return True
+
+
+def _worlded_choice_payload() -> dict:
+    import knoxmap_setup
+
+    with _CHOICE_LOCK:
+        job = dict(_CHOICE)
+    needed = knoxmap_setup.worlded_choice_needed()
+    job["ask"] = job["state"] in ("running", "error") or needed
+    return job
+
+
+def _pick_worlded_exe() -> str | None:
+    """The WorldEd program the player picked, '' if they cancelled, or None
+    if no file window could be opened."""
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -1614,7 +3646,109 @@ def _pick_game_folder() -> str | None:
             root.attributes("-topmost", True)
         except tk.TclError:
             pass
-        chosen = filedialog.askdirectory(title="Select the Project Zomboid folder")
+        types = ([("WorldEd", "*.exe"), ("All files", "*.*")]
+                 if os.name == "nt" else [("All files", "*")])
+        chosen = filedialog.askopenfilename(title="Select WorldEd", filetypes=types)
+        root.destroy()
+        return chosen or ""
+    except Exception:
+        log.exception("file window failed")
+    if os.name != "nt":
+        return None
+    import subprocess
+
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$d = New-Object System.Windows.Forms.OpenFileDialog; "
+        "$d.Title = 'Select WorldEd'; "
+        "$d.Filter = 'WorldEd|*.exe|All files|*.*'; "
+        "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"
+    )
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True, text=True, timeout=180, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        log.exception("file window failed")
+        return None
+    if done.returncode != 0:
+        return None
+    return (done.stdout or "").strip()
+
+
+@app.route("/api/worlded-choice", methods=["GET", "POST"])
+def api_worlded_choice():
+    """When the program file has no WorldEd beside it, Download or Find.
+
+    Download installs the release the compiler is built for, next to KnoxMap.
+    Find opens a file window; the program they click is the one KnoxMap uses.
+    """
+    if request.method == "GET":
+        return jsonify(_worlded_choice_payload())
+    action = (request.get_json(silent=True) or {}).get("action")
+    if action == "download":
+        _begin_worlded_choice(True)
+        return jsonify({"started": True, "state": "running"})
+    if action == "find":
+        chosen = _pick_worlded_exe()
+        if chosen is None:
+            return jsonify({"error": "Could not open a file window."}), 500
+        if not chosen:
+            payload = _worlded_choice_payload()
+            payload["cancelled"] = True
+            return jsonify(payload)
+        try:
+            knoxpaths.adopt_worlded(chosen)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        log.info("worlded chosen: %s", chosen)
+        _begin_worlded_choice(False)
+        return jsonify({"started": True, "state": "running"})
+    return jsonify({"error": "Unknown WorldEd choice."}), 400
+
+
+def _default_mods_dir() -> str:
+    """The Project Zomboid mods folder Install already uses.
+
+    That is ~/Zomboid/mods, or ZOMBOID_DIR / the setup config when the game's
+    user folder has been moved. If that folder has never been created and the
+    Config tab has a game install, use the mods folder beside that install.
+    """
+    configured = bool(os.environ.get("ZOMBOID_DIR") or knoxpaths.load_config().get("zomboid_dir"))
+    mods = knoxpaths.zomboid_user_dir() / "mods"
+    if configured or mods.is_dir() or mods.parent.is_dir():
+        return str(mods)
+    game = knoxpaths.pz_install_dir()
+    if game is not None:
+        return str(Path(game) / "mods")
+    return str(mods)
+
+
+def _pick_folder(title: str, initial: str | None = None) -> str | None:
+    """A folder the player picked, '' if they cancelled, or None if no folder
+    window could be opened. Same dialog the game location uses."""
+    title = " ".join((title or "Select a folder").split())[:80] or "Select a folder"
+    start = None
+    if initial and initial.strip():
+        candidate = Path(os.path.expanduser(initial.strip().strip('"')))
+        if candidate.is_dir():
+            start = str(candidate)
+        elif candidate.parent.is_dir():
+            start = str(candidate.parent)
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        kwargs = {"title": title}
+        if start:
+            kwargs["initialdir"] = start
+        chosen = filedialog.askdirectory(**kwargs)
         root.destroy()
         return chosen or ""
     except Exception:
@@ -1623,13 +3757,16 @@ def _pick_game_folder() -> str | None:
         return None
     import subprocess
 
+    safe_title = title.replace("'", "''")
     script = (
         "Add-Type -AssemblyName System.Windows.Forms; "
         "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
-        "$d.Description = 'Select the Project Zomboid folder'; "
+        f"$d.Description = '{safe_title}'; "
         "$d.ShowNewFolderButton = $false; "
-        "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }"
     )
+    if start:
+        script += f"$d.SelectedPath = '{start.replace(chr(39), chr(39) * 2)}'; "
+    script += "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }"
     try:
         done = subprocess.run(
             ["powershell", "-NoProfile", "-STA", "-Command", script],
@@ -1640,6 +3777,24 @@ def _pick_game_folder() -> str | None:
     if done.returncode != 0:
         return None
     return (done.stdout or "").strip()
+
+
+def _pick_game_folder() -> str | None:
+    return _pick_folder("Select the Project Zomboid folder")
+
+
+@app.route("/api/browse-folder", methods=["POST"])
+def api_browse_folder():
+    """The folder window used by Game location, for any other path field."""
+    body = request.get_json(silent=True) or {}
+    title = body.get("title") if isinstance(body.get("title"), str) else ""
+    initial = body.get("path") if isinstance(body.get("path"), str) else ""
+    chosen = _pick_folder(title, initial)
+    if chosen is None:
+        return jsonify({"error": "Could not open a folder window."}), 500
+    if not chosen:
+        return jsonify({"cancelled": True, "path": ""})
+    return jsonify({"cancelled": False, "path": chosen})
 
 
 _JAR_MISSING = ("That folder does not contain the Project Zomboid jar. "
@@ -1710,11 +3865,13 @@ def _has_road_rules(tools) -> bool:
         text = rules.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    # The newest rule, so tools patched before street furniture existed are
-    # sent back through Setup - and no blank litter tile, so are the ones
-    # patched while the litter rule still named trash_01_13 and 14, which the
-    # game draws as a question mark.
-    return "KnoxMap road Yard bed_soil" in text and "trash_01_13" not in text
+    # Traffic signal W is the newest rule. Tools patched before junctions
+    # existed are sent back through Setup, and so are the ones still missing
+    # the yard rules or still naming trash_01_13, which the game draws as a
+    # question mark.
+    return ("KnoxMap road Traffic signal W" in text
+            and "KnoxMap road Yard bed_soil" in text
+            and "trash_01_13" not in text)
 
 
 def _overture_ready() -> bool:
@@ -1832,6 +3989,7 @@ def api_compile():
     # reaches the handful that matter.
     from tools.compile_map import failed_cells
     only_failed = bool(data.get("onlyFailed"))
+    output = data.get("output") if isinstance(data.get("output"), str) else ""
     if only_failed and not any(failed_cells(piece) for piece in targets):
         return jsonify({"error": "Nothing is recorded as failed."}), 400
 
@@ -1892,9 +4050,18 @@ def api_compile():
             left = []
             for piece in targets:
                 left.extend(compiler.failed_cells(str(piece)))
+            try:
+                placed = _deliver_compiled(map_dir, output) if output.strip() else str(map_dir)
+            except Exception as exc:
+                eid = knoxlog.record(exc, f"compile {name}: could not copy output")
+                with _PROGRESS_LOCK:
+                    _COMPILE[name] = {"state": "error", "errorId": eid,
+                                      "error": f"Could not write the compiled map: {exc}"}
+                return
             with _PROGRESS_LOCK:
                 mapstate.stamp(str(map_dir), "compile")
-                _COMPILE[name] = {"state": "done", "error": None, "failed": left}
+                _COMPILE[name] = {"state": "done", "error": None, "failed": left,
+                                  "output": placed}
         except knoxstop.Stopped:
             log.info("compile %s: stopped after %.0fs", name, time.time() - t0)
             _done_stopping(name)
@@ -1948,6 +4115,15 @@ def api_install():
              else map_dir.name).strip()[:80]
     mod_id = SAFE_NAME.sub("_", raw_id if isinstance(raw_id, str) and raw_id.strip()
                            else map_dir.name).strip("_")[:60] or map_dir.name[:60]
+    # No "export" key is the upgrade path and anything that still asks for
+    # the whole mod. An empty list is the switches all turned off.
+    if "export" in data:
+        choice = _install_choice(data.get("export"))
+        if not choice:
+            return jsonify({"error": "Pick at least one install option."}), 400
+    else:
+        choice = {"full"}
+    full = "full" in choice
     targets = _pack_mod_dirs(map_dir) or [map_dir]
     installed = []
     n_cells = 0
@@ -1956,8 +4132,12 @@ def api_install():
         for index, piece in enumerate(targets):
             piece_title = title if len(targets) == 1 else f"{title} {index + 1}"
             piece_id = mod_id if len(targets) == 1 else f"{mod_id}_{index + 1}"
+            mods_dir = data.get("modsDir") if isinstance(data.get("modsDir"), str) else ""
             mod_root, cells, piece_extras = make_map_mod.package(
-                str(piece), piece_title, piece_id)
+                str(piece), piece_title, piece_id,
+                mods_dir=mods_dir.strip() or None,
+                spawn_selector=full, reset_loot_menu=full, rifle=full,
+                editable_copy="editable" in choice)
             installed.append(str(mod_root))
             n_cells += cells
             extras.extend(piece_extras or [])
@@ -1971,7 +4151,7 @@ def api_install():
              map_dir.name, n_cells, len(installed), mod_id, extras)
     return jsonify({"modRoot": installed[-1], "cells": n_cells,
                     "extras": extras, "modId": mod_id, "title": title,
-                    "mods": len(installed)})
+                    "mods": len(installed), "export": sorted(choice)})
 
 
 def _bbox_area_km2(south: float, west: float, north: float, east: float) -> float:
@@ -2022,7 +4202,8 @@ How to import (per Thuztor's Mapping Guide v0.2, chapter 2)
 Notes
 -----
 * Roads render as asphalt (residential = light, secondary = medium,
-  primary/motorway = dark). Paths and tracks render as dirt lines.
+  primary/motorway = dark). Walking paths render as dirt. Tracks render
+  as gravel track tiles, or as dirt when the surface is tagged dirt.
 * Forests render as dense trees in the interior and a grass+tree blend
   at the edges so the transition isn't a hard rectangle.
 * The spawn map is generated procedurally: higher density on asphalt,
@@ -2038,13 +4219,69 @@ Notes
     (map_dir / "README.txt").write_text(text, encoding="utf-8")
 
 
+_EXPORT_PARTS = {"full", "map", "editable", "buildings", "cells", "pictures", "preview"}
+
+
+def _export_parts(raw: str | None) -> set[str] | None:
+    """Which pieces a download asked for. No query is the whole folder."""
+    if not raw:
+        return {"full"}
+    selected = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    selected &= _EXPORT_PARTS
+    return selected or None
+
+
+def _install_choice(raw) -> set[str]:
+    if not isinstance(raw, list):
+        return set()
+    return {str(part) for part in raw if str(part) in {"full", "map", "editable"}}
+
+
+def _export_keep(rel: str, selected: set[str]) -> bool:
+    """Whether one file belongs in the zip for the switches that are on.
+
+    Full output is the whole folder, including caches that are not their own
+    switch. The others are a union: a file can belong to more than one.
+    """
+    if "full" in selected:
+        return True
+    posix = rel.replace("\\", "/")
+    name = posix.rsplit("/", 1)[-1].lower()
+    keep = False
+    if "map" in selected:
+        keep = keep or name.startswith("worldmap") or name == "streets.xml"
+    if "editable" in selected:
+        keep = keep or (
+            name.endswith(".pzw") or name.endswith(".bmp") or name.endswith(".tmx")
+            or name.endswith(".csv") or name.endswith(".geojson")
+            or name.endswith("_structures.json") or name.endswith("_places.json")
+            or posix.startswith("tmx/") or "/tmx/" in f"/{posix}")
+    if "buildings" in selected:
+        keep = keep or (
+            posix.startswith("buildings/") or "/buildings/" in f"/{posix}"
+            or name.endswith(".tbx") or name.endswith("_buildings.geojson")
+            or name.endswith("_structures.json") or name.endswith("_places.json"))
+    if "cells" in selected:
+        keep = keep or posix.startswith("lots/") or "/lots/" in f"/{posix}"
+    if "pictures" in selected:
+        keep = keep or posix.startswith("pictures/") or "/pictures/" in f"/{posix}"
+    if "preview" in selected:
+        keep = keep or (
+            name.endswith("_preview.png") or name == "readme.txt"
+            or name.endswith("_info.json") or name.endswith("_population.json")
+            or name.endswith("_guncache.json")
+            or name in {"settings.json", "pack.json", "knoxmap_map.json"})
+    return keep
+
+
 @app.route("/download/<map_name>.zip")
 def download_all(map_name: str):
-    """Everything for one map, zipped on demand.
+    """The map, zipped on demand, limited to the export switches that are on.
 
     Built when asked for rather than at generation time, so it also picks up
     anything produced later - the .tbx buildings, the .pzw project and the
     placement CSV that `python -m knoxbuild` writes into the same folder.
+    No `parts` query is the whole folder, which is what the old link asked for.
     """
     safe = SAFE_NAME.sub("_", map_name)
     map_dir = (OUTPUT_DIR / safe).resolve()
@@ -2052,18 +4289,37 @@ def download_all(map_name: str):
         return jsonify({"error": "Bad map name."}), 400
     if not map_dir.is_dir():
         return jsonify({"error": f"No output for {safe!r}."}), 404
+    selected = _export_parts(request.args.get("parts"))
+    if not selected:
+        return jsonify({"error": "Pick at least one export option."}), 400
 
     buf = io.BytesIO()
+    wrote = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(map_dir.rglob("*")):
             if not path.is_file() or path.suffix.lower() == ".zip":
                 continue
+            rel = path.relative_to(map_dir).as_posix()
+            if not _export_keep(rel, selected):
+                continue
             zf.write(path, arcname=str(Path(safe) / path.relative_to(map_dir)))
+            wrote += 1
+    if not wrote:
+        return jsonify({"error": "Those export options have nothing to download yet."}), 404
+    if selected == {"map"}:
+        suffix = "-map"
+    elif selected == {"editable"}:
+        suffix = "-editable"
+    elif "full" not in selected:
+        suffix = "-selected"
+    else:
+        suffix = ""
     buf.seek(0)
     return send_file(buf, mimetype="application/zip", as_attachment=True,
-                     download_name=f"{safe}.zip")
+                     download_name=f"{safe}{suffix}.zip")
 
 
 if __name__ == "__main__":
+    warm_buildings()
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="127.0.0.1", port=port, debug=False)

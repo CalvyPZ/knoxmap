@@ -60,6 +60,44 @@ def save_config(values: dict) -> None:
         json.dump(config, f, indent=2)
 
 
+def user_config_dir() -> Path:
+    """Settings that belong to the person, not to one copy of the program.
+
+    The window's own storage does not: each launch picks a new local port, so
+    that storage is empty again, and it lives in the cache beside the program,
+    which a new download does not keep. This folder stays with the account.
+    """
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "KnoxMap"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "KnoxMap"
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "knoxmap"
+
+
+def _tutorial_flag() -> Path:
+    return user_config_dir() / "tutorial-seen"
+
+
+def tutorial_seen() -> bool:
+    """True once the first-run tutorial has been finished, skipped or closed."""
+    if _tutorial_flag().is_file():
+        return True
+    return load_config().get("tutorial_seen") == "1"
+
+
+def mark_tutorial_seen() -> None:
+    """Remember the tutorial across launches, updates and a new copy of KnoxMap."""
+    path = _tutorial_flag()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("1\n", encoding="utf-8")
+    try:
+        save_config({"tutorial_seen": "1"})
+    except OSError:
+        pass
+
+
 def _first(*candidates) -> Path | None:
     for c in candidates:
         if c and _exists(Path(c)):
@@ -84,6 +122,9 @@ def _tool(name: str, override: str) -> Path | None:
     """One of the map tools' programs: the Windows build, or a Linux one built
     from the same source beside it (see worlded/README.md)."""
     chosen = os.environ.get(override)
+    if not chosen:
+        key = "worlded_cli" if name == "PZWorldEd_cli" else "worlded"
+        chosen = load_config().get(key)
     if chosen and _exists(Path(chosen)):
         return Path(chosen)
     tools = mapping_tools_dir()
@@ -93,6 +134,33 @@ def _tool(name: str, override: str) -> Path | None:
         if _exists(candidate):
             return candidate
     return None
+
+
+_WORLDED_KEYS = {
+    "pzworlded.exe": "worlded",
+    "pzworlded": "worlded",
+    "pzworlded_cli.exe": "worlded_cli",
+    "pzworlded_cli": "worlded_cli",
+}
+
+
+def adopt_worlded(path: str) -> Path:
+    """Remember a WorldEd program the player picked.
+
+    A file inside a bin folder also selects that install as the mapping tools.
+    """
+    exe = Path(path).expanduser()
+    if not exe.is_file():
+        raise ValueError("Choose PZWorldEd.exe.")
+    key = _WORLDED_KEYS.get(exe.name.lower())
+    if key is None:
+        raise ValueError("Choose PZWorldEd.exe.")
+    resolved = exe.resolve()
+    values: dict = {key: resolved}
+    if resolved.parent.name.lower() == "bin":
+        values["mapping_tools"] = resolved.parent.parent
+    save_config(values)
+    return resolved
 
 
 def worlded_cli() -> Path | None:

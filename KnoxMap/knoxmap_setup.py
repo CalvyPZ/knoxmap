@@ -1,9 +1,9 @@
 """KnoxMap setup: everything a fresh PC needs, in one go.
 
 The program file does this itself the first time it opens. A git checkout
-can still run it by hand:
+creates `.venv` itself, then can still run this by hand:
 
-    Setup.bat           (this folder, or: python knoxmap_setup.py)
+    python knoxmap_setup.py
 
 Safe to run again at any time; every step checks first and skips what is
 already done. What it does:
@@ -32,6 +32,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -42,11 +43,60 @@ import knoxpaths  # noqa: E402
 
 _busy = False
 _busy_lock = threading.Lock()
+# The window reads these while setup runs. _show_first_time is latched when a
+# run starts, so installing the tools part-way through does not bring the
+# New map and Load map buttons back before the run has finished.
+_started = False
+_finished = False
+_step = 0
+_show_first_time = False
+SETUP_STEPS = 5
 
 
 def busy() -> bool:
     """True while the program file is doing setup in the background."""
     return _busy
+
+
+def _first_launch() -> bool:
+    """True when this copy has not got the map tools yet.
+
+    That is the first time it sets itself up. A later open finds them and
+    leaves New map and Load map up while it rechecks.
+    """
+    return knoxpaths.mapping_tools_dir() is None or knoxpaths.worlded_cli() is None
+
+
+def _start_run_locked() -> None:
+    """Mark a setup run as begun. The caller holds _busy_lock."""
+    global _busy, _started, _finished, _step, _show_first_time
+    _busy = True
+    _started = True
+    _finished = False
+    _step = 0
+    _show_first_time = _first_launch()
+
+
+def _end_run_locked() -> None:
+    """Mark a setup run as ended. The caller holds _busy_lock."""
+    global _busy, _finished
+    _busy = False
+    _finished = True
+
+
+def progress() -> dict:
+    """Where setup is, for the first-launch window.
+
+    first_time is true only while a first-time run is still going, and in
+    the moment before that run has started. Once it ends, the buttons return
+    even if something is still missing.
+    """
+    with _busy_lock:
+        started, finished = _started, _finished
+        show, step, running = _show_first_time, _step, _busy
+    first = (not started and _first_launch()) or (show and started and not finished)
+    return {"busy": running, "finished": finished, "first_time": first,
+            "step": step, "total": SETUP_STEPS}
 
 # The exact PZ Mapping Tools release the patched compiler was built from. The
 # compiler links against this release's Qt and editor libraries, so the two
@@ -76,8 +126,11 @@ def say(msg: str = "") -> None:
 
 
 def step(n: int, title: str) -> None:
+    global _step
+    with _busy_lock:
+        _step = n
     say()
-    say(f"[{n}/5] {title}")
+    say(f"[{n}/{SETUP_STEPS}] {title}")
 
 
 def download(url: str, what: str) -> bytes:
@@ -485,17 +538,70 @@ def finish(tools: Path, game: Path | None, cli_ok: bool) -> None:
         say("Start KnoxMap with ./knoxmap.sh.")
 
 
+def worlded_choice_needed() -> bool:
+    """The packaged program has no WorldEd yet, so the window asks first.
+
+    A source checkout still fetches the tools on its own. The program file
+    the player launches does not: WorldEd is either downloaded next to it,
+    or a program they pick.
+    """
+    packaged = os.environ.get("KNOXMAP_SERVE") == "1" or getattr(sys, "frozen", False)
+    if not packaged:
+        return False
+    return knoxpaths.worlded_gui() is None and knoxpaths.worlded_cli() is None
+
+
+def claim_busy() -> None:
+    """Take the setup lock, waiting if a run is already in it."""
+    while True:
+        with _busy_lock:
+            if not _busy:
+                _start_run_locked()
+                return
+        time.sleep(0.1)
+
+
+def release_busy() -> None:
+    with _busy_lock:
+        _end_run_locked()
+
+
+def continue_after_choice(download: bool, on_progress=None) -> None:
+    """Finish setup once the player has chosen Download or Find.
+
+    Download fetches the compiler's matching WorldEd release into the folder
+    beside the program. Find has already pointed at a program, so this only
+    continues when that program sits in a mapping-tools install.
+    """
+    def progress(msg: str) -> None:
+        if on_progress:
+            on_progress(msg)
+
+    if download:
+        progress("Downloading WorldEd…")
+        tools = ensure_mapping_tools()
+    else:
+        tools = knoxpaths.mapping_tools_dir()
+        if tools is None:
+            return
+    progress("Installing WorldEd…")
+    cli_ok = ensure_patched_cli(tools)
+    game = find_game()
+    progress("Setting up WorldEd…")
+    configure_tools(tools, game)
+    finish(tools, game, cli_ok)
+
+
 def start_in_background() -> None:
     """The program file does setup itself. Nobody has to run a script first."""
     threading.Thread(target=_run_for_program, name="knoxmap-setup", daemon=True).start()
 
 
 def _run_for_program() -> None:
-    global _busy
     with _busy_lock:
         if _busy:
             return
-        _busy = True
+        _start_run_locked()
     os.environ["KNOXMAP_UNATTENDED"] = "1"
     os.environ["KNOXMAP_NO_PAUSE"] = "1"
     try:
@@ -505,7 +611,8 @@ def _run_for_program() -> None:
         import traceback
         traceback.print_exc()
     finally:
-        _busy = False
+        with _busy_lock:
+            _end_run_locked()
 
 
 def main() -> int:
@@ -525,6 +632,9 @@ def main() -> int:
         say("         so maps of more than a few square kilometres will fail with")
         say("         'MemoryError'. KnoxMap needs 64-bit Python.")
         say("")
+    if os.environ.get("KNOXMAP_UNATTENDED") == "1" and worlded_choice_needed():
+        say("Cannot find WorldEd.")
+        return 0
     tools = ensure_mapping_tools()
     cli_ok = ensure_patched_cli(tools)
     game = find_game()

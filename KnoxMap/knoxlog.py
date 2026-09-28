@@ -96,7 +96,18 @@ def setup(program: str = "app", console: bool = False) -> logging.Logger:
     log.info("KnoxMap %s started (%s)", version(), program)
     for line in system_summary().splitlines():
         log.info("  %s", line)
+    flush()
     return log
+
+
+def flush() -> None:
+    """Write the log out now. A long step used to die with its last line still
+    in the buffer, so the file looked as if the step had never started."""
+    for handler in log.handlers:
+        try:
+            handler.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _install_hooks() -> None:
