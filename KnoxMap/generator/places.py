@@ -35,6 +35,17 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
+# Nominatim uses both place types and administrative-boundary records for
+# regions. The exact admin_level meaning varies by country, so it is useful for
+# a human label but not as the only test for whether a result is a region.
+REGION_ADDRESS_TYPES = {
+    "continent", "country", "state", "state_district", "province", "region",
+    "county", "municipality", "city", "city_district", "town", "borough",
+    "district", "village",
+}
+REGION_PLACE_TYPES = REGION_ADDRESS_TYPES | {"administrative"}
+MAX_OUTLINE_POINTS = 18000
+
 _lock = threading.Lock()
 _last_call = 0.0
 MIN_INTERVAL = 1.0
@@ -51,17 +62,20 @@ def _throttle() -> None:
 
 
 def search(query: str, viewbox: tuple[float, float, float, float] | None = None,
-           bounded: bool = False, limit: int = 8) -> list[dict]:
+           bounded: bool = False, limit: int = 8,
+           regions_only: bool = False) -> list[dict]:
     """Geocode `query`. viewbox is (south, west, north, east) to bias results."""
     query = (query or "").strip()
     if not query:
         return []
 
+    request_limit = 20 if regions_only else limit
     params = {
         "q": query,
         "format": "jsonv2",
-        "limit": str(max(1, min(limit, 20))),
+        "limit": str(max(1, min(request_limit, 20))),
         "addressdetails": "1",
+        "extratags": "1",
         # Real outlines for towns, districts and parks, simplified to about ten
         # metres so a city boundary does not arrive as megabytes of points.
         "polygon_geojson": "1",
@@ -86,26 +100,103 @@ def search(query: str, viewbox: tuple[float, float, float, float] | None = None,
                                         float(bb[2]), float(bb[3]))
         except (ValueError, IndexError):
             continue
+        outline = normalise_outline(item.get("geojson"))
+        category = item.get("category") or item.get("class") or ""
+        place_type = item.get("type") or ""
+        address_type = item.get("addresstype") or ""
+        extras = item.get("extratags") or {}
+        admin_level = str(extras.get("admin_level") or "")
+        is_region = _is_region(category, place_type, address_type, admin_level)
+        if regions_only and not is_region:
+            continue
         out.append({
             "name": item.get("name") or item.get("display_name", "").split(",")[0],
             "display_name": item.get("display_name", ""),
             "lat": float(item["lat"]),
             "lon": float(item["lon"]),
             "bbox": [south, west, north, east],
-            "category": item.get("category") or item.get("class") or "",
-            "type": item.get("type") or "",
-            "outline": _outline(item.get("geojson")),
+            "category": category,
+            "type": place_type,
+            "address_type": address_type,
+            "admin_level": admin_level,
+            "region": is_region,
+            "region_type": _region_type(place_type, address_type, admin_level)
+                           if is_region else "",
+            "outline": outline,
         })
-    return out
+    return out[:max(1, limit)]
 
 
-def _outline(geojson: dict | None) -> dict | None:
+def _is_region(category: str, place_type: str, address_type: str,
+               admin_level: str) -> bool:
+    """Whether a Nominatim result represents a whole named region."""
+    category = category.lower()
+    place_type = place_type.lower()
+    address_type = address_type.lower()
+    if category == "boundary" and place_type == "administrative":
+        return True
+    if address_type in REGION_ADDRESS_TYPES:
+        return True
+    return category in {"place", "boundary"} and place_type in REGION_PLACE_TYPES \
+        and bool(admin_level or place_type != "administrative")
+
+
+def _region_type(place_type: str, address_type: str, admin_level: str) -> str:
+    """A concise, internationally useful label for an OSM region."""
+    kind = (address_type or place_type).lower()
+    labels = {
+        "continent": "Continent", "country": "Country", "state": "State",
+        "province": "Province", "region": "Region", "state_district": "Region",
+        "county": "County", "municipality": "Council / municipality",
+        "city": "City", "city_district": "City district", "town": "Town",
+        "borough": "Borough", "district": "District", "village": "Village",
+    }
+    if kind in labels:
+        return labels[kind]
+    try:
+        level = int(admin_level)
+    except (TypeError, ValueError):
+        return "Administrative region"
+    if level <= 2:
+        return "Country"
+    if level <= 4:
+        return "State / region"
+    if level <= 6:
+        return "Council / county"
+    if level <= 8:
+        return "City / municipality"
+    return "Town / district"
+
+
+def _point_count(geojson: dict) -> int:
+    kind = geojson.get("type")
+    polygons = ([geojson.get("coordinates") or []] if kind == "Polygon"
+                else geojson.get("coordinates") or [])
+    return sum(len(ring) for polygon in polygons for ring in polygon)
+
+
+def normalise_outline(geojson: dict | None) -> dict | None:
     """The place's own boundary, when it has one worth drawing a map in."""
     if not geojson or geojson.get("type") not in ("Polygon", "MultiPolygon"):
         return None
-    rings = geojson["coordinates"] if geojson["type"] == "Polygon" else \
-        [r for poly in geojson["coordinates"] for r in poly]
-    if sum(len(r) for r in rings) > 20000:
+    if _point_count(geojson) > MAX_OUTLINE_POINTS:
+        # Detailed coastlines can exceed the renderer's safe request size even
+        # after Nominatim's simplification. Preserve topology while reducing
+        # detail instead of silently removing the Select region action.
+        try:
+            from shapely.geometry import mapping, shape
+            geometry = shape(geojson)
+            minx, miny, maxx, maxy = geometry.bounds
+            tolerance = max(maxx - minx, maxy - miny) / 100000
+            for _ in range(12):
+                geometry = geometry.simplify(tolerance, preserve_topology=True)
+                candidate = mapping(geometry)
+                if (candidate.get("type") in ("Polygon", "MultiPolygon")
+                        and _point_count(candidate) <= MAX_OUTLINE_POINTS):
+                    return candidate
+                tolerance *= 2
+        except (ImportError, TypeError, ValueError):
+            return None
         return None
     return geojson
 
