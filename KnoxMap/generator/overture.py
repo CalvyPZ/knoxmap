@@ -39,6 +39,7 @@ import gzip
 import json
 import math
 import os
+import sys
 import threading
 
 from .osm import OSMFeature
@@ -75,11 +76,29 @@ def available() -> bool:
 
 def why_unavailable() -> str:
     """What to tell somebody who asked for it and has not got it."""
+    if getattr(sys, "frozen", False):
+        return ("Filling gaps from Overture Maps needs DuckDB, and this copy "
+                "of KnoxMap was built without it. Everything else works "
+                "without it.")
     return ("Filling gaps from Overture Maps needs DuckDB, which reads the "
             "map data where Overture publishes it. Install it with "
             "'.venv/bin/python -m pip install duckdb' (or "
             '".venv\\Scripts\\python -m pip install duckdb" on Windows) and '
             "start KnoxMap again. Everything else works without it.")
+
+
+def _extension_dir() -> str:
+    """Where DuckDB may download httpfs and spatial.
+
+    A packaged program cannot write beside its own file. The map folder's
+    cache can, and a later generate reuses the extensions it already fetched.
+    """
+    home = os.environ.get("KNOXMAP_HOME")
+    if not home:
+        home = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.abspath(os.path.join(home, "cache", "duckdb"))
+    os.makedirs(path, exist_ok=True)
+    return path.replace("\\", "/").replace("'", "''")
 
 
 def release() -> str:
@@ -142,6 +161,7 @@ def fetch(south: float, west: float, north: float, east: float,
     import duckdb
 
     con = duckdb.connect()
+    con.execute(f"SET extension_directory='{_extension_dir()}';")
     con.execute("INSTALL httpfs; LOAD httpfs; INSTALL spatial; LOAD spatial;")
     con.execute(f"SET s3_region='{REGION}';")
 

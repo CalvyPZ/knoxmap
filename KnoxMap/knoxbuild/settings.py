@@ -71,10 +71,10 @@ class Settings:
     # machine-detected roofprints under the same licence, and where OSM is
     # blank they are the difference between a town and a few streets.
     #
-    # Off by default, because where OSM is complete this adds sheds and costs
-    # a few minutes: measured over the same size of box, 60 buildings in
-    # Gifhorn against 761 in Urgup. Needs DuckDB installed.
-    fill_gaps: int = 0
+    # On by default. Where OSM is complete this adds sheds and costs a few
+    # minutes: measured over the same size of box, 60 buildings in Gifhorn
+    # against 761 in Urgup. Needs DuckDB installed.
+    fill_gaps: int = 1
     # Put one military rifle somewhere on the map, come what may. A real town
     # has no army checkpoint in it, so the game's rifles - which spawn from
     # army and police loot - may have nowhere at all to appear.

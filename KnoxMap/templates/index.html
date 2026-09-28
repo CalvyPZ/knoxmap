@@ -3,6 +3,19 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<script>
+(function () {
+  function apply() {
+    var theme = 'dark';
+    try { if (localStorage.getItem('knoxmap.base') === 'streets') theme = 'light'; } catch (e) {}
+    document.documentElement.setAttribute('data-theme', theme);
+  }
+  apply();
+  window.addEventListener('storage', function (e) {
+    if (e.key === 'knoxmap.base') apply();
+  });
+})();
+</script>
 <title>KnoxMap {{ version }}</title>
 <link rel="icon" type="image/svg+xml" href="/static/logo.svg"/>
 <!-- The map library is bundled in static/vendor (see LICENSES.md), so the
@@ -10,45 +23,9 @@
 <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css"/>
 <link rel="stylesheet" href="/static/vendor/leaflet-draw/leaflet.draw.css"/>
 <link rel="stylesheet" href="/static/css/app.css"/>
+<link rel="stylesheet" href="/static/css/edit.css"/>
 </head>
 <body data-in-window="{{ 1 if in_window else 0 }}" data-shell="{{ shell }}">
-
-<header class="topbar">
-  <span class="version-wrap">
-    <button type="button" class="version" id="appVersion" aria-haspopup="true" aria-expanded="false"
-            title="The KnoxMap version you are running. Click to choose another"
-            >v{{ version }}<span class="version-dot" id="versionDot" hidden
-             title="A newer KnoxMap is out"></span></button>
-    <div id="versionMenu" class="version-menu" role="dialog" aria-label="KnoxMap versions" hidden>
-      <div class="version-menu-head">
-        <b>KnoxMap versions</b>
-        <button type="button" class="version-menu-close" aria-label="Close">&times;</button>
-      </div>
-      <p class="hint">Any release from GitHub. The one you pick downloads now and goes in
-        when KnoxMap restarts; your maps and settings stay.</p>
-      <div id="versionNote" class="hint"></div>
-      <ul id="versionList" class="version-list"><li class="hint">Asking GitHub…</li></ul>
-    </div>
-  </span>
-  <span class="credits-wrap">
-    <button type="button" class="credits" id="creditsBtn" aria-haspopup="true" aria-expanded="false">Credits</button>
-    <div id="creditsMenu" class="version-menu" role="dialog" aria-label="Credits" hidden>
-      <div class="version-menu-head">
-        <b>Credits</b>
-        <button type="button" class="version-menu-close" aria-label="Close">&times;</button>
-      </div>
-      <p class="hint">People who made KnoxMap.</p>
-      <ul class="version-list credits-list">
-        <li><a href="https://github.com/spytheeuclidean-a11y" target="_blank" rel="noopener">Euclid80tr (spytheeuclidean-a11y)</a></li>
-        <li><a href="https://github.com/arytek" target="_blank" rel="noopener">Aryan N (arytek)</a></li>
-      </ul>
-    </div>
-  </span>
-  <span class="byline"><a class="discord" href="https://discord.gg/ePM8dSxPm7" target="_blank" rel="noopener" aria-label="Discord" title="Discord"><svg viewBox="0 0 59 44" aria-hidden="true" focusable="false"><path fill="#5865F2" d="M37.1937 0C36.6265 1.0071 36.1172 2.04893 35.6541 3.11392C31.2553 2.45409 26.7754 2.45409 22.365 3.11392C21.9136 2.04893 21.3926 1.0071 20.8254 0C16.6928 0.70613 12.6644 1.94475 8.84436 3.69271C1.27372 14.9098 -0.775214 25.8374 0.243466 36.6146C4.67704 39.8906 9.6431 42.391 14.9333 43.9884C16.1256 42.391 17.179 40.6893 18.0819 38.9182C16.3687 38.2815 14.7133 37.4828 13.1274 36.5567C13.5442 36.2557 13.9493 35.9432 14.3429 35.6422C23.6384 40.0179 34.4039 40.0179 43.711 35.6422C44.1046 35.9663 44.5097 36.2789 44.9264 36.5567C43.3405 37.4943 41.6852 38.2815 39.9604 38.9298C40.8633 40.7009 41.9167 42.4025 43.109 44C48.3992 42.4025 53.3653 39.9137 57.7988 36.6377C59.0027 24.1358 55.7383 13.3007 49.1748 3.70429C45.3663 1.95633 41.3379 0.717706 37.2053 0.0231518L37.1937 0ZM19.3784 29.9816C16.5192 29.9816 14.1461 27.3886 14.1461 24.1821C14.1461 20.9755 16.4266 18.371 19.3669 18.371C22.3071 18.371 24.6455 20.9871 24.5992 24.1821C24.5529 27.377 22.2956 29.9816 19.3784 29.9816ZM38.6639 29.9816C35.7931 29.9816 33.4431 27.3886 33.4431 24.1821C33.4431 20.9755 35.7236 18.371 38.6639 18.371C41.6042 18.371 43.9309 20.9871 43.8846 24.1821C43.8383 27.377 41.581 29.9816 38.6639 29.9816Z"/></svg></a> &middot; <a href="#" id="reportLink">report a problem</a></span>
-  <div id="language" class="language" data-no-translate
-       title="The window's language. Copy lang/english.txt, translate it and name it after your language" hidden></div>
-  <span id="updateNote" class="update-note" hidden></span>
-</header>
 
 <main>
   <section id="map-pane">
@@ -56,22 +33,26 @@
       <div class="search-field">
         <input id="searchInput" type="search" autocomplete="off"
                placeholder="Search for a place" />
-        <label class="search-scope">
-          <input type="checkbox" id="searchHere" />
-          <span>Within view</span>
-        </label>
+      </div>
+      <div class="search-mode" role="radiogroup" aria-label="Search type">
+        <button type="button" class="is-on" data-search-mode="place"
+                role="radio" aria-checked="true">Place</button>
+        <button type="button" data-search-mode="region"
+                role="radio" aria-checked="false">Region border</button>
       </div>
       <ul id="search-results" hidden></ul>
     </div>
 
     <div id="map-tools">
-      <div id="basemaps" role="radiogroup" aria-label="Basemap">
+      <div id="basemaps" role="radiogroup" aria-label="Theme">
         <button type="button" data-base="dark" class="is-on">Dark</button>
         <button type="button" data-base="streets">Light</button>
       </div>
     </div>
 
     <div id="map"></div>
+    <div id="paint-map"></div>
+    <div id="edit-map"></div>
 
     <div id="gen-overlay" hidden>
       <div class="gen-box">
@@ -79,52 +60,74 @@
         <div id="gen-stage">Contacting OpenStreetMap…</div>
         <div id="gen-detail"></div>
         <div class="bar"><div id="gen-bar" class="bar-fill"></div></div>
-        <div class="gen-elapsed"><span id="gen-clock">0:00</span></div>
+        <div class="gen-elapsed"><span id="gen-clock">0:00</span> <span id="gen-elapsed-word" hidden>elapsed</span></div>
         <button id="stopOverlayBtn" class="btn btn-small btn-stop" data-stop>Stop</button>
       </div>
     </div>
   </section>
 
-  <aside id="controls">
-    <div class="side-step">
-      <button type="button" id="sidePrev" class="btn" disabled>Previous</button>
-      <button type="button" id="sideNext" class="btn">Next</button>
+  <aside id="controls" class="is-home">
+    <div class="side-meta">
+      <span class="version-wrap">
+        <button type="button" class="version" id="appVersion" aria-haspopup="true" aria-expanded="false"
+                title="The KnoxMap version you are running. Click to choose another"
+                >v{{ version }}<span class="version-dot" id="versionDot"></span></button>
+        <div id="versionMenu" class="version-menu" role="dialog" aria-label="KnoxMap versions" hidden>
+          <div class="version-menu-head">
+            <b>KnoxMap versions</b>
+            <button type="button" class="version-menu-close" aria-label="Close">&times;</button>
+          </div>
+          <p class="hint">Any release from GitHub. The one you pick downloads now and goes in
+            when KnoxMap restarts; your maps and settings stay.</p>
+          <div id="versionNote" class="hint"></div>
+          <ul id="versionList" class="version-list"><li class="hint">Asking GitHub…</li></ul>
+        </div>
+      </span>
+      <a class="discord issues" href="https://discord.gg/ePM8dSxPm7" target="_blank" rel="noopener" title="Help"><svg viewBox="0 0 59 44" aria-hidden="true" focusable="false"><path fill="#5865F2" d="M37.1937 0C36.6265 1.0071 36.1172 2.04893 35.6541 3.11392C31.2553 2.45409 26.7754 2.45409 22.365 3.11392C21.9136 2.04893 21.3926 1.0071 20.8254 0C16.6928 0.70613 12.6644 1.94475 8.84436 3.69271C1.27372 14.9098 -0.775214 25.8374 0.243466 36.6146C4.67704 39.8906 9.6431 42.391 14.9333 43.9884C16.1256 42.391 17.179 40.6893 18.0819 38.9182C16.3687 38.2815 14.7133 37.4828 13.1274 36.5567C13.5442 36.2557 13.9493 35.9432 14.3429 35.6422C23.6384 40.0179 34.4039 40.0179 43.711 35.6422C44.1046 35.9663 44.5097 36.2789 44.9264 36.5567C43.3405 37.4943 41.6852 38.2815 39.9604 38.9298C40.8633 40.7009 41.9167 42.4025 43.109 44C48.3992 42.4025 53.3653 39.9137 57.7988 36.6377C59.0027 24.1358 55.7383 13.3007 49.1748 3.70429C45.3663 1.95633 41.3379 0.717706 37.2053 0.0231518L37.1937 0ZM19.3784 29.9816C16.5192 29.9816 14.1461 27.3886 14.1461 24.1821C14.1461 20.9755 16.4266 18.371 19.3669 18.371C22.3071 18.371 24.6455 20.9871 24.5992 24.1821C24.5529 27.377 22.2956 29.9816 19.3784 29.9816ZM38.6639 29.9816C35.7931 29.9816 33.4431 27.3886 33.4431 24.1821C33.4431 20.9755 35.7236 18.371 38.6639 18.371C41.6042 18.371 43.9309 20.9871 43.8846 24.1821C43.8383 27.377 41.581 29.9816 38.6639 29.9816Z"/></svg><span>Help</span></a>
+      <span class="byline"><a class="issues" href="https://github.com/spytheeuclidean-a11y/knoxmap/issues" target="_blank" rel="noopener" title="Bug Reports"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>Bug Reports</span></a></span>
+      <div class="settings-wrap" id="settingsWrap">
+        <button type="button" class="settings-btn" id="settingsBtn" aria-haspopup="true" aria-label="Settings" title="Settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" fill-rule="evenodd" d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7.2 7.2 0 0 0-1.69-.98l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84a.48.48 0 0 0-.47.41l-.36 2.54c-.61.25-1.17.59-1.69.98l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.52.4 1.08.73 1.69.98l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.61-.25 1.17-.59 1.69-.98l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58zM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2z"/></svg>
+        </button>
+        <div class="settings-menu" id="settingsMenu">
+          <div id="language" class="language" data-no-translate
+               title="The window's language. Copy lang/english.txt, translate it and name it after your language" hidden></div>
+          <span class="credits-wrap">
+            <button type="button" class="credits" id="creditsBtn" aria-haspopup="true" aria-expanded="false">Credits</button>
+            <div id="creditsMenu" class="version-menu" role="dialog" aria-label="Credits" hidden>
+              <div class="version-menu-head">
+                <b>Credits</b>
+                <button type="button" class="version-menu-close" aria-label="Close">&times;</button>
+              </div>
+              <p class="hint">People who made KnoxMap.</p>
+              <ul class="version-list credits-list">
+                <li><a href="https://github.com/spytheeuclidean-a11y" target="_blank" rel="noopener">Euclid80tr (spytheeuclidean-a11y)</a></li>
+                <li><a href="https://github.com/arytek" target="_blank" rel="noopener">Aryan N (arytek)</a></li>
+                <li><a href="https://github.com/CalvyPZ" target="_blank" rel="noopener">CalvyPZ</a></li>
+              </ul>
+            </div>
+          </span>
+          <button type="button" class="clear-cache" id="clearCacheBtn">Clear cache</button>
+        </div>
+      </div>
+      <span id="updateNote" class="update-note" hidden></span>
     </div>
-    <div class="side-shell has-sub">
-    <div class="side-tabs" role="tablist" aria-label="Sidebar">
-      <button type="button" class="side-tab is-on" role="tab" id="tabSetup"
-              data-master="setup" aria-selected="true" aria-controls="subSetup">Setup</button>
-      <button type="button" class="side-tab" role="tab" id="tabMap"
-              data-master="map" aria-selected="false" aria-controls="subMap" tabindex="-1">Map</button>
-      <button type="button" class="side-tab" role="tab" id="tabBuild"
-              data-master="build" aria-selected="false" aria-controls="subBuild" tabindex="-1">Build</button>
+    <div id="sideHome" class="side-home">
+      <div class="side-home-actions" id="sideHomeActions" hidden>
+        <button type="button" id="newMapBtn" class="btn">New map</button>
+        <button type="button" id="loadMapBtn" class="btn">Load map</button>
+      </div>
+      <div class="side-home-setup" id="sideHomeSetup" role="status" hidden>
+        <div class="setup-spinner" aria-hidden="true"></div>
+        <p class="setup-spinner-title">Performing first time setup</p>
+        <p class="setup-spinner-count" id="setupStepCount" aria-live="polite">0 of 5 steps complete</p>
+      </div>
     </div>
-
-    <div class="side-subtabs" role="tablist" id="subSetup" data-master="setup" aria-label="Setup">
-      <button type="button" class="side-subtab is-on" role="tab" data-tab="game"
-              aria-selected="true" aria-controls="tabPanelGame">Game</button>
-      <button type="button" class="side-subtab" role="tab" data-tab="mod"
-              aria-selected="false" aria-controls="tabPanelMod" tabindex="-1">Mod</button>
-    </div>
-    <div class="side-subtabs" role="tablist" id="subMap" data-master="map" aria-label="Map" hidden>
-      <button type="button" class="side-subtab is-on" role="tab" data-tab="area"
-              aria-selected="true" aria-controls="tabPanelArea">Area</button>
-      <button type="button" class="side-subtab" role="tab" data-tab="advanced"
-              aria-selected="false" aria-controls="tabPanelAdvanced" tabindex="-1">Advanced</button>
-    </div>
-    <div class="side-subtabs" role="tablist" id="subBuild" data-master="build" aria-label="Build" hidden>
-      <button type="button" class="side-subtab is-on" role="tab" data-tab="generate"
-              aria-selected="true" aria-controls="tabPanelGenerate">Generate</button>
-      <button type="button" class="side-subtab" role="tab" data-tab="build"
-              aria-selected="false" aria-controls="tabPanelBuild" tabindex="-1">Build</button>
-      <button type="button" class="side-subtab" role="tab" data-tab="edit"
-              aria-selected="false" aria-controls="tabPanelEdit" tabindex="-1">Edit</button>
-      <button type="button" class="side-subtab" role="tab" data-tab="export"
-              aria-selected="false" aria-controls="tabPanelExport" tabindex="-1">Export</button>
-    </div>
+    <div class="side-shell">
+    <p class="side-section" id="sideSection">Config</p>
 
     <div class="side-scroll">
-      <div class="side-panel" role="tabpanel" id="tabPanelGame" data-master="setup" data-tab="game">
+      <div class="side-panel" role="tabpanel" id="tabPanelGame" data-master="setup">
         <section class="setup-card" id="setupCard" hidden>
           <h2>Setup isn't finished</h2>
           <p id="setupLead" hidden>Getting the map compiler ready. This happens once.</p>
@@ -133,53 +136,58 @@
 
         <section id="steamLibraries">
           <h2>Game location</h2>
-          <p class="hint">The install is the folder that contains the Project Zomboid jar.</p>
-          <div class="location-choice" role="radiogroup" aria-label="Game location">
-            <label class="location-option">
-              <input type="radio" name="gameLocation" id="gameAuto" value="auto" checked>
-              Detect automatically
-            </label>
-            <label class="location-option">
-              <input type="radio" name="gameLocation" id="gameManual" value="manual">
-              Choose a folder
-            </label>
-          </div>
-          <div id="gameBrowseRow" hidden>
+          <p class="hint">The folder where projectzomboid.jar lives.</p>
+          <div class="game-location-row">
             <button type="button" id="gameBrowse" class="btn">Browse…</button>
-            <div id="gamePath" class="hint"></div>
-            <div id="gameJar" class="hint"></div>
+            <input type="text" id="gamePath" readonly aria-label="Game location">
           </div>
           <div id="steamNote" class="hint"></div>
-        </section>
-      </div>
-
-      <div class="side-panel" role="tabpanel" id="tabPanelMod" data-master="setup" data-tab="mod" hidden>
-        <section id="mapsCard" hidden>
-          <details id="mapsPanel">
-            <summary>Your maps <span class="count" id="mapsCount"></span></summary>
-            <p class="hint">Maps already in this folder. Open one to build, compile or install
-              it again without drawing it afresh.</p>
-            <ul class="map-list" id="mapList"></ul>
-          </details>
         </section>
 
         <section>
           <h2>Settings</h2>
-          <label class="field">Map name
+          <label class="field">Project Name
             <input type="text" id="mapName" value="" placeholder="leave blank for an automatic name"/>
           </label>
-          <label class="field">Scale per tile
-            <select id="metersPerTile">
-              <option value="0.5">0.5 m per tile (small areas)</option>
-              <option value="1.0" selected>1 m per tile (recommended)</option>
-              <option value="2.0">2 m per tile</option>
-              <option value="3.0">3 m per tile</option>
-              <option value="4.0">4 m per tile</option>
-              <option value="6.0">6 m per tile</option>
-              <option value="8.0">8 m per tile (whole regions)</option>
-            </select>
+          <label class="field">Mod name
+            <input type="text" id="mapTitle"/>
           </label>
+          <label class="field">Mod id
+            <input type="text" id="modId"/>
+          </label>
+          <div class="field-label">Scale per tile</div>
+          <div class="preset-cards" id="scaleCards" role="radiogroup" aria-label="Scale per tile">
+            <button type="button" class="preset-card" data-scale="0.5" role="radio" aria-checked="false">0.5m2</button>
+            <button type="button" class="preset-card is-on" data-scale="1" role="radio" aria-checked="true">1m2</button>
+            <button type="button" class="preset-card" data-scale="2" role="radio" aria-checked="false">2m2</button>
+            <button type="button" class="preset-card" data-scale="3" role="radio" aria-checked="false">3m2</button>
+            <button type="button" class="preset-card" data-scale="4" role="radio" aria-checked="false">4m2</button>
+            <button type="button" class="preset-card" data-scale="6" role="radio" aria-checked="false">6m2</button>
+            <button type="button" class="preset-card" data-scale="8" role="radio" aria-checked="false">8m2</button>
+            <button type="button" class="preset-card" data-scale="10" role="radio" aria-checked="false">10m2</button>
+          </div>
+          <select id="metersPerTile" hidden>
+            <option value="0.5">0.5m2</option>
+            <option value="1" selected>1m2</option>
+            <option value="2">2m2</option>
+            <option value="3">3m2</option>
+            <option value="4">4m2</option>
+            <option value="6">6m2</option>
+            <option value="8">8m2</option>
+            <option value="10">10m2</option>
+          </select>
+        </section>
+      </div>
 
+      <div class="side-panel" role="tabpanel" id="tabPanelArea" data-master="map" hidden>
+        <section>
+          <div class="coords" hidden>
+            <label>S <input type="number" step="0.000001" id="south" readonly></label>
+            <label>W <input type="number" step="0.000001" id="west"  readonly></label>
+            <label>N <input type="number" step="0.000001" id="north" readonly></label>
+            <label>E <input type="number" step="0.000001" id="east"  readonly></label>
+          </div>
+          <div id="area-stats" hidden></div>
           <div class="field-label">Default Population</div>
           <div class="preset-cards" id="presetCards" role="radiogroup" aria-label="Default Population">
             <button type="button" class="preset-card is-on" data-preset="town" role="radio" aria-checked="true">Town</button>
@@ -193,38 +201,12 @@
             <option value="city">City</option>
             <option value="rural">Rural</option>
           </select>
-        </section>
-      </div>
-
-      <div class="side-panel" role="tabpanel" id="tabPanelArea" data-master="map" data-tab="area" hidden>
-        <section>
-          <button type="button" id="vanillaOverlayBtn" class="btn" aria-pressed="false"
-                  title="Show the base game's Knox County map, centred on this view, so you can judge how big an area to draw. It follows the scale setting. Drag it to move it.">Overlay Vanilla Map</button>
-          <div id="vanillaNote" class="hint"></div>
-          <div class="coords" hidden>
-            <label>S <input type="number" step="0.000001" id="south" readonly></label>
-            <label>W <input type="number" step="0.000001" id="west"  readonly></label>
-            <label>N <input type="number" step="0.000001" id="north" readonly></label>
-            <label>E <input type="number" step="0.000001" id="east"  readonly></label>
-          </div>
-          <div id="area-layers">
-            <div class="empty-state">Nothing selected yet.</div>
-          </div>
-          <div id="area-stats" hidden></div>
           <div class="area-toggles">
-            <label class="toggle">
-              <input type="checkbox" id="fillGaps" data-key="fill_gaps">
-              <span class="toggle-track" aria-hidden="true"></span>
-              <span class="toggle-copy">
-                <span class="toggle-name">Add missing buildings</span>
-                <span class="toggle-hint">Fills in buildings that were not drawn on the source map. Useful where a town is only half mapped. Where the map is already complete it mostly adds sheds. Optional, and slower.</span>
-              </span>
-            </label>
             <label class="toggle">
               <input type="checkbox" id="seedRandom">
               <span class="toggle-track" aria-hidden="true"></span>
               <span class="toggle-copy">
-                <span class="toggle-name">Randomise seed</span>
+                <span class="toggle-name">Set seed</span>
                 <span class="toggle-hint">Same seed and area gives the same town again.</span>
               </span>
             </label>
@@ -240,66 +222,77 @@
               </span>
             </label>
             <label class="toggle">
+              <input type="checkbox" id="fillGaps" data-key="fill_gaps" checked>
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Add missing buildings</span>
+                <span class="toggle-hint">Fills in areas of the map which are missing OSM data.</span>
+              </span>
+            </label>
+            <label class="toggle">
               <input type="checkbox" id="guaranteedRifle" data-key="guaranteed_rifle" checked>
               <span class="toggle-track" aria-hidden="true"></span>
               <span class="toggle-copy">
                 <span class="toggle-name">Guaranteed rifle</span>
-                <span class="toggle-hint">Leaves one military rifle on the map: in an army building if there is one, otherwise the police station, a gun shop, or a house on the edge of town. A real town has no checkpoints for one to spawn in.</span>
+                <span class="toggle-hint">Guarantees that a rifle can spawn on the map.</span>
               </span>
             </label>
           </div>
-          <div id="landmark-panel">
-            <button id="landmarksBtn" class="btn" disabled>List named places in the area</button>
-            <div id="landmark-results"></div>
-          </div>
         </section>
-      </div>
-
-      <div class="side-panel" role="tabpanel" id="tabPanelAdvanced" data-master="map" data-tab="advanced" hidden>
-        <section id="advanced">
-          <div class="advanced-head">
-            <h2>More settings</h2>
-            <button type="button" id="resetSettings" class="icon-btn" title="Reset" aria-label="Reset">
-              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-                <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
-                      d="M13.2 8a5.2 5.2 0 1 1-1.5-3.6"/>
-                <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
-                      d="M13.2 2.6V5.4H10.4"/>
-              </svg>
-            </button>
-          </div>
+        <details class="advanced-fold" id="advanced">
+          <summary>
+            <span class="advanced-head">
+              <h2>Advanced settings</h2>
+              <button type="button" id="resetSettings" class="icon-btn" title="Reset" aria-label="Reset">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                  <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                        d="M13.2 8a5.2 5.2 0 1 1-1.5-3.6"/>
+                  <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                        d="M13.2 2.6V5.4H10.4"/>
+                </svg>
+              </button>
+            </span>
+          </summary>
           <div id="advanced-body">
             <!-- Filled from /api/settings so the page never holds a second,
                  drifting copy of the limits. -->
           </div>
-        </section>
+        </details>
       </div>
 
       <div class="side-panel" role="tabpanel" id="tabPanelGenerate" data-master="build" data-tab="generate" hidden>
         <section>
+          <div class="area-toggles" id="generateOptions">
+            <label class="toggle">
+              <input type="checkbox" id="genBuildings" checked>
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Buildings</span>
+                <span class="toggle-hint">Generate and furnish buildings after drawing the map.</span>
+              </span>
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="genPaperMap" checked>
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Paper map</span>
+                <span class="toggle-hint">Add roads, buildings and place names to the in-game map.</span>
+              </span>
+            </label>
+          </div>
           <button id="generateBtn" class="btn btn-primary" disabled>Generate map</button>
           <div id="status"></div>
-          <p id="downloadEmpty" class="hint">Nothing to download yet. Generate a map first.</p>
-          <div id="downloadReady" hidden>
-            <a id="downloadAll" class="btn" download>Download everything (.zip)</a>
-            <div id="saveNote" class="hint"></div>
-            <button id="makePictures" class="btn" type="button" hidden>Draw a picture of it</button>
-            <div id="pictureNote" class="hint"></div>
-            <div id="pictureShots" class="shots" hidden></div>
-            <details id="downloads-details">
-              <summary>Single files</summary>
-              <ul id="downloads"></ul>
-            </details>
-          </div>
         </section>
-      </div>
-
-      <div class="side-panel" role="tabpanel" id="tabPanelBuild" data-master="build" data-tab="build" hidden>
         <div class="pipe-card" data-step="buildings">
           <div class="pipe-body">
             <div class="pipe-title">Buildings</div>
             <span id="buildingsNote" class="step-note">Makes a furnished building for every footprint.</span>
-            <div class="bar bar-indet"><div class="bar-fill"></div></div>
+            <div class="building-legend" aria-label="Building generation colours">
+              <span><i class="pending"></i>Waiting</span>
+              <span><i class="active"></i>Building</span>
+              <span><i class="complete"></i>Complete</span>
+            </div>
+            <div class="bar bar-indet" id="buildingsMeter"><div id="buildingsBar" class="bar-fill"></div></div>
             <div id="census" class="census" hidden>
               <div class="census-head">Population</div>
               <div class="tiles census-tiles" id="censusTiles"></div>
@@ -311,68 +304,276 @@
               </div>
             </div>
           </div>
-          <button id="buildingsBtn" class="btn">Build</button>
           <button class="btn btn-small btn-stop" data-stop hidden>Stop</button>
+        </div>
+        <div id="genOverlays" class="gen-overlays" hidden>
+          <div class="field-label">Overlays</div>
+          <label class="toggle">
+            <input type="checkbox" id="ovBuildings" disabled>
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-copy">
+              <span class="toggle-name">Show Buildings</span>
+              <span class="toggle-hint">Red footprints for buildings as each one is finished.</span>
+            </span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="ovBiomes">
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-copy">
+              <span class="toggle-name">Show Biomes</span>
+              <span class="toggle-hint">Biome colours, and the foraging zone that goes with each one.</span>
+            </span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="ovZones">
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-copy">
+              <span class="toggle-name">Show Zoning</span>
+              <span class="toggle-hint">Residential, commercial, medical, park and the other mapped areas.</span>
+            </span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="ovStreets">
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span class="toggle-copy">
+              <span class="toggle-name">Show Streets</span>
+              <span class="toggle-hint">Colour by street type, thickness by width, and the street name.</span>
+            </span>
+          </label>
+          <div id="genOverlayLegend" class="gen-overlay-legend" hidden></div>
         </div>
       </div>
 
-      <div class="side-panel" role="tabpanel" id="tabPanelEdit" data-master="build" data-tab="edit" hidden>
-        <section>
-          <p class="hint">Editing tools will go here.</p>
+      <div class="side-panel" role="tabpanel" id="tabPanelEdit" data-master="edit" hidden>
+        <section id="editPanel">
+          <p id="editEmpty" class="hint">Generate or open a map first.</p>
+          <p id="editError" class="hint bad" hidden></p>
+          <div id="editTools" hidden>
+            <p id="editStable" class="hint" hidden>Re-generate this map to keep edits across a new generate.</p>
+            <p id="editNoPieces" class="hint" hidden>This map has no pieces to edit.</p>
+            <div class="field-label">Layers</div>
+            <div class="edit-layers" id="editLayers">
+              <label class="edit-layer"><input type="checkbox" data-layer="buildings" checked><span>Buildings</span></label>
+              <label class="edit-layer"><input type="checkbox" data-layer="areas" checked><span>Areas</span></label>
+              <label class="edit-layer"><input type="checkbox" data-layer="roads" checked><span>Roads</span></label>
+              <label class="edit-layer"><input type="checkbox" data-layer="fences" checked><span>Fences</span></label>
+              <label class="edit-layer"><input type="checkbox" data-layer="places" checked><span>Places</span></label>
+              <label class="edit-layer"><input type="checkbox" id="editLayerGrid" checked><span>Cell grid</span></label>
+              <label class="edit-layer"><input type="checkbox" id="editLayerTerrain" checked><span>Terrain</span></label>
+            </div>
+            <label class="field edit-opacity">
+              <span>Terrain opacity</span>
+              <input id="editOpacity" type="range" min="0" max="1" step="0.05" value="0.85">
+            </label>
+            <p class="edit-readout hint">
+              <span>Tile</span> <b id="editTileX">—</b>, <b id="editTileY">—</b>
+              <span>Cell</span> <b id="editCellX">—</b>, <b id="editCellY">—</b>
+            </p>
+            <p id="editDrawHint" class="hint" hidden>Drag a rectangle on the map.</p>
+
+            <div id="editInspector" hidden>
+              <label class="field" data-for="building area road place">
+                <span>Name</span>
+                <input id="editName" type="text" autocomplete="off">
+              </label>
+              <label class="field" data-for="building">
+                <span>Kind</span>
+                <select id="editKind"></select>
+              </label>
+              <label class="field" data-for="building">
+                <span>Levels</span>
+                <input id="editLevels" type="number" min="1" max="30" step="1">
+              </label>
+              <label class="field" data-for="building">
+                <span>Style</span>
+                <select id="editStyle"></select>
+              </label>
+              <label class="field" data-for="building">
+                <span>Seed</span>
+                <input id="editSeed" type="number" min="1" max="9999" step="1">
+              </label>
+              <div class="edit-nudge" data-for="building">
+                <span class="field-label">Nudge</span>
+                <button type="button" class="btn btn-small" id="editNudgeXm">Offset x -1</button>
+                <button type="button" class="btn btn-small" id="editNudgeXp">Offset x +1</button>
+                <button type="button" class="btn btn-small" id="editNudgeYm">Offset y -1</button>
+                <button type="button" class="btn btn-small" id="editNudgeYp">Offset y +1</button>
+                <span id="editOffset" class="edit-offset">0, 0</span>
+              </div>
+              <p class="edit-meta hint" id="editMeta" data-for="building" hidden>
+                <span>Rooms</span> <b id="editRooms"></b>
+                <span>Furniture</span> <b id="editFurniture"></b>
+                <span>File</span> <b id="editFile"></b>
+                <span>Tile</span> <b id="editPlaceTile"></b>
+                <span>Cell</span> <b id="editPlaceCell"></b>
+              </p>
+              <label class="field" data-for="area">
+                <span>Category</span>
+                <select id="editCategory"></select>
+              </label>
+              <label class="edit-check" id="editRenameWrap" data-for="road">
+                <input type="checkbox" id="editRenameAll">
+                <span>Rename every segment</span>
+              </label>
+              <label class="field" data-for="place">
+                <span>Population</span>
+                <input id="editPopulation" type="number" min="0" step="1">
+              </label>
+              <div class="edit-actions">
+                <button type="button" class="btn btn-small" id="editSave" data-for="building area road place">Save change</button>
+                <button type="button" class="btn btn-small" id="editDelete" data-for="building area">Delete</button>
+                <button type="button" class="btn btn-small" id="editHide" data-for="place road">Hide</button>
+              </div>
+            </div>
+
+            <div id="editBulk" hidden>
+              <label class="field" id="editBulkKindWrap">
+                <span>Kind</span>
+                <select id="editBulkKind"></select>
+              </label>
+              <label class="field" id="editBulkCatWrap">
+                <span>Category</span>
+                <select id="editBulkCategory"></select>
+              </label>
+              <div class="edit-actions">
+                <button type="button" class="btn btn-small" id="editBulkApply">Apply to selection</button>
+                <button type="button" class="btn btn-small" id="editBulkDelete">Delete</button>
+                <button type="button" class="btn btn-small" id="editBulkReroll">Re-roll interiors</button>
+              </div>
+            </div>
+
+            <div class="field-label">Pending changes</div>
+            <p id="editPendingEmpty" class="hint">No pending changes.</p>
+            <ul id="editPending" class="edit-pending"></ul>
+            <button type="button" id="editRevertAll" class="btn btn-small" disabled>Revert all</button>
+
+            <div class="field-label">Region</div>
+            <label class="field">
+              <span>Category</span>
+              <select id="editZoneCategory"></select>
+            </label>
+            <label class="field">
+              <span>Area name</span>
+              <input id="editAreaName" type="text" autocomplete="off">
+            </label>
+            <div class="edit-actions">
+              <button type="button" class="btn btn-small" id="editReroll" aria-pressed="false">Re-roll interiors</button>
+              <button type="button" class="btn btn-small" id="editRebuild" aria-pressed="false">Rebuild area</button>
+              <button type="button" class="btn btn-small" id="editZone" aria-pressed="false">Set zoning</button>
+              <button type="button" class="btn btn-small" id="editDrawArea" aria-pressed="false">Draw zoning area</button>
+              <button type="button" class="btn btn-small" id="editSelectRect" aria-pressed="false">Select in rectangle</button>
+            </div>
+            <div id="editStageNotes"></div>
+            <p id="editApplyStatus" class="hint"></p>
+            <button type="button" id="editApply" class="btn btn-primary" disabled>Apply</button>
+          </div>
         </section>
       </div>
 
-      <div class="side-panel" role="tabpanel" id="tabPanelExport" data-master="build" data-tab="export" hidden>
-        <div class="pipe-card" data-step="compile">
-          <div class="pipe-body">
-            <div class="pipe-title">Compile</div>
-            <span id="compileNote" class="step-note">Turns the map into the game's files with WorldEd.
-              Takes a few minutes.</span>
-            <div class="bar"><div id="compileBar" class="bar-fill"></div></div>
-            <button id="retryCellsBtn" class="btn btn-small" hidden>Compile the cells that failed</button>
-            <details class="manual-fallback">
-              <summary>Or do it yourself in WorldEd</summary>
-              <button id="worldedBtn" class="btn btn-small" disabled>Open in WorldEd</button>
-              <span id="worldedNote" class="step-note">Then
-                <b>File → BMP To TMX → All Cells…</b> and
-                <b>File → Generate Lots 8x8 → All Cells…</b></span>
-            </details>
-          </div>
-          <button id="compileBtn" class="btn" disabled>Compile</button>
-          <button class="btn btn-small btn-stop" data-stop hidden>Stop</button>
-        </div>
-        <div class="pipe-card" data-step="install">
-          <div class="pipe-body">
-            <div class="pipe-title">Install</div>
-            <div class="install-row">
-              <label>Name in game <input type="text" id="mapTitle"/></label>
-              <label>Mod id <input type="text" id="modId"/></label>
+      <div class="side-panel" role="tabpanel" id="tabPanelExport" data-master="export" hidden>
+        <section>
+          <div id="downloadReady" hidden>
+            <figure class="preview-frame">
+              <a id="previewLink" target="_blank"><img id="previewImg" alt="Map preview"/></a>
+              <figcaption>Preview</figcaption>
+            </figure>
+            <p class="export-map-title">Map: <span class="ph map-badge">—</span></p>
+            <div id="upgradeNote" class="upgrade-note" hidden></div>
+            <div id="results-info"></div>
+            <div id="saveNote" class="hint"></div>
+            <div class="area-toggles" id="pictureOptions" hidden>
+              <label class="toggle">
+                <input type="checkbox" value="town" checked>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-copy">
+                  <span class="toggle-name">The whole map</span>
+                  <span class="toggle-hint">One picture of the entire map.</span>
+                </span>
+              </label>
+              <label class="toggle">
+                <input type="checkbox" value="close" checked>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-copy">
+                  <span class="toggle-name">Close up</span>
+                  <span class="toggle-hint">The middle of the map, close enough to see.</span>
+                </span>
+              </label>
+              <label class="toggle">
+                <input type="checkbox" value="inside" checked>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-copy">
+                  <span class="toggle-name">With the roofs off</span>
+                  <span class="toggle-hint">That same middle, with the roofs off so the rooms show.</span>
+                </span>
+              </label>
             </div>
-            <span id="installNote" class="step-note">Copies the map into your Zomboid mods folder.</span>
+            <button id="makePictures" class="btn" type="button" hidden>Draw a picture of it</button>
+            <div id="pictureNote" class="hint"></div>
+            <div id="pictureShots" class="shots" hidden></div>
           </div>
-          <button id="installBtn" class="btn" disabled>Install</button>
-        </div>
+          <div class="area-toggles" id="exportChoices">
+            <label class="toggle">
+              <input type="checkbox" id="optCompile" checked>
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Compile map</span>
+                <span class="toggle-hint">Compiles the map into a format PZ can use</span>
+              </span>
+            </label>
+            <div id="compileOutputSlot">
+              <div class="export-location" id="exportOutputRow">
+                <div class="field-label">Output location</div>
+                <div class="game-location-row">
+                  <button type="button" id="exportOutputBrowse" class="btn">Browse…</button>
+                  <input type="text" id="exportOutputPath" readonly aria-label="Output location">
+                </div>
+              </div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="optInstall" checked>
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Install to game</span>
+                <span class="toggle-hint">Automatically installs the compiled map mod into the games install location.</span>
+              </span>
+            </label>
+            <div class="export-location" id="exportInstallRow">
+              <div class="field-label">Install location</div>
+              <div class="game-location-row">
+                <button type="button" id="exportInstallBrowse" class="btn">Browse…</button>
+                <input type="text" id="exportInstallPath" readonly aria-label="Install location">
+              </div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="optEditable" checked>
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Editable Map File</span>
+                <span class="toggle-hint">Outputs a WorldEd Project for further editing</span>
+              </span>
+            </label>
+            <div id="editableOutputSlot"></div>
+          </div>
+          <div class="bar"><div id="compileBar" class="bar-fill"></div></div>
+          <span id="compileNote" class="step-note"></span>
+          <span id="installNote" class="step-note"></span>
+          <span id="worldedNote" class="step-note"></span>
+          <button id="retryCellsBtn" class="btn btn-small" type="button" hidden>Compile the cells that failed</button>
+          <div class="export-actions">
+            <button id="exportBtn" class="btn" type="button">Export</button>
+            <button class="btn btn-small btn-stop" data-stop hidden>Stop</button>
+          </div>
+        </section>
       </div>
     </div>
+    <footer class="side-foot">
+      <button type="button" class="btn side-prev">Cancel</button>
+      <span class="side-count" aria-live="polite">Step 1 / 6</span>
+      <button type="button" class="btn side-next">Next</button>
+    </footer>
     </div>
   </aside>
 </main>
-
-<section id="results" hidden>
-  <h2>Map: <span class="ph map-badge">—</span></h2>
-
-  <div id="upgradeNote" class="upgrade-note" hidden></div>
-
-  <div id="results-grid">
-    <figure class="preview-frame">
-      <a id="previewLink" target="_blank"><img id="previewImg" alt="Map preview"/></a>
-      <figcaption>Preview</figcaption>
-    </figure>
-    <div class="results-side">
-      <div id="results-info"></div>
-    </div>
-  </div>
-</section>
 
 <div id="toasts" aria-live="polite"></div>
 
@@ -398,11 +599,24 @@
   </div>
 </div>
 
+<div id="worldedAsk" class="worlded-ask" hidden>
+  <div class="worlded-ask-box" role="dialog" aria-modal="true" aria-labelledby="worldedAskTitle">
+    <p id="worldedAskTitle">Cannot find WorldEd.</p>
+    <p id="worldedAskNote" class="hint"></p>
+    <div class="worlded-ask-actions">
+      <button type="button" id="worldedDownload" class="btn">Download</button>
+      <button type="button" id="worldedFind" class="btn">Find</button>
+    </div>
+  </div>
+</div>
+
 <script src="/static/vendor/leaflet/leaflet.js"></script>
 <script src="/static/vendor/leaflet-draw/leaflet.draw.js"></script>
 <script src="/static/js/clip.js"></script>
 <script src="/static/js/fx.js"></script>
+<script src="/static/js/georef.js"></script>
 <script src="/static/js/app.js"></script>
+<script src="/static/js/edit.js"></script>
 <script src="/static/js/tutorial.js"></script>
 <script src="/static/js/i18n.js"></script>
 </body>

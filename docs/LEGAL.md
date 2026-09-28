@@ -50,10 +50,12 @@ is that pointer, and `places.py` and the README link to it too.
 Source: [Overpass API commons](https://dev.overpass-api.de/overpass-doc/en/preface/commons.html)
 
 Public instances expect roughly **under 10,000 requests and 1 GB per day** per
-user. KnoxMap identifies itself, splits large areas into a modest number of
-queries, backs off when refused, and caches every download next to the map so
-regenerating an area does not download it again. Very large or repeated use
-should run its own Overpass instance.
+user. KnoxMap uses Overpass for the list of named places inside a selection,
+identifies itself, and backs off when refused. The streets, buildings, water
+and land are not taken from Overpass: they are read from Geofabrik's daily
+OpenStreetMap extracts, cached under `cache/geofabrik`, and cut on this
+computer by the reader packed in the program. Very large or repeated Overpass
+use should run its own instance.
 
 ### Satellite imagery
 KnoxMap used to offer Esri World Imagery as a background. Esri's
@@ -120,8 +122,13 @@ Source: [GPL-2.0](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
 KnoxMap has no accounts, telemetry or analytics. While it runs, your PC
 contacts:
 
-- OpenStreetMap's tile server, Nominatim and Overpass servers, for the map,
-  searches and map data (these see your IP address and what you look up);
+- OpenStreetMap's tile server and Nominatim, for the background map and place
+  search, and Overpass, for the named places inside an area (these see your
+  IP address and what you look up);
+- Geofabrik's download server, for the daily regional extract the map is
+  drawn from, cached on your PC after the first fetch;
+- Amazon S3, only when **Add missing buildings** is on, to read Overture's
+  building files through DuckDB;
 - GitHub, once during setup, to download PZ Mapping Tools and the compiler,
   and later when KnoxMap checks for a new version of its own program file.
 

@@ -33,7 +33,7 @@ hidden += py_modules("tools", "tools", skip=("selftest.py",))
 datas = []
 for folder in ("templates", "static", "lang"):
     datas.append((os.path.join(ROOT, folder), folder))
-datas.append((os.path.join(REPO, "CHANGELOG.md"), "."))
+datas.append((os.path.join(REPO, "docs", "CHANGELOG.md"), "."))
 lua = os.path.join(ROOT, "knoxbuild", "lua")
 if os.path.isdir(lua):
     datas.append((lua, os.path.join("knoxbuild", "lua")))
@@ -42,10 +42,58 @@ for name in os.listdir(worlded):
     if name.endswith(".py"):
         datas.append((os.path.join(worlded, name), "worlded"))
 
+
+def bundle_osmium():
+    # The map reader is pyosmium. Its extension and the libraries next to it
+    # have to be inside this program; generating a map does not launch osmium.
+    from PyInstaller.utils.hooks import (
+        collect_data_files, collect_dynamic_libs, collect_submodules,
+    )
+    bins = collect_dynamic_libs("osmium")
+    data = collect_data_files("osmium")
+    mods = collect_submodules("osmium")
+    try:
+        from PyInstaller.utils.hooks import collect_delvewheel_libs_directory
+        more_data, more_bins = collect_delvewheel_libs_directory("osmium")
+        data += more_data
+        bins += more_bins
+    except Exception:
+        pass
+    return bins, data, mods
+
+
+def bundle_duckdb():
+    # Gap filling reads Overture's GeoParquet through DuckDB. The import sits
+    # inside a function, so a frozen build leaves it out unless it is named.
+    from PyInstaller.utils.hooks import (
+        collect_data_files, collect_dynamic_libs, collect_submodules,
+    )
+    return (collect_dynamic_libs("duckdb"),
+            collect_data_files("duckdb"),
+            collect_submodules("duckdb"))
+
+
+osmium_bins, osmium_data, osmium_mods = bundle_osmium()
+hidden += osmium_mods
+datas += osmium_data
+duckdb_bins, duckdb_data, duckdb_mods = bundle_duckdb()
+hidden += duckdb_mods
+hidden.append("duckdb")
+datas += duckdb_data
+bins = osmium_bins + duckdb_bins
+# SciPy's hooks collect the rest of the package. These are reached through
+# a lazy or private name, so a frozen build misses them unless named here.
+hidden += [
+    "scipy.ndimage",
+    "scipy.spatial",
+    "scipy.spatial._ckdtree",
+    "scipy._lib.messagestream",
+]
+
 a = Analysis(
     [os.path.join(ROOT, "knoxmap.py")],
     pathex=[ROOT],
-    binaries=[],
+    binaries=bins,
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],
