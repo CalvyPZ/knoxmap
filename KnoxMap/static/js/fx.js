@@ -84,60 +84,164 @@ const fx = (() => {
   }
 
   // ---- terrain progress ---------------------------------------------------
+  function bytes(n) {
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i >= 2 && n < 100 ? 1 : 0)} ${units[i]}`;
+  }
+
+  function duration(s) {
+    s = Math.max(1, Math.round(s));
+    if (s < 60) return `${s} s`;
+    const m = Math.round(s / 60);
+    if (m < 60) return `${m} min`;
+    return `${Math.floor(m / 60)} h ${m % 60} min`;
+  }
+
   let clockTimer = null;
+  let hideTimer = null;
   let started = 0;
+
+  function formatClock(seconds) {
+    const s = Math.max(0, Math.round(Number(seconds) || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    const mm = String(m).padStart(2, '0');
+    const ss = String(r).padStart(2, '0');
+    if (h) return `${h}:${mm}:${ss}`;
+    return `${m}:${ss}`;
+  }
+
+  function paintClock(seconds) {
+    $('#gen-clock').textContent = formatClock(seconds);
+  }
+
+  function showElapsedWord(on) {
+    const word = $('#gen-elapsed-word');
+    if (word) word.hidden = !on;
+  }
+
+  function armClock(reset) {
+    if (reset) started = Date.now();
+    clearInterval(clockTimer);
+    const tick = () => paintClock(Math.floor((Date.now() - started) / 1000));
+    tick();
+    clockTimer = setInterval(tick, 500);
+  }
 
   const overlay = {
     show() {
+      clearTimeout(hideTimer);
       const el = $('#gen-overlay');
       el.hidden = false;
+      el.dataset.mode = 'terrain';
       $('.gen-kicker', el).textContent = 'Generating terrain';
       $('#gen-stage').textContent = 'Checking daily map extracts…';
       $('#gen-detail').textContent = '';
       $('#gen-bar').style.width = '4%';
-      started = Date.now();
-      clearInterval(clockTimer);
-      clockTimer = setInterval(() => {
-        const s = Math.floor((Date.now() - started) / 1000);
-        $('#gen-clock').textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-      }, 500);
+      showElapsedWord(false);
+      armClock(true);
+    },
+    buildings(view) {
+      clearTimeout(hideTimer);
+      const el = $('#gen-overlay');
+      const starting = el.hidden || el.dataset.mode !== 'buildings';
+      el.hidden = false;
+      el.dataset.mode = 'buildings';
+      $('.gen-kicker', el).textContent = 'Generating buildings';
+      $('#gen-stage').textContent = (view && view.stage) || 'Generating buildings';
+      $('#gen-detail').textContent = (view && view.detail) || '';
+      const pct = Math.max(0, Math.min(100, Number(view && view.pct) || 0));
+      $('#gen-bar').style.width = `${Math.max(pct, 2)}%`;
+      showElapsedWord(true);
+      if (view && typeof view.elapsed === 'number') {
+        clearInterval(clockTimer);
+        clockTimer = null;
+        paintClock(view.elapsed);
+      } else if (starting) {
+        armClock(true);
+      }
     },
     update(p) {
+      const el = $('#gen-overlay');
+      if (el && el.dataset.mode === 'buildings') return;
       if (p.stage === 'osm' || p.stage === 'regions') {
         const total = p.total || 1;
         const done = p.done || 0;
-        $('#gen-stage').textContent = p.message || 'Checking daily map extracts';
-        $('#gen-detail').textContent = p.detail || (total > 1 ? `Part ${done + 1} of ${total}` : '');
-        $('#gen-bar').style.width = `${Math.max(6, Math.round(8 + 40 * done / total))}%`;
+        const dl = p.download;
+        const share = dl && dl.total ? Math.min(1, dl.done / dl.total) : 0;
+        let stage = p.message || 'Checking daily map extracts';
+        if (dl && dl.total > 0) {
+          const pct = Math.min(100, Math.round(100 * dl.done / dl.total));
+          const left = dl.speed > 0 && dl.total > dl.done
+            ? `, ${duration((dl.total - dl.done) / dl.speed)} left`
+            : '';
+          stage = `${stage} · ${pct}%${left}`;
+        }
+        $('#gen-stage').textContent = stage;
+        let detail = p.detail || (total > 1 ? `Part ${done + 1} of ${total}` : '');
+        if (dl) {
+          const parts = [];
+          if (dl.total > 0) {
+            parts.push(`${Math.min(100, Math.round(100 * dl.done / dl.total))}%`);
+          }
+          parts.push(dl.total ? `${bytes(dl.done)} of ${bytes(dl.total)}` : bytes(dl.done));
+          if (dl.speed > 0) parts.push(`${bytes(dl.speed)}/s`);
+          if (dl.speed > 0 && dl.total > dl.done) {
+            parts.push(`${duration((dl.total - dl.done) / dl.speed)} left`);
+          }
+          if (total > 1) parts.push(`region ${done + 1} of ${total}`);
+          detail = `${detail ? detail + ': ' : ''}${parts.join(' · ')}`;
+        }
+        $('#gen-detail').textContent = detail;
+        $('#gen-bar').style.width = `${Math.max(6, Math.round(8 + 40 * (done + share) / total))}%`;
       } else if (p.stage === 'mod') {
         const total = p.total || 1;
         const done = p.done || 0;
-        $('#gen-stage').textContent = 'Drawing a map piece';
+        $('#gen-stage').textContent = p.view || 'Drawing a map piece';
         $('#gen-detail').textContent = p.detail || `Piece ${done + 1} of ${total}`;
         $('#gen-bar').style.width = `${Math.max(48, Math.round(48 + 34 * done / total))}%`;
       } else if (p.stage === 'render') {
-        $('#gen-stage').textContent = 'Drawing the terrain';
+        $('#gen-stage').textContent = p.view || 'Drawing the terrain';
         $('#gen-detail').textContent = `${(p.features || 0).toLocaleString()} features`;
         $('#gen-bar').style.width = '82%';
+      } else if (p.view) {
+        $('#gen-stage').textContent = p.view;
       }
     },
     done(summary) {
-      $('.gen-kicker').textContent = 'Done';
+      clearTimeout(hideTimer);
+      const el = $('#gen-overlay');
+      el.hidden = false;
+      delete el.dataset.mode;
+      $('.gen-kicker', el).textContent = 'Done';
       $('#gen-stage').textContent = summary || '';
       $('#gen-detail').textContent = '';
       $('#gen-bar').style.width = '100%';
+      showElapsedWord(false);
       this.hide(600);
     },
     fail(message) {
-      $('.gen-kicker').textContent = 'Failed';
+      clearTimeout(hideTimer);
+      const el = $('#gen-overlay');
+      el.hidden = false;
+      delete el.dataset.mode;
+      $('.gen-kicker', el).textContent = 'Failed';
       $('#gen-stage').textContent = message.length > 160 ? message.slice(0, 157) + '…' : message;
       $('#gen-detail').textContent = '';
+      showElapsedWord(false);
       this.hide(2500);
     },
     hide(delay = 0) {
-      setTimeout(() => {
-        $('#gen-overlay').hidden = true;
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => {
+        const el = $('#gen-overlay');
+        el.hidden = true;
+        delete el.dataset.mode;
         clearInterval(clockTimer);
+        clockTimer = null;
       }, delay);
     },
   };
@@ -169,50 +273,66 @@ const fx = (() => {
   }
 
   function progress(key, pct) {
-    const bar = key === 'compile' ? $('#compileBar') : null;
+    const bar = key === 'compile' ? $('#compileBar')
+      : key === 'buildings' ? $('#buildingsBar') : null;
     if (!bar) return;
-    bar.parentElement.classList.toggle('is-indeterminate', !(pct > 0));
-    if (pct > 0) bar.style.width = `${Math.min(100, pct)}%`;
+    const meter = bar.parentElement;
+    const measured = pct > 0;
+    meter.classList.toggle('is-indeterminate', !measured);
+    meter.classList.toggle('is-measured', measured);
+    bar.style.width = measured ? `${Math.min(100, pct)}%` : '';
   }
 
-  // ---- basemaps -------------------------------------------------------------
+  // ---- theme ------------------------------------------------------------------
+  // Dark and Light restyle the whole window. The same choice picks the map
+  // tiles: streets as they are, or the same tiles darkened in CSS.
+  let showTiles = () => {};
+
+  function savedBase() {
+    let saved = 'dark';
+    try { saved = localStorage.getItem('knoxmap.base') || 'dark'; } catch (_) {}
+    return saved === 'streets' ? 'streets' : 'dark';
+  }
+
+  function applyTheme(name) {
+    document.documentElement.dataset.theme = name === 'streets' ? 'light' : 'dark';
+    document.querySelectorAll('#basemaps button').forEach(btn => {
+      btn.classList.toggle('is-on', btn.dataset.base === name);
+    });
+  }
+
+  function chooseBase(name) {
+    const base = name === 'streets' ? 'streets' : 'dark';
+    applyTheme(base);
+    try { localStorage.setItem('knoxmap.base', base); } catch (_) {}
+    showTiles(base);
+  }
+
   function mapExtras() {
     if (typeof map === 'undefined') return;
     const attribution = '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
     const layers = {
       streets: L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 19, attribution }),
-      // The same tiles, darkened in CSS.
       dark: L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 19, className: 'tiles-dark', attribution }),
     };
     const existing = [];
     map.eachLayer(l => { if (l instanceof L.TileLayer) existing.push(l); });
     existing.forEach(l => map.removeLayer(l));
-    let saved = 'dark';
-    try { saved = localStorage.getItem('knoxmap.base') || 'dark'; } catch (_) {}
-    if (!layers[saved]) saved = 'dark';
-    function showBase(name) {
+    showTiles = (name) => {
       Object.values(layers).forEach(l => map.removeLayer(l));
       layers[name].addTo(map);
       map.getContainer().classList.toggle('base-light', name === 'streets');
-    }
-    showBase(saved);
-    document.querySelectorAll('#basemaps button').forEach(btn => {
-      btn.classList.toggle('is-on', btn.dataset.base === saved);
-      btn.addEventListener('click', () => {
-        showBase(btn.dataset.base);
-        document.querySelectorAll('#basemaps button')
-          .forEach(b => b.classList.toggle('is-on', b === btn));
-        try { localStorage.setItem('knoxmap.base', btn.dataset.base); } catch (_) {}
-      });
-    });
+    };
+    showTiles(savedBase());
   }
 
   // ---- default population ------------------------------------------------------
   function presetCards() {
     const select = $('#preset');
-    document.querySelectorAll('.preset-card').forEach(card => {
+    if (!select) return;
+    document.querySelectorAll('#presetCards .preset-card').forEach(card => {
       card.addEventListener('click', () => {
-        document.querySelectorAll('.preset-card').forEach(c => {
+        document.querySelectorAll('#presetCards .preset-card').forEach(c => {
           const on = c === card;
           c.classList.toggle('is-on', on);
           c.setAttribute('aria-checked', on ? 'true' : 'false');
@@ -246,18 +366,16 @@ const fx = (() => {
   // ---- updates ------------------------------------------------------------
   // updater.py downloads a newer release in the background; once it is
   // ready the header offers a restart, which installs it.
-  // A dot beside the version in the top bar: green when a newer release
-  // exists, amber once it has downloaded and only a restart is left. The
-  // menu is behind a click, so without this nothing on screen said an
-  // update was waiting.
+  // The version chip wears a dot: green on its own, and amber once a newer
+  // release has downloaded and only a restart is left.
   function versionDot(state, version) {
     const dot = $('#versionDot');
     if (!dot) return;
-    dot.hidden = !state;
+    dot.hidden = false;
     dot.classList.toggle('ready', state === 'ready');
-    dot.title = state === 'ready'
-      ? `KnoxMap ${version} is downloaded - restart to use it`
-      : `KnoxMap ${version} is out`;
+    if (state === 'ready') dot.title = `KnoxMap ${version} is downloaded - restart to use it`;
+    else if (state) dot.title = `KnoxMap ${version} is out`;
+    else dot.removeAttribute('title');
   }
 
   async function watchUpdates() {
@@ -488,12 +606,51 @@ const fx = (() => {
     });
   }
 
+  function closeSettingsPopouts() {
+    const credits = $('#creditsMenu');
+    const creditsBtn = $('#creditsBtn');
+    if (credits) credits.hidden = true;
+    if (creditsBtn) creditsBtn.setAttribute('aria-expanded', 'false');
+    const langList = document.querySelector('#language .language-list');
+    const langBtn = document.querySelector('#language .language-btn');
+    if (langList) langList.hidden = true;
+    if (langBtn) langBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function settingsMenu() {
+    const wrap = $('#settingsWrap');
+    if (!wrap) return;
+    wrap.addEventListener('mouseleave', closeSettingsPopouts);
+    wrap.addEventListener('focusout', e => {
+      if (!wrap.contains(e.relatedTarget)) closeSettingsPopouts();
+    });
+    const clearBtn = $('#clearCacheBtn');
+    if (!clearBtn) return;
+    clearBtn.addEventListener('click', async () => {
+      clearBtn.disabled = true;
+      try {
+        const res = await fetch('/api/cache/clear', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Could not clear the cache');
+        toast('ok', 'Clear cache', 'Map tiles and downloaded map data were cleared.');
+      } catch (err) {
+        toast('bad', 'Clear cache', err.message || 'Could not clear the cache');
+      } finally {
+        clearBtn.disabled = false;
+      }
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
+    applyTheme(savedBase());
+    document.querySelectorAll('#basemaps button').forEach(btn => {
+      btn.addEventListener('click', () => chooseBase(btn.dataset.base));
+    });
     versionMenu();
     creditsMenu();
+    settingsMenu();
     setTimeout(watchUpdates, 8000);
     presetCards();
-    $('#reportLink')?.addEventListener('click', e => { e.preventDefault(); saveReport(); });
   });
   window.addEventListener('load', mapExtras);
 

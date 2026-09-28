@@ -80,6 +80,7 @@ const i18n = (() => {
     if (Object.keys(strings).length) {
       translateAll();
       watch();
+      document.dispatchEvent(new Event('knoxmap-lang'));
     } else if (remember) {
       window.location.reload();       // back to English: the simplest way back
     }

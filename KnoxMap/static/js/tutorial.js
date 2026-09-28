@@ -1,6 +1,7 @@
 // First launch only. Asks once, then walks the map, the tools on it,
-// the sidebar, and where to get help. Remembered in localStorage so a
-// later launch goes straight to the window.
+// the sidebar, and where to get help. Dismissing it — No, Skip, Escape,
+// finishing, or closing the window — is remembered for the account, so a
+// later launch, an update, or a new copy of the program does not ask again.
 
 const tutorial = (() => {
   const KEY = 'knoxmap.tutorial';
@@ -15,19 +16,19 @@ const tutorial = (() => {
     },
     {
       title: 'Map interface',
-      body: 'Search for a place at the top left. Dark and Light at the top right switch the basemap. The tools on the left draw the area: rectangle, polygon, circle or freehand. The eraser cuts a shape out of it.',
-      targets: ['#search-box', '#map-tools', '.leaflet-top.leaflet-left'],
+      body: 'Search for a place at the top left. Dark and Light at the top right switch the basemap. The tools at the bottom left draw the area: rectangle, polygon, circle or freehand. The eraser cuts a shape out of it.',
+      targets: ['#search-box', '#map-tools', '.leaflet-bottom.leaflet-left'],
       place: 'bottom',
     },
     {
       title: 'Sidebar',
-      body: 'Previous and Next step through Setup, Map and Build. Setup finds the game and names the map. Map is the area you drew. Build generates, compiles and installs the mod.',
+      body: 'Back and Next at the bottom of the sidebar move through Setup, Map and Build. The count shows which step you are on. Setup finds the game and names the map. Map is the area you drew. Build generates, compiles and installs the mod.',
       targets: ['#controls'],
       place: 'left-of',
     },
     {
       title: 'More help',
-      body: 'The Discord icon in the top bar is where to ask for help.',
+      body: 'The Discord icon at the top of the sidebar is where to ask for help.',
       link: DISCORD,
       targets: ['a.discord'],
       place: 'below',
@@ -53,14 +54,19 @@ const tutorial = (() => {
   let mode = 'ask';
   let index = 0;
 
-  function alreadySeen() {
+  async function alreadySeen() {
+    try {
+      const res = await fetch('/api/tutorial');
+      if (res.ok && (await res.json()).seen) return true;
+    } catch (_) { /* the account file is the record; this only asks it */ }
     try { return localStorage.getItem(KEY) === '1'; }
     catch (_) { return true; }
   }
 
   function markSeen() {
     try { localStorage.setItem(KEY, '1'); }
-    catch (_) { /* a window that cannot remember still closes the tutorial */ }
+    catch (_) { /* the account file below is what the next launch reads */ }
+    fetch('/api/tutorial', { method: 'POST', keepalive: true }).catch(() => {});
   }
 
   function rectsFor(selectors) {
@@ -220,7 +226,11 @@ const tutorial = (() => {
     placeCard(step.place);
   }
 
-  yesBtn.addEventListener('click', () => { index = 0; showStep(); });
+  yesBtn.addEventListener('click', () => {
+    document.getElementById('newMapBtn').click();
+    index = 0;
+    showStep();
+  });
   document.getElementById('tutorialNo').addEventListener('click', finish);
   skipBtn.addEventListener('click', finish);
   backBtn.addEventListener('click', back);
@@ -233,10 +243,57 @@ const tutorial = (() => {
     if (e.key === 'ArrowRight') { e.preventDefault(); forward(); }
     if (e.key === 'ArrowLeft') { e.preventDefault(); back(); }
   });
+  window.addEventListener('pagehide', () => { if (open) markSeen(); });
+
+  function whenWorldEdSettled(then) {
+    const run = () => {
+      if (document.body.dataset.worldedAsk === '1') {
+        const ask = document.getElementById('worldedAsk');
+        const watch = new MutationObserver(() => {
+          if (ask.hidden) { watch.disconnect(); then(); }
+        });
+        watch.observe(ask, { attributes: true, attributeFilter: ['hidden'] });
+        return;
+      }
+      then();
+    };
+    if (document.body.dataset.worldedAsk !== undefined) { run(); return; }
+    const watch = new MutationObserver(() => {
+      if (document.body.dataset.worldedAsk === undefined) return;
+      watch.disconnect();
+      run();
+    });
+    watch.observe(document.body, { attributes: true, attributeFilter: ['data-worlded-ask'] });
+  }
+
+  function whenFirstSetupDone(then) {
+    const run = () => {
+      if (document.body.dataset.firstSetup === '1') {
+        const watch = new MutationObserver(() => {
+          if (document.body.dataset.firstSetup !== '1') {
+            watch.disconnect();
+            then();
+          }
+        });
+        watch.observe(document.body, { attributes: true, attributeFilter: ['data-first-setup'] });
+        return;
+      }
+      then();
+    };
+    if (document.body.dataset.firstSetup !== undefined) { run(); return; }
+    const watch = new MutationObserver(() => {
+      if (document.body.dataset.firstSetup === undefined) return;
+      watch.disconnect();
+      run();
+    });
+    watch.observe(document.body, { attributes: true, attributeFilter: ['data-first-setup'] });
+  }
 
   document.addEventListener('DOMContentLoaded', () => {
-    if (alreadySeen()) return;
-    requestAnimationFrame(() => requestAnimationFrame(showAsk));
+    alreadySeen().then(seen => {
+      if (seen) return;
+      whenWorldEdSettled(() => whenFirstSetupDone(() => requestAnimationFrame(() => requestAnimationFrame(showAsk))));
+    });
   });
 
   return { relayout };
