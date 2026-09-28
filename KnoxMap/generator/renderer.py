@@ -15,6 +15,8 @@ import json
 import math
 import os
 import random
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -23,9 +25,14 @@ from PIL import Image, ImageDraw, ImageFilter
 
 import knoxstop
 
+from . import biomes
+from . import intersections
 from . import pz_colors as C
 from . import structures
-from .osm import FENCE_BARRIERS, OSMFeature, classify
+from .osm import (
+    AIRPORT_PAVED, FENCE_BARRIERS, OSMFeature, classify, is_airport_area,
+    is_rail_area,
+)
 
 
 # --- projection ------------------------------------------------------------
@@ -51,6 +58,11 @@ class Projector:
     # Degrees the map is turned, counter-clockwise, so its main street grid
     # runs along the tile grid. See dominant_road_angle.
     rotation: float = 0.0
+    # UTM metres the turn is about. A window of a larger map keeps the
+    # parent's center, so neighbouring pieces share an edge. None means this
+    # projector's own center (a map saved before the center was recorded).
+    rot_cx_m: float | None = None
+    rot_cy_m: float | None = None
 
     @classmethod
     def build(cls, south: float, west: float, north: float, east: float,
@@ -75,20 +87,39 @@ class Projector:
         return cls(south, west, north, east, meters_per_tile,
                    tiles_w, tiles_h,
                    cx - half_w_m, cy - half_h_m,
-                   t, rotation)
+                   t, rotation, cx, cy)
+
+    def _rot_center(self) -> tuple[float, float]:
+        if self.rot_cx_m is None or self.rot_cy_m is None:
+            w_m = self.width * self.meters_per_tile
+            h_m = self.height * self.meters_per_tile
+            return self.min_x_m + w_m / 2, self.min_y_m + h_m / 2
+        return self.rot_cx_m, self.rot_cy_m
 
     def to_px(self, lat: float, lon: float) -> tuple[float, float]:
         x_m, y_m = self._transformer.transform(lon, lat)
-        if self.rotation:
-            cx = self.min_x_m + self.width * self.meters_per_tile / 2
-            cy = self.min_y_m + self.height * self.meters_per_tile / 2
-            a = math.radians(self.rotation)
-            dx, dy = x_m - cx, y_m - cy
-            x_m = cx + dx * math.cos(a) - dy * math.sin(a)
-            y_m = cy + dx * math.sin(a) + dy * math.cos(a)
-        px = (x_m - self.min_x_m) / self.meters_per_tile
+        rot = self.rotation
+        if rot:
+            trig = getattr(self, "_px_trig", None)
+            if trig is None or trig[0] != rot:
+                ang = math.radians(rot)
+                trig = (rot, math.cos(ang), math.sin(ang))
+                self._px_trig = trig
+            cx_m = self.rot_cx_m
+            cy_m = self.rot_cy_m
+            if cx_m is None or cy_m is None:
+                cx, cy = self._rot_center()
+            else:
+                cx, cy = cx_m, cy_m
+            cos_a, sin_a = trig[1], trig[2]
+            dx = x_m - cx
+            dy = y_m - cy
+            x_m = cx + dx * cos_a - dy * sin_a
+            y_m = cy + dx * sin_a + dy * cos_a
+        mpt = self.meters_per_tile
+        px = (x_m - self.min_x_m) / mpt
         # Image Y grows downward; UTM Y grows northward → flip.
-        py = self.height - (y_m - self.min_y_m) / self.meters_per_tile
+        py = self.height - (y_m - self.min_y_m) / mpt
         return px, py
 
     def to_latlon(self, px: float, py: float) -> tuple[float, float]:
@@ -101,8 +132,7 @@ class Projector:
         x_m = self.min_x_m + px * self.meters_per_tile
         y_m = self.min_y_m + (self.height - py) * self.meters_per_tile
         if self.rotation:
-            cx = self.min_x_m + self.width * self.meters_per_tile / 2
-            cy = self.min_y_m + self.height * self.meters_per_tile / 2
+            cx, cy = self._rot_center()
             a = math.radians(-self.rotation)
             dx, dy = x_m - cx, y_m - cy
             x_m = cx + dx * math.cos(a) - dy * math.sin(a)
@@ -112,19 +142,11 @@ class Projector:
 
     def latlon_bbox(self) -> tuple[float, float, float, float]:
         """(south, west, north, east) covering the whole map, turned or not."""
-        back = pyproj.Transformer.from_crs(self._transformer.target_crs,
-                                           "EPSG:4326", always_xy=True)
-        w_m = self.width * self.meters_per_tile
-        h_m = self.height * self.meters_per_tile
-        cx, cy = self.min_x_m + w_m / 2, self.min_y_m + h_m / 2
-        a = math.radians(-self.rotation)
-        lons, lats = [], []
-        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
-            dx, dy = sx * w_m / 2, sy * h_m / 2
-            lon, lat = back.transform(cx + dx * math.cos(a) - dy * math.sin(a),
-                                      cy + dx * math.sin(a) + dy * math.cos(a))
-            lons.append(lon)
+        lats, lons = [], []
+        for px, py in ((0, 0), (self.width, 0), (self.width, self.height), (0, self.height)):
+            lat, lon = self.to_latlon(px, py)
             lats.append(lat)
+            lons.append(lon)
         return min(lats), min(lons), max(lats), max(lons)
 
     def cell_grid(self) -> tuple[int, int]:
@@ -134,16 +156,18 @@ class Projector:
         """A tile rectangle of this map, on the same metre grid.
 
         Adjacent windows share the edge between them, so two mods drawn from
-        them meet when both are enabled.
+        them meet when both are enabled. The turn stays about this projector's
+        center, not the window's own, or the pieces fan apart on the preview.
         """
         mpt = self.meters_per_tile
         north_m = self.min_y_m + self.height * mpt
+        rcx, rcy = self._rot_center()
         return Projector(
             self.south, self.west, self.north, self.east, mpt,
             tiles_w, tiles_h,
             self.min_x_m + x0 * mpt,
             north_m - (y0 + tiles_h) * mpt,
-            self._transformer, self.rotation)
+            self._transformer, self.rotation, rcx, rcy)
 
     def grid_dict(self) -> dict:
         epsg = self._transformer.target_crs.to_epsg()
@@ -155,6 +179,8 @@ class Projector:
             "meters_per_tile": self.meters_per_tile,
             "epsg": int(epsg or 0),
             "rotation": self.rotation,
+            "rot_cx_m": self._rot_center()[0],
+            "rot_cy_m": self._rot_center()[1],
         }
 
     @classmethod
@@ -163,10 +189,18 @@ class Projector:
         epsg = int(grid["epsg"])
         transformer = pyproj.Transformer.from_crs(
             "EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+        rcx, rcy = grid.get("rot_cx_m"), grid.get("rot_cy_m")
+        try:
+            rcx = float(rcx) if rcx is not None else None
+            rcy = float(rcy) if rcy is not None else None
+        except (TypeError, ValueError):
+            rcx, rcy = None, None
+        if rcx is None or rcy is None:
+            rcx, rcy = None, None
         return cls(0.0, 0.0, 0.0, 0.0, float(grid["meters_per_tile"]),
                    int(grid["width_tiles"]), int(grid["height_tiles"]),
                    float(grid["min_x_m"]), float(grid["min_y_m"]),
-                   transformer, float(grid.get("rotation") or 0.0))
+                   transformer, float(grid.get("rotation") or 0.0), rcx, rcy)
 
 
 # Roads that count towards a town's street grid. Paths wander, and a motorway
@@ -231,7 +265,7 @@ def _inside(feat: OSMFeature, proj: Projector, shape) -> bool:
 
 
 def _clip_to_shape(landscape: Image.Image, shape, buckets: dict[str, list[OSMFeature]],
-                   proj: Projector) -> None:
+                   proj: Projector):
     """Outside the drawn shape, the ground goes back to countryside.
 
     Water stays - a river does not stop at a line on the map - and so do the
@@ -276,6 +310,7 @@ def _clip_to_shape(landscape: Image.Image, shape, buckets: dict[str, list[OSMFea
         if outside.any():
             grass = Image.new("RGB", (w, y1 - y0), C.DARK_GRASS)
             landscape.paste(grass, (0, y0), Image.fromarray(outside.astype(np.uint8) * 255))
+    return keep
 
 
 def cover_bbox(south: float, west: float, north: float, east: float,
@@ -297,6 +332,21 @@ def cover_bbox(south: float, west: float, north: float, east: float,
     lons, lats = zip(*(back.transform(cx + dx, cy + dy)
                        for dx in (-r, r) for dy in (-r, r)))
     return min(lats), min(lons), max(lats), max(lons)
+
+
+def bbox_for_cells(south: float, west: float, north: float, east: float,
+                   meters_per_tile: float) -> tuple[float, float, float, float]:
+    """The selection plus one cell.
+
+    The map is rounded up to whole cells, so its edges sit a little outside
+    the box that was drawn. The cut has to include that margin or each edge
+    piece would walk the regional file again.
+    """
+    dlat = (meters_per_tile * C.CELL_SIZE) / 111320.0
+    mid = math.radians((south + north) / 2.0)
+    dlon = dlat / max(0.2, math.cos(mid))
+    return (max(-90.0, south - dlat), max(-180.0, west - dlon),
+            min(90.0, north + dlat), min(180.0, east + dlon))
 
 
 def dominant_road_angle(features: Iterable[OSMFeature], south: float, west: float,
@@ -350,6 +400,7 @@ LANDSCAPE_ORDER = [
     "residential",    # gardens and yards
     "commercial",     # pavement in front of shops
     "industrial",     # gravel yards
+    "airport",        # airfield grass; runways and aprons are painted later
     "military",
     "schoolyard",
     "hospital_grounds",
@@ -370,8 +421,9 @@ LANDSCAPE_ORDER = [
     "water",
     "pool",
     "railway",        # gravel track bed; roads cross it at level crossings
-    "dirt_path",      # thin dirt line
+    "dirt_path",      # walking path: dirt tiles
     "paved_path",     # footway, pavement, cycleway
+    "road_track",     # farm track: gravel track tiles, dirt when tagged so
     "pier",           # jetties and breakwaters, over the water
     "parking",        # car park tarmac
     "plaza",          # paved pedestrian square
@@ -384,6 +436,15 @@ LANDSCAPE_ORDER = [
     # footprint disagreed by a tile - and the building's own floor covers the
     # ground under it anyway.
 ]
+
+# Land and water, painted before any street. The window shows this pass on
+# its own, then the roads on top of it.
+_GROUND_FIRST = {
+    "residential", "commercial", "industrial", "airport", "military", "schoolyard",
+    "hospital_grounds", "worship_grounds", "cemetery", "orchard", "farmland",
+    "grass", "park", "sports", "wetland", "sand", "dirt", "playground",
+    "track", "water", "pool",
+}
 
 # Waterways drawn from a centre line, when no area is mapped around them.
 # A river is usually mapped with its banks too, which paints over this.
@@ -402,9 +463,18 @@ ROAD_WIDTHS_M = {
     "road_service": 3.5,
     "dirt_path": 2.5,
     "paved_path": 2.5,
+    "road_track": 4.0,
     "pier": 3.0,
     "railway": 4.0,
 }
+
+# Centre lines written to _roads.geojson. worldmap.HIGHWAY_VALUE draws these
+# as highways; NAMED_CLASSES is the named subset. Pier and railway are drawn
+# on the paper map, but not as highways.
+ROAD_EXPORT_CATEGORIES = (
+    "road_major", "road_medium", "road_minor", "road_service",
+    "dirt_path", "paved_path", "road_track",
+)
 
 # Metres of kerb either side. Town streets in the vanilla game sit in a band of
 # pale concrete; without it the asphalt runs straight into grass and every road
@@ -428,6 +498,10 @@ LANDSCAPE_FILL = {
     "dirt": C.DIRT,
     "dirt_path": C.DIRT,
     "paved_path": C.PALE_CONCRETE,
+    # lightgravel (blends_street): the track tiles. A car treats them as a
+    # road. A track tagged dirt/earth/mud is painted with the dirt tiles
+    # instead; see _route_fill.
+    "road_track": C.LIGHT_ASPHALT,
     "pier": C.PALE_CONCRETE,
     "railway": C.LIGHT_ASPHALT,
     "grass": C.MEDIUM_GRASS,
@@ -448,6 +522,7 @@ LANDSCAPE_FILL = {
     "residential": C.MEDIUM_GRASS,
     "commercial": C.PALE_CONCRETE,
     "industrial": C.LIGHT_ASPHALT,
+    "airport": C.MEDIUM_GRASS,
     "military": C.DIRT,
     "schoolyard": C.PALE_CONCRETE,
     "hospital_grounds": C.MEDIUM_GRASS,
@@ -461,12 +536,32 @@ LANDSCAPE_FILL = {
     "pool": C.WATER,
 }
 
+# A track tagged as bare dirt takes the dirt tiles. Anything else, including
+# an untagged track, takes the gravel track tiles.
+_DIRT_TRACK_SURFACES = {"dirt", "earth", "ground", "mud", "sand", "grass", "soil"}
+
+
+def _route_fill(cat: str, tags: dict):
+    """Ground colour for one way. Tracks follow the surface tag."""
+    if cat == "road_track" and (tags.get("surface") or "").lower() in _DIRT_TRACK_SURFACES:
+        return C.DIRT
+    return LANDSCAPE_FILL.get(cat)
+
 # Categories knoxbuild needs as areas, to tell what a building standing in
 # them probably is: an untagged building on an industrial estate is a works,
 # not a house.
 AREA_CATEGORIES = {"residential", "commercial", "industrial", "military",
                    "schoolyard", "hospital_grounds", "worship_grounds",
-                   "cemetery", "parking", "sports"}
+                   "cemetery", "parking", "sports", "airport", "railway"}
+# Land use drawn on the generate-tab zoning overlay. Wider than AREA_CATEGORIES
+# on purpose: a park does not change what a building is, but it is still a zone.
+ZONE_CATEGORIES = (
+    "residential", "commercial", "industrial", "military",
+    "schoolyard", "hospital_grounds", "worship_grounds",
+    "cemetery", "parking", "sports", "airport", "railway",
+    "park", "grass", "farmland", "forest", "scrub",
+    "orchard", "wetland", "playground", "plaza",
+)
 # Drawn onto the vegetation bitmap rather than the ground.
 VEG_CATEGORIES = {"forest", "scrub", "tree_single", "hedge", "orchard",
                   "cemetery", "wetland"}
@@ -497,6 +592,40 @@ def _way_width_m(feat: OSMFeature, cat: str) -> float:
     return base
 
 
+def _aeroway_width_m(feat: OSMFeature) -> float:
+    """Paved width of a runway or taxiway mapped as a centre line.
+
+    OSM's width is in metres. A runway with no width is the usual 45 m; a
+    taxiway is a lane and a half. The road cap of 30 m would draw a runway
+    as a street.
+    """
+    kind = feat.tags.get("aeroway")
+    if kind == "runway":
+        base, cap = 45.0, 90.0
+    elif kind == "taxiway":
+        base, cap = 18.0, 45.0
+    else:
+        base, cap = 23.0, 60.0
+    raw = feat.tags.get("width") or feat.tags.get("est_width")
+    if raw:
+        try:
+            return max(4.0, min(cap, float(str(raw).split()[0].replace(",", "."))))
+        except ValueError:
+            pass
+    return base
+
+
+def _paint_filled(draw: ImageDraw.ImageDraw, image: Image.Image, feat: OSMFeature,
+                  proj: Projector, fill: tuple[int, int, int]) -> None:
+    """Fill one area. Open ways are left to the line passes."""
+    if not _is_polygon(feat):
+        return
+    if feat.kind == "relation":
+        _paint_multipolygon(image, feat, proj, fill)
+    else:
+        _draw_polygon(draw, _feature_coords_px(feat, proj), fill)
+
+
 def _feature_coords_px(feat: OSMFeature, proj: Projector) -> list[list[tuple[float, float]]]:
     """Project every ring/linestring in this feature to pixel space."""
     if feat.kind == "way":
@@ -513,11 +642,20 @@ def _feature_coords_px(feat: OSMFeature, proj: Projector) -> list[list[tuple[flo
 
 
 def _is_polygon(feat: OSMFeature) -> bool:
-    """Treat as polygon if first/last point match (way) or it's a relation."""
+    """Treat as polygon if first/last point match (way) or it's a relation.
+
+    A closed roundabout is still the ring of the road. Painted as an area it
+    became a solid disc of tarmac, with no pavement and no kerb. area=yes
+    wins, the same rule as the local extract reader.
+    """
     if feat.kind == "relation":
         return True
-    if feat.kind == "way" and len(feat.geometry) >= 3:
-        return feat.geometry[0] == feat.geometry[-1]
+    if feat.kind == "way" and len(feat.geometry) >= 3 and feat.geometry[0] == feat.geometry[-1]:
+        if feat.tags.get("area") == "yes":
+            return True
+        if feat.tags.get("junction") in {"roundabout", "circular"}:
+            return False
+        return True
     return False
 
 
@@ -567,6 +705,32 @@ def _draw_line(draw: ImageDraw.ImageDraw, rings: list[list[tuple[float, float]]]
                     draw.ellipse((x - r, y - r, x + r, y + r), fill=fill)
 
 
+def _paint_watch(on_view, every: float = 1.2):
+    """Hand the bitmap to on_view as it is painted, at most once a second or so.
+
+    A new `stage` is sent at once, so the window can show each pass (terrain,
+    streets, and what follows) instead of waiting out the throttle.
+    """
+    last = 0.0
+    shown = None
+
+    def show(image, force: bool = False, stage: str | None = None) -> None:
+        nonlocal last, shown
+        if on_view is None:
+            return
+        now = time.monotonic()
+        if stage is not None and stage != shown:
+            force = True
+        if not force and now - last < every:
+            return
+        last = now
+        if stage is not None:
+            shown = stage
+        on_view(image, shown)
+
+    return show
+
+
 # --- main entry point ------------------------------------------------------
 
 @dataclass
@@ -594,23 +758,43 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
            shape: dict | None = None,
            straight_roads: bool = False,
            should_stop=None,
-           proj: "Projector | None" = None) -> RenderResult:
+           proj: "Projector | None" = None,
+           on_view=None) -> RenderResult:
     if proj is None:
         proj = Projector.build(south, west, north, east, meters_per_tile, rotation)
     # Read more than once below - the buildings pass goes back over the
     # address points - so never leave this as a generator.
     features = list(features)
+    # Junctions are read off the roads as mapped, then carried onto wherever
+    # straightening moves those roads. The nodes are still in `features` here;
+    # the paint loop below drops every node that is not a tree.
+    junctions = intersections.collect(
+        features, classify, _is_polygon, _way_width_m, SIDEWALK_M)
+    moved_junctions: dict = {}
     if straight_roads:
         # Every road in straight runs at 45-degree steps (octilinear.py).
         from .octilinear import straighten_roads
-        straighten_roads(features, proj, classify, _is_polygon)
+        straighten_roads(features, proj, classify, _is_polygon, moved_junctions)
+    junctions.relocate(moved_junctions, proj)
+    junctions.measure(meters_per_tile)
     # A drawn polygon, circle or real outline rather than a rectangle: the map
     # still covers its bounding box in whole cells, but only what lies inside
     # the shape is built.
     clip = shape_px(shape, proj)
     landscape = Image.new("RGB", (proj.width, proj.height), C.DARK_GRASS)
     vegetation = Image.new("RGB", (proj.width, proj.height), C.VEG_NOTHING)
+    # Biome index for Build 42's biomemap PNGs. Same paint order as the
+    # ground, so a wood, a field and a street land on the pixels the game
+    # reads back as biome and foraging zone.
+    cover = biomes.Cover(
+        (proj.width, proj.height), (south + north) / 2.0, (west + east) / 2.0)
     l_draw = ImageDraw.Draw(landscape)
+    # The window watches this bitmap while it is painted. Throttled so a
+    # long road pass still redraws, without a copy on every feature.
+    show = _paint_watch(on_view)
+    # The grass sheet is the first frame worth showing. Land use paints onto
+    # it next; streets wait until that pass has had its own frame.
+    show(landscape, force=True, stage="Terrain and biomes")
 
     # Bucket features so we paint in a deterministic order.
     buckets: dict[str, list[OSMFeature]] = {}
@@ -665,6 +849,12 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
     if addressed:
         building_feats = building_feats + addressed
         buckets["building"] = buckets.get("building", []) + addressed
+    # The same streets again where neither source drew a roof: a house on
+    # each side, kept off the carriageway and off anything already mapped.
+    streeted = _houses_along_streets(buckets, building_feats, proj, clip)
+    if streeted:
+        building_feats = building_feats + streeted
+        buckets["building"] = buckets.get("building", []) + streeted
 
     def ground_rings(feat: OSMFeature) -> list[list[tuple[float, float]]]:
         rings = _feature_coords_px(feat, proj)
@@ -676,16 +866,45 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
         return [list(g.coords) for g in getattr(left, "geoms", [left])
                 if g.geom_type == "LineString" and not g.is_empty]
 
+    # Area edits change the bitmaps only. _areas.geojson stays the OSM
+    # export, and added polygons are not written into it. A missing or
+    # broken overlay paints the OSM data as it stands.
+    paint_buckets = buckets
+    paint_veg = vegetation_feats
+    try:
+        loaded = _load_edits(output_dir, map_name)
+        if loaded is not None:
+            paint_buckets, paint_veg = _areas_for_paint(
+                buckets, vegetation_feats, loaded)
+    except Exception:
+        paint_buckets = buckets
+        paint_veg = vegetation_feats
+
+    def _roles(feat: OSMFeature):
+        return [(role, [proj.to_px(la, lo) for la, lo in ring])
+                for role, ring in feat.role_geoms]
+
+    def _mark(cat: str, feat: OSMFeature, rings, width: int | None = None) -> None:
+        cover.stamp(
+            cat, feat.tags, rings, width=width,
+            relation_rings=_roles(feat) if feat.kind == "relation" else None)
+
     # The sea first, under everything: a pier or a beach mapped over it
     # paints on top.
     for sea in sea_polygons(buckets.get("coastline", []), proj):
         for part in getattr(sea, "geoms", None) or [sea]:
             if hasattr(part, "exterior"):
                 l_draw.polygon(list(part.exterior.coords), fill=C.WATER)
+                cover.polygon([list(part.exterior.coords)], biomes.WATER)
                 for hole in part.interiors:
                     l_draw.polygon(list(hole.coords), fill=C.DARK_GRASS)
+                    cover.polygon([list(hole.coords)], cover.open)
 
+    paint_stage = "Terrain and biomes"
     for cat in LANDSCAPE_ORDER:
+        if paint_stage == "Terrain and biomes" and cat not in _GROUND_FIRST:
+            show(landscape, force=True, stage="Terrain and biomes")
+            paint_stage = "Streets"
         if cat == "railway":
             # Pavements, as one pass over every road class and after the land
             # use: painted first, a park or a lawn mapped up to the kerb erased
@@ -693,54 +912,129 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
             # street's pavement cannot cut across the high street it joins.
             for road in ("road_minor", "road_medium", "road_major"):
                 margin = SIDEWALK_M[road]
-                for feat in buckets.get(road, []):
+                for feat in paint_buckets.get(road, []):
                     if _is_polygon(feat):
                         continue
                     width_px = (_way_width_m(feat, road) + 2 * margin) / meters_per_tile
                     _draw_line(l_draw, ground_rings(feat),
                                C.PALE_CONCRETE, int(width_px))
+                    cover.line(ground_rings(feat), biomes.DIRT, int(width_px))
+                    show(landscape, stage=paint_stage)
             for road, verge in VERGE_M.items():
-                for feat in buckets.get(road, []):
+                for feat in paint_buckets.get(road, []):
                     if _is_polygon(feat):
                         continue
                     width_px = (_way_width_m(feat, road) + 2 * verge) / meters_per_tile
-                    _draw_line(l_draw, ground_rings(feat),
-                               C.DARK_GRASS, int(width_px))
+                    rings = ground_rings(feat)
+                    _draw_line(l_draw, rings, C.DARK_GRASS, int(width_px))
+                    cover.line(rings, biomes.TOWN, int(width_px))
+                    show(landscape, stage=paint_stage)
         fill = LANDSCAPE_FILL.get(cat)
         if fill is None:
             continue
-        for feat in buckets.get(cat, []):
+        for feat in paint_buckets.get(cat, []):
+            # Paved aeroways are drawn after the roads, or a grass polygon
+            # mapped over the infield would cover the runway. Railway yards
+            # are land use and are drawn with the industrial pass, under the
+            # pavements; the rails themselves stay here so a road can cross.
+            if cat == "airport" and feat.tags.get("aeroway") in AIRPORT_PAVED:
+                continue
+            if cat == "railway" and is_rail_area(feat.tags) and _is_polygon(feat):
+                continue
             rings = _feature_coords_px(feat, proj)
+            colour = _route_fill(cat, feat.tags)
             if cat in ROAD_WIDTHS_M and not _is_polygon(feat):
                 width_px = _way_width_m(feat, cat) / meters_per_tile
-                _draw_line(l_draw, ground_rings(feat), fill, int(width_px))
+                drawn = ground_rings(feat)
+                _draw_line(l_draw, drawn, colour, int(width_px))
+                _mark(cat, feat, drawn, int(width_px))
             elif feat.kind == "relation":
-                _paint_multipolygon(landscape, feat, proj, fill)
+                _paint_multipolygon(landscape, feat, proj, colour)
+                _mark(cat, feat, rings)
             elif _is_polygon(feat):
-                _draw_polygon(l_draw, rings, fill)
+                _draw_polygon(l_draw, rings, colour)
+                _mark(cat, feat, rings)
             else:
                 # A river or canal mapped only as its centre line.
                 metres = WATERWAY_WIDTH_M.get(feat.tags.get("waterway"), 3.0)
-                _draw_line(l_draw, rings, fill, max(1, int(metres / meters_per_tile)))
+                width_px = max(1, int(metres / meters_per_tile))
+                _draw_line(l_draw, rings, fill, width_px)
+                _mark(cat, feat, rings, width_px)
+            show(landscape, stage=paint_stage)
+        if cat == "industrial":
+            yard = LANDSCAPE_FILL["railway"]
+            for feat in paint_buckets.get("railway", []):
+                if not (is_rail_area(feat.tags) and _is_polygon(feat)):
+                    continue
+                _paint_filled(l_draw, landscape, feat, proj, yard)
+                _mark("railway", feat, _feature_coords_px(feat, proj))
+                show(landscape, stage=paint_stage)
+
+    # Runways, taxiways and aprons. After every land-cover polygon, so the
+    # infield grass does not erase them, and before the shape clip.
+    for feat in paint_buckets.get("airport", []):
+        if feat.tags.get("aeroway") not in AIRPORT_PAVED:
+            continue
+        if _is_polygon(feat):
+            _paint_filled(l_draw, landscape, feat, proj, C.DARK_ASPHALT)
+            _mark("parking", feat, _feature_coords_px(feat, proj))
+        else:
+            width_px = _aeroway_width_m(feat) / meters_per_tile
+            drawn = ground_rings(feat)
+            _draw_line(l_draw, drawn, C.DARK_ASPHALT, max(1, int(width_px)))
+            cover.line(drawn, biomes.DIRT, max(1, int(width_px)))
+        show(landscape, stage=paint_stage)
 
     # Bridges over water squared to the tiles (generator/structures.py).
     for deck, cat in lifted.straight:
         l_draw.rectangle(deck.bounds, fill=LANDSCAPE_FILL.get(cat, C.MEDIUM_ASPHALT))
-    _pave_dense_ground(landscape, building_feats, buckets, proj)
+        cover.rectangle(deck.bounds, biomes.pixel_for(cat, {}, cover.climate))
+    # Corners, roundabout islands and turning circles, before the kerbs are
+    # read off the edge between tarmac and pavement. A junction on a deck is
+    # not a junction on the ground.
+    building_rings = [ring for feat in building_feats
+                      for ring in _feature_coords_px(feat, proj) if len(ring) >= 3]
+    intersections.shape_ground(
+        landscape, junctions, proj, cover, building_rings, set(lifted.cut),
+        [deck.bounds for deck, _cat in lifted.straight])
+    blocks = _pave_dense_ground(landscape, building_feats, paint_buckets, proj,
+                                cover=cover)
     for paved in lifted.paving:
         l_draw.polygon(list(paved.exterior.coords), fill=C.PAVING)
+        cover.polygon([list(paved.exterior.coords)], biomes.TOWN)
+    keep = None
     if clip is not None:
-        _clip_to_shape(landscape, clip, buckets, proj)
+        keep = _clip_to_shape(landscape, clip, paint_buckets, proj)
     _weather_roads(landscape, proj)
+    # Streets already went out while they were drawn. This frame is the
+    # ground between them, when any block was paved, weathered roads included.
+    show(landscape, force=True, stage="City blocks" if blocks else "Streets")
 
     knoxstop.check(should_stop, "the terrain")
-    _paint_vegetation(vegetation, landscape, vegetation_feats, proj,
+    _paint_vegetation(vegetation, landscape, paint_veg, proj,
                       density=tree_density)
+    _stamp_biome_woods(cover, paint_veg, proj)
+    cover.flush_woods()
+    cover.apply_shores()
+    if keep is not None:
+        cover.apply_keep(keep)
     _paint_gardens(vegetation, landscape, building_feats, proj, density=tree_density)
     _paint_wild_growth(vegetation, landscape, proj, density=tree_density)
     _clear_building_vegetation(vegetation, building_feats, proj)
-    _paint_road_details(vegetation, landscape, buckets, proj)
-    _paint_street_furniture(vegetation, landscape)
+    # An airfield is mown grass. Wild growth and garden trees treat that
+    # colour as open country, which would plant a wood across the runway.
+    _clear_building_vegetation(
+        vegetation,
+        [f for f in paint_buckets.get("airport", []) if _is_polygon(f)],
+        proj)
+    _clear_route_vegetation(vegetation, paint_buckets, proj)
+    show(_build_preview(landscape, vegetation), force=True, stage="Vegetation")
+    show(None, force=True, stage="Road markings and kerbs")
+    _paint_road_details(vegetation, landscape, buckets, proj, junctions.skip_rects())
+    show(None, force=True, stage="Intersections")
+    reserved = intersections.paint_controls(vegetation, landscape, junctions, proj)
+    show(None, force=True, stage="Street furniture")
+    _paint_street_furniture(vegetation, landscape, reserved)
     # Nothing grows through a deck or a ramp, and no lamp stands on one.
     veg_px = vegetation.load()
     for x, y in lifted.clear_veg:
@@ -753,13 +1047,19 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
     structures.settle_posts(lifted, lambda x, y: 0 <= x < proj.width and 0 <= y < proj.height
                             and ground_px[x, y] not in under)
 
-    # --- zombie spawn map (10x smaller, grayscale) ---
+    # The spawn density image and the visual preview only read the finished
+    # bitmaps, so compose them at the same time.
     spawn_w = proj.width // C.SPAWN_MAP_SCALE
     spawn_h = proj.height // C.SPAWN_MAP_SCALE
-    spawn_map = _build_spawn_map(landscape, spawn_w, spawn_h, spawn_density)
-
-    # --- preview (landscape + vegetation blended) ---
-    preview = _build_preview(landscape, vegetation)
+    show(None, force=True, stage="Compositing output images")
+    with ThreadPoolExecutor(max_workers=2,
+                            thread_name_prefix="knox-compose") as executor:
+        spawn_future = executor.submit(
+            _build_spawn_map, landscape, spawn_w, spawn_h, spawn_density)
+        preview_future = executor.submit(_build_preview, landscape, vegetation)
+        spawn_map = spawn_future.result()
+        preview = preview_future.result()
+    show(preview, force=True, stage="Writing map files")
 
     # --- output files ---
     os.makedirs(output_dir, exist_ok=True)
@@ -770,55 +1070,108 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
     buildings_path = os.path.join(output_dir, f"{map_name}_buildings.geojson")
     meta_path = os.path.join(output_dir, f"{map_name}_info.json")
 
-    landscape.save(landscape_path, format="BMP")
-    vegetation.save(veg_path, format="BMP")
-    # The ground as drawn, before knoxbuild paints front paths into it
-    # (knoxbuild/yards.py), so building again starts from clean ground.
-    landscape.save(os.path.join(output_dir, f"{map_name}_ground_base.bmp"), format="BMP")
-    vegetation.save(os.path.join(output_dir, f"{map_name}_veg_base.bmp"), format="BMP")
-    spawn_map.save(spawn_path, format="BMP")
-    preview.save(preview_path, format="PNG")
-
-    with open(buildings_path, "w", encoding="utf-8") as f:
-        json.dump(_buildings_geojson(building_feats), f)
-    with open(os.path.join(output_dir, f"{map_name}_areas.geojson"), "w", encoding="utf-8") as f:
-        json.dump(_areas_geojson(buckets), f)
-    with open(os.path.join(output_dir, f"{map_name}_fences.geojson"), "w", encoding="utf-8") as f:
-        json.dump(_lines_geojson([f for f in fence_feats
-                                  if clip is None or _inside(f, proj, clip)]), f)
-    with open(os.path.join(output_dir, f"{map_name}_structures.json"), "w", encoding="utf-8") as f:
-        json.dump({"bridges": lifted.bridges, "monuments": lifted.monuments,
-                   "tiles": lifted.rows()}, f)
-    with open(os.path.join(output_dir, f"{map_name}_places.json"), "w",
-              encoding="utf-8") as f:
-        json.dump(_places(place_feats, proj), f, ensure_ascii=False)
-
     cells_x, cells_y = proj.cell_grid()
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "map_name": map_name,
-            "bbox": {"south": south, "west": west, "north": north, "east": east},
-            "rotation": rotation,
-            "osm_cache": osm_cache,
-            "straight_roads": bool(straight_roads),
-            "osm_bbox": list(osm_bbox) if osm_bbox else None,
-            "shape": shape,
-            "meters_per_tile": meters_per_tile,
-            "width_tiles": proj.width,
-            "height_tiles": proj.height,
-            "cells_x": cells_x,
-            "cells_y": cells_y,
-            "spawn_density_max": spawn_density,
-            "building_count": len(building_feats),
-            "feature_count": sum(len(v) for v in buckets.values()),
-            # How many homes came from an address with no building drawn for
-            # it, so "it made none of mine" is a number rather than a guess.
-            "houses_from_addresses": len(addressed),
-            "guide_reference": "Thuztor Mapping Guide v0.2",
-            # The metre grid this bitmap was drawn on. A later build uses it
-            # so a mod cut out of a larger map stays where it was drawn.
-            "grid": proj.grid_dict(),
-        }, f, indent=2)
+    metadata = {
+        "map_name": map_name,
+        "bbox": {"south": south, "west": west, "north": north, "east": east},
+        "rotation": rotation,
+        "osm_cache": osm_cache,
+        "straight_roads": bool(straight_roads),
+        "osm_bbox": list(osm_bbox) if osm_bbox else None,
+        "shape": shape,
+        "meters_per_tile": meters_per_tile,
+        "width_tiles": proj.width,
+        "height_tiles": proj.height,
+        "cells_x": cells_x,
+        "cells_y": cells_y,
+        "spawn_density_max": spawn_density,
+        "building_count": len(building_feats),
+        "feature_count": sum(len(v) for v in buckets.values()),
+        "houses_from_addresses": len(addressed),
+        "houses_from_streets": len(streeted),
+        "guide_reference": "Thuztor Mapping Guide v0.2",
+        "grid": proj.grid_dict(),
+        # Climate class used to pick Build 42 biomes. The cell PNGs are
+        # written later, once the map has a world origin (knoxbuild).
+        "biome": {
+            "climate": cover.climate,
+            "open": cover.open,
+            "cell_tiles": biomes.BIOME_CELL,
+        },
+    }
+
+    def save_base(image, path, base_path):
+        import shutil
+        image.save(path, format="BMP")
+        # Building generation paints paths into the working bitmap. Its base
+        # copy must stay byte-for-byte identical to this original.
+        shutil.copyfile(path, base_path)
+
+    def save_image(image, path, image_format):
+        image.save(path, format=image_format)
+
+    def save_json(path, make_data, **options):
+        # json.dump walks the pure-Python encoder, one dict and list at a
+        # time. dumps() is that same encoder in C, so the text matches and
+        # the file is one write. Text mode stays, so an indented file still
+        # gets the platform newline translation dump() applied.
+        text = json.dumps(make_data(), **options)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    roads = [feat for cat in ROAD_EXPORT_CATEGORIES
+             for feat in buckets.get(cat, [])]
+    output_jobs = {
+        "landscape": lambda: save_base(
+            landscape, landscape_path,
+            os.path.join(output_dir, f"{map_name}_ground_base.bmp")),
+        "vegetation": lambda: save_base(
+            vegetation, veg_path,
+            os.path.join(output_dir, f"{map_name}_veg_base.bmp")),
+        "zombie map": lambda: save_image(spawn_map, spawn_path, "BMP"),
+        "preview": lambda: save_image(preview, preview_path, "PNG"),
+        "buildings": lambda: save_json(
+            buildings_path, lambda: _buildings_geojson(building_feats)),
+        "areas": lambda: save_json(
+            os.path.join(output_dir, f"{map_name}_areas.geojson"),
+            lambda: _areas_geojson(buckets)),
+        "roads": lambda: save_json(
+            os.path.join(output_dir, f"{map_name}_roads.geojson"),
+            lambda: _roads_geojson(roads, classify)),
+        "junctions": lambda: save_json(
+            os.path.join(output_dir, f"{map_name}_junctions.json"),
+            lambda: intersections.to_json(junctions)),
+        "fences": lambda: save_json(
+            os.path.join(output_dir, f"{map_name}_fences.geojson"),
+            lambda: _lines_geojson([f for f in fence_feats
+                                    if clip is None or _inside(f, proj, clip)])),
+        "structures": lambda: save_json(
+            os.path.join(output_dir, f"{map_name}_structures.json"),
+            lambda: {"bridges": lifted.bridges, "monuments": lifted.monuments,
+                     "tiles": lifted.rows()}),
+        "places": lambda: save_json(
+            os.path.join(output_dir, f"{map_name}_places.json"),
+            lambda: _places(place_feats, proj), ensure_ascii=False),
+        "metadata": lambda: save_json(meta_path, lambda: metadata, indent=2),
+        "biomes": lambda: _write_biomes(
+            cover, output_dir, map_name),
+        "zones": lambda: save_json(
+            os.path.join(output_dir, f"{map_name}_zones.geojson"),
+            lambda: _zones_geojson(buckets)),
+    }
+    workers = min(len(output_jobs), os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="knox-output") as executor:
+        pending = {executor.submit(job): name for name, job in output_jobs.items()}
+        completed = 0
+        while pending:
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in finished:
+                pending.pop(future)
+                future.result()
+                completed += 1
+                show(None, force=True,
+                     stage=f"Writing map files ({completed} of {len(output_jobs)})")
 
     return RenderResult(
         landscape_path=landscape_path,
@@ -841,7 +1194,7 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
 DENSE_COVERAGE = 0.28
 # Mapped green space keeps its grass however built-up the area around it is.
 GREEN_CATEGORIES = {"park", "grass", "sports", "cemetery", "orchard", "farmland",
-                    "wetland", "hospital_grounds"}
+                    "wetland", "hospital_grounds", "airport"}
 
 
 def sea_polygons(feats: list[OSMFeature], proj: Projector) -> list:
@@ -1016,7 +1369,8 @@ def _smooth_road_edges(landscape: Image.Image, asphalt, is_colour) -> None:
 
 
 def _paint_road_details(veg: Image.Image, landscape: Image.Image,
-                        buckets: dict[str, list[OSMFeature]], proj: Projector) -> None:
+                        buckets: dict[str, list[OSMFeature]], proj: Projector,
+                        skip_rects=()) -> None:
     """Kerbs where pavement meets the road, and lines down two-lane roads.
 
     Asphalt ran straight into the pavement with nothing between them, and a
@@ -1077,6 +1431,10 @@ def _paint_road_details(veg: Image.Image, landscape: Image.Image,
         for feat in buckets.get(cat, []):
             if _is_polygon(feat):
                 continue
+            # A roundabout is one-way whether or not the tag says so, and a
+            # line around the ring would run through the island.
+            if feat.tags.get("junction") in {"roundabout", "circular"}:
+                continue
             width = _way_width_m(feat, cat) / mpt
             if width < 6 or feat.tags.get("oneway") in ("yes", "1", "-1"):
                 continue
@@ -1089,6 +1447,13 @@ def _paint_road_details(veg: Image.Image, landscape: Image.Image,
                         marks.append((style, "W", ax, ay, bx, by, width))
     if not marks:
         return
+    # Junction boxes, so a centre line stops at the stop line instead of
+    # running through the crossroads. Built once; the line walk is per tile.
+    blocked = set()
+    for x0, y0, x1, y1 in skip_rects:
+        for y in range(max(0, int(y0)), min(h, int(y1))):
+            for x in range(max(0, int(x0)), min(w, int(x1))):
+                blocked.add((x, y))
     colour_for = {("yellow", "N"): C.LINE_YELLOW_N, ("yellow", "W"): C.LINE_YELLOW_W,
                   ("white", "N"): C.LINE_WHITE_N, ("white", "W"): C.LINE_WHITE_W}
     ground_px = landscape.load()
@@ -1107,6 +1472,8 @@ def _paint_road_details(veg: Image.Image, landscape: Image.Image,
             y = int(round(ay + (by - ay) * t))
             along = x if edge == "N" else y
             if style == "white" and (along // 3) % 2:
+                continue
+            if (x, y) in blocked:
                 continue
             if not (road_at(x, y) and (road_at(x, y - 1) if edge == "N" else road_at(x - 1, y))):
                 continue
@@ -1159,7 +1526,8 @@ HYDRANT_EVERY = 70
 DRAIN_EVERY = 34
 
 
-def _paint_street_furniture(veg: Image.Image, landscape: Image.Image) -> dict:
+def _paint_street_furniture(veg: Image.Image, landscape: Image.Image,
+                            reserved=None) -> dict:
     """Lamps, hydrants and drains along the kerbs; grime, cracks and litter.
 
     A generated street was clean tarmac, kerb and pavement and nothing else;
@@ -1236,6 +1604,18 @@ def _paint_street_furniture(veg: Image.Image, landscape: Image.Image) -> dict:
                 (C.EDGE_LINE_N, (0, -1), C.LAMP_S), (C.EDGE_LINE_S, (0, 1), C.LAMP_N)]
     taken: dict[str, set] = {"lamp": set(), "hydrant": set(), "drain": set(), "speed": set()}
     out = vp.copy()
+    # A signalised junction gets a lamp on each pavement corner, before the
+    # regular spacing claims the cell.
+    if reserved is not None:
+        for lx, ly, colour in reserved.lamps:
+            if not (0 <= lx < w and 0 <= ly < h):
+                continue
+            if not empty[ly, lx] or asphalt[ly, lx]:
+                continue
+            out[ly, lx] = colour
+            empty[ly, lx] = False
+            taken["lamp"].add((lx // LAMP_EVERY, ly // LAMP_EVERY, None))
+            counts["lamp"] = counts.get("lamp", 0) + 1
     # Speed signs stand where drivers keeping right see their faces: on the
     # east kerb of a north-south road facing south, the north kerb of an
     # east-west one facing east. Erika's signs only face those two ways.
@@ -1270,6 +1650,9 @@ def _paint_street_furniture(veg: Image.Image, landscape: Image.Image) -> dict:
                 px, py = at
                 if colour is None or not (0 <= px < w and 0 <= py < h):
                     continue
+                # Signs, lines and the junction box are already spoken for.
+                if reserved is not None and reserved.covers(px, py):
+                    continue
                 # Speed signs keep a spacing per facing: the north-south roads,
                 # met first, took every cell and left east-west ones none.
                 cell = (px // every, py // every, facing if what == "speed" else None)
@@ -1299,11 +1682,22 @@ def _paint_street_furniture(veg: Image.Image, landscape: Image.Image) -> dict:
     # Scattered things: each square rolls once, and each kind has its own band
     # of the roll, so no square gets two.
     roll = rng.random((h, w))
+    # Litter stays off the junction. Grime and cracks may still land there:
+    # wear does not stop for a stop line.
+    held = np.zeros((h, w), dtype=bool)
+    if reserved is not None:
+        for x0, y0, x1, y1 in reserved.rects:
+            held[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = True
+        for tx, ty in reserved.tiles:
+            if 0 <= tx < w and 0 <= ty < h:
+                held[ty, tx] = True
     lo = 0.0
     for mask, share, colour, name in (
             (asphalt, CRACK_SHARE, C.ASPHALT_CRACKS, "cracks"),
             (pavement, LITTER_SHARE, C.LITTER, "litter")):
         pick = mask & empty & (roll >= lo) & (roll < lo + share)
+        if name == "litter":
+            pick &= ~held
         lo += share
         out[pick] = colour
         empty &= ~pick
@@ -1313,7 +1707,8 @@ def _paint_street_furniture(veg: Image.Image, landscape: Image.Image) -> dict:
 
 
 def _pave_dense_ground(landscape: Image.Image, building_feats: list[OSMFeature],
-                       buckets: dict[str, list[OSMFeature]], proj: Projector) -> None:
+                       buckets: dict[str, list[OSMFeature]], proj: Projector,
+                       cover=None):
     """Pave the unmapped ground of built-up city blocks.
 
     Land OSM says nothing about is painted as wild grass, which is right in the
@@ -1404,6 +1799,9 @@ def _pave_dense_ground(landscape: Image.Image, building_feats: list[OSMFeature],
         if mask.any():
             paint = Image.new("RGB", (w, y1 - y0), C.PALE_CONCRETE)
             landscape.paste(paint, (0, y0), Image.fromarray(mask.astype(np.uint8) * 255))
+            if cover is not None:
+                cover.paint_mask(mask, biomes.TOWN, y0)
+    return True
 
 
 def _weather_roads(landscape: Image.Image, proj: Projector) -> None:
@@ -1439,6 +1837,36 @@ def _weather_roads(landscape: Image.Image, proj: Projector) -> None:
                     continue
                 if px[x, y] in asphalt:
                     px[x, y] = shade
+
+
+def _stamp_biome_woods(cover, feats: list[OSMFeature], proj: Projector) -> None:
+    """Forest and scrub polygons become the climate's woodland biome.
+
+    Roads, water and bare ground are left alone inside ``flush_woods``. A
+    single mapped tree is a small patch of the same woodland, not a forest
+    zone the size of a field.
+    """
+    for feat in feats:
+        cat = classify(feat.tags)
+        rings = _feature_coords_px(feat, proj)
+        if cat in {"forest", "scrub"} and _is_polygon(feat):
+            holes = ()
+            if feat.kind == "relation":
+                outers = []
+                holes = []
+                for role, ring in feat.role_geoms:
+                    projected = [proj.to_px(la, lo) for la, lo in ring]
+                    if len(projected) < 3:
+                        continue
+                    if role == "inner":
+                        holes.append(projected)
+                    else:
+                        outers.append(projected)
+                rings = outers
+            cover.queue_wood(rings, feat.tags, scrub=cat == "scrub", holes=holes)
+        elif cat == "tree_single" and rings and rings[0]:
+            radius = max(1, int(2 / proj.meters_per_tile))
+            cover.queue_wood(rings, feat.tags, radius=radius)
 
 
 def _paint_vegetation(veg: Image.Image, landscape: Image.Image,
@@ -1491,41 +1919,49 @@ def _paint_woodland(veg: Image.Image, landscape: Image.Image,
 
     # Build a "border band" of the forest mask so we can paint edges lighter.
     eroded = mask.filter(ImageFilter.MinFilter(5))
-    veg_px = veg.load()
-    mask_px = mask.load()
-    eroded_px = eroded.load()
-    scrub_px = scrub_mask.load()
-    land_px = landscape.load()
 
     # Thickest to thinnest. `density` shifts every tile along this ladder.
+    # The shift depends only on density, so it is resolved once: at 1.0 the
+    # two forest colours are used as they stand, the way graded() returned
+    # its argument unchanged.
     GRADES = [C.VEG_NOTHING, C.SPARSE_TREES, C.TREES_DARK_GRASS, C.TREES]
-
-    def graded(colour) -> tuple[int, int, int]:
-        if density == 1.0:
-            return colour
-        i = GRADES.index(colour)
+    if density == 1.0:
+        full_shade, edge_shade = C.TREES, C.TREES_DARK_GRASS
+    else:
         shift = round((density - 1.0) * 2)
-        return GRADES[min(max(i + shift, 0), len(GRADES) - 1)]
+        limit = len(GRADES) - 1
+        full_shade = GRADES[min(max(GRADES.index(C.TREES) + shift, 0), limit)]
+        edge_shade = GRADES[min(max(
+            GRADES.index(C.TREES_DARK_GRASS) + shift, 0), limit)]
 
-    w, h = veg.size
-    for y in range(h):
-        for x in range(w):
-            if scrub_px[x, y]:
-                veg_px[x, y] = C.BUSHES_TREES_DARK_GRASS
-            if mask_px[x, y]:
-                # Only paint trees on grass / dirt. Skip water, roads, buildings.
-                lp = land_px[x, y]
-                if lp == C.WATER:
-                    continue
-                shade = graded(C.TREES if eroded_px[x, y]
-                               else C.TREES_DARK_GRASS)
-                if shade == C.VEG_NOTHING:
-                    continue
-                veg_px[x, y] = shade
-                # Trees on a grass tile → switch the landscape to DARK_GRASS
-                # so the PZ renderer is happy (trees sit on dark grass best).
-                if lp in (C.MEDIUM_GRASS, C.LIGHT_GRASS):
-                    land_px[x, y] = C.DARK_GRASS
+    import numpy as np
+
+    # load() treats 0 as false. Scrub is written first, including on water,
+    # and a forest shade overwrites it. Water, and a VEG_NOTHING grade, skip
+    # that write and leave the scrub (and the ground) as they are.
+    veg_px = np.array(veg, copy=True)
+    land_px = np.array(landscape, copy=True)
+    scrub_hit = np.asarray(scrub_mask) != 0
+    forest_hit = np.asarray(mask) != 0
+    core = np.asarray(eroded) != 0
+    veg_px[scrub_hit] = C.BUSHES_TREES_DARK_GRASS
+
+    # Only paint trees on grass / dirt. Skip water, roads, buildings.
+    water = np.all(land_px == C.WATER, axis=2)
+    paintable = forest_hit & ~water
+    soften = (np.all(land_px == C.MEDIUM_GRASS, axis=2)
+              | np.all(land_px == C.LIGHT_GRASS, axis=2))
+    for shade, where in ((full_shade, paintable & core),
+                         (edge_shade, paintable & ~core)):
+        if shade == C.VEG_NOTHING:
+            continue
+        veg_px[where] = shade
+        # Trees on a grass tile → switch the landscape to DARK_GRASS
+        # so the PZ renderer is happy (trees sit on dark grass best).
+        land_px[where & soften] = C.DARK_GRASS
+
+    veg.paste(Image.fromarray(veg_px), (0, 0))
+    landscape.paste(Image.fromarray(land_px), (0, 0))
 
 
 def _paint_vegetation_extras(veg: Image.Image, landscape: Image.Image,
@@ -1613,11 +2049,30 @@ LONG_GRASS_SHARE = 0.0
 GRASS_COLOURS = (C.DARK_GRASS, C.MEDIUM_GRASS, C.LIGHT_GRASS)
 
 
-# Rows of the map worked on at a time in _box_any. A whole town's summed-area
-# table is four bytes a tile twice over - a 6000 x 5400 map needed a third of a
-# gigabyte for one call, which is what ran a 32-bit Python out of memory. In
-# strips it is a few megabytes, for the same answer.
+# Rows of the map worked on at a time in _box_any. The reach used to be a
+# summed-area table, four bytes a tile twice over - a 6000 x 5400 map needed
+# a third of a gigabyte for one call, which ran a 32-bit Python out of memory.
+# Strips keep the scratch to a few megabytes, for the same answer.
 BOX_STRIP_ROWS = 512
+
+
+def _window_any(values, size: int, axis: int):
+    """True where any value in a centered window along `axis` is nonzero.
+
+    Outside the array counts as zero, the same border a constant-0 filter uses.
+    `size` is odd, so the window sits on the tile rather than between two.
+    """
+    import numpy as np
+
+    radius = size // 2
+    moved = np.moveaxis(values, axis, -1)
+    padded = np.pad(moved, [(0, 0)] * (moved.ndim - 1) + [(radius, radius)])
+    acc = np.cumsum(padded, axis=-1, dtype=np.int32)
+    n = moved.shape[-1]
+    hi = acc[..., size - 1:size - 1 + n]
+    lo = np.zeros(hi.shape, dtype=np.int32)
+    lo[..., 1:] = acc[..., :n - 1]
+    return np.moveaxis((hi - lo) > 0, -1, axis)
 
 
 def _box_any(mask, radius: int):
@@ -1625,21 +2080,23 @@ def _box_any(mask, radius: int):
     import numpy as np
 
     h, w = mask.shape
+    # A 1x1 window is the mask. Same answer as the summed-area test at radius 0.
+    if radius == 0:
+        return np.array(mask, dtype=bool)
     out = np.zeros((h, w), dtype=bool)
-    k = 2 * radius + 1
+    if h == 0 or w == 0:
+        return out
+    # Any set tile in the square is a row-wise window, then the same down the
+    # columns. Outside the map counts as empty, which is what the old padding
+    # stood for.
+    size = 2 * radius + 1
     for top in range(0, h, BOX_STRIP_ROWS):
         bottom = min(h, top + BOX_STRIP_ROWS)
-        # The strip, plus the rows on either side that can reach into it. Past
-        # the top and bottom of the map there is nothing, which is what the
-        # padding stands for, exactly as it did for the whole map at once.
         y0, y1 = max(0, top - radius), min(h, bottom + radius)
-        block = np.pad(mask[y0:y1].astype(np.int32), radius + 1)
-        ii = block.cumsum(0)
-        ii = ii.cumsum(1)
-        rows = y1 - y0
-        total = (ii[k:k + rows, k:k + w] - ii[0:rows, k:k + w]
-                 - ii[k:k + rows, 0:w] + ii[0:rows, 0:w])
-        out[top:bottom] = total[top - y0:bottom - y0] > 0
+        block = np.ascontiguousarray(mask[y0:y1], dtype=np.uint8)
+        horiz = _window_any(block, size, 1)
+        vert = _window_any(horiz, size, 0)
+        out[top:bottom] = vert[top - y0:bottom - y0]
     return out
 
 
@@ -1660,53 +2117,119 @@ def _paint_gardens(veg: Image.Image, landscape: Image.Image,
     house = np.array(houses, dtype=bool)
     del houses
     ground = np.array(landscape.convert("RGB"))
+    # One packed key, then a compare per grass colour. Same tiles as matching
+    # the three channels separately.
+    key = (ground[..., 0].astype(np.uint32) << 16
+           | ground[..., 1].astype(np.uint32) << 8
+           | ground[..., 2].astype(np.uint32))
     grass = np.zeros(house.shape, dtype=bool)
     for colour in GRASS_COLOURS:
-        grass |= np.all(ground == colour, axis=2)
-    del ground                       # a town's worth of pixels; let it go
+        packed = (colour[0] << 16) | (colour[1] << 8) | colour[2]
+        grass |= key == packed
+    del ground, key                 # a town's worth of pixels; let it go
     vegp = np.array(veg.convert("RGB"))
     empty = np.all(vegp == 0, axis=2)
     del vegp
     lawn = grass & empty & ~house
     del empty
     paved_near = _box_any(~grass & ~house, GARDEN_CLEAR_OF_PAVING)
+    del grass
 
     yard = lawn & _box_any(house, GARDEN_REACH_TILES)         & ~_box_any(house, GARDEN_CLEAR_OF_HOUSE) & ~paved_near
     rng = np.random.default_rng(1234)
     step = GARDEN_TREE_EVERY
     chance = min(1.0, GARDEN_TREE_CHANCE * density)
     h, w = house.shape
-    px = veg.load()
+    ncy = (h + step - 1) // step
+    ncx = (w + step - 1) // step
+    ncells = ncy * ncx
+    # One pass over the yard, then each grid cell's pixels in the order
+    # np.nonzero used to hand back for that cell alone. The integer draw
+    # therefore picks the same tile it used to.
+    ys_all, xs_all = np.nonzero(yard)
+    del yard
+    starts = np.zeros(ncells + 1, dtype=np.int64)
+    if len(xs_all):
+        cid = (ys_all // step) * ncx + (xs_all // step)
+        order = np.argsort(cid, kind="stable")
+        ys_all = ys_all[order]
+        xs_all = xs_all[order]
+        counts = np.bincount(cid[order], minlength=ncells)
+        del cid, order
+        np.cumsum(counts, out=starts[1:])
+        occ = np.flatnonzero(counts)
+        del counts
+    else:
+        occ = np.empty(0, dtype=np.int64)
+
+    def burn(n):
+        # Same draws as n calls to rng.random(), then dropped. An empty cell
+        # never asks for an integer, whatever its roll was, so a batch of
+        # those rolls leaves every later draw where it was. In pieces, because
+        # one array for a whole town is a quarter of a gigabyte of floats.
+        piece = 1 << 18
+        while n > piece:
+            rng.random(piece)
+            n -= piece
+        if n:
+            rng.random(n)
+
+    tree_ys = np.empty(len(occ), dtype=ys_all.dtype)
+    tree_xs = np.empty(len(occ), dtype=xs_all.dtype)
     planted = 0
-    for y0 in range(0, h, step):
-        for x0 in range(0, w, step):
-            if rng.random() >= chance:
-                continue
-            ys, xs = np.nonzero(yard[y0:y0 + step, x0:x0 + step])
-            if len(xs) == 0:
-                continue
-            i = rng.integers(len(xs))
-            px[int(x0 + xs[i]), int(y0 + ys[i])] = C.TREES
-            planted += 1
+    prev = 0
+    for i in occ:
+        i = int(i)
+        gap = i - prev
+        if gap:
+            burn(gap)
+        prev = i + 1
+        # The skip is rolled before the cell is looked at, same as the old
+        # loop. Only a cell that passed and actually has yard consumes an
+        # integer, and that integer is the index in the cell's nonzero list.
+        if rng.random() >= chance:
+            continue
+        a = int(starts[i])
+        b = int(starts[i + 1])
+        pick = int(rng.integers(b - a))
+        tree_ys[planted] = ys_all[a + pick]
+        tree_xs[planted] = xs_all[a + pick]
+        planted += 1
+    tail = ncells - prev
+    if tail:
+        burn(tail)
+    del starts, occ, ys_all, xs_all
 
     # Shrubs: lawn right against a wall, not in front of the paving.
     # The dice are rolled for the tiles in question, not for every tile on the
     # map: one roll each way over a town is a quarter of a gigabyte of floats.
     beside = lawn & _box_any(house, 1) & ~house & ~paved_near
-    ys, xs = np.nonzero(beside)
-    keep = rng.random(len(xs)) < SHRUB_CHANCE * density
-    for x, y in zip(xs[keep].tolist(), ys[keep].tolist()):
-        px[x, y] = C.BUSHES
+    bys, bxs = np.nonzero(beside)
+    keep = rng.random(len(bxs)) < SHRUB_CHANCE * density
 
-    open_grass = lawn & ~beside & ~_box_any(house, 0)
-    ys, xs = np.nonzero(open_grass)
-    roll = rng.random(len(xs))
+    # Radius 0 is the house mask itself. Lawn is already clear of it.
+    open_grass = lawn & ~beside & ~house
+    del beside, paved_near, lawn, house
+    gys, gxs = np.nonzero(open_grass)
+    del open_grass
+    roll = rng.random(len(gxs))
+
+    veg_arr = np.array(veg.convert("RGB"))
+    if planted:
+        veg_arr[tree_ys[:planted], tree_xs[:planted]] = C.TREES
+    if keep.any():
+        veg_arr[bys[keep], bxs[keep]] = C.BUSHES
     for colour, share, lo in ((C.SHORT_GRASS, SHORT_GRASS_SHARE, 0.0),
                               (C.GRASS_ON_DARK, LONG_GRASS_SHARE, SHORT_GRASS_SHARE)):
         pick = (roll >= lo) & (roll < lo + share)
-        for x, y in zip(xs[pick].tolist(), ys[pick].tolist()):
-            if px[x, y] == C.VEG_NOTHING:
-                px[x, y] = colour
+        if not pick.any():
+            continue
+        sy = gys[pick]
+        sx = gxs[pick]
+        still = np.all(veg_arr[sy, sx] == C.VEG_NOTHING, axis=1)
+        if still.any():
+            veg_arr[sy[still], sx[still]] = colour
+    veg.paste(Image.fromarray(veg_arr, "RGB"))
     return planted
 
 
@@ -1774,6 +2297,29 @@ def _paint_wild_growth(veg: Image.Image, landscape: Image.Image,
     return planted
 
 
+def _clear_route_vegetation(veg: Image.Image, buckets: dict, proj: Projector) -> None:
+    """No trees on a walking path or a track.
+
+    Woodland is painted over the whole polygon, path included, so a trail
+    through a wood came out as trees standing in the dirt.
+    """
+    mask = Image.new("1", veg.size, 0)
+    draw = ImageDraw.Draw(mask)
+    hit = False
+    for cat in ("dirt_path", "paved_path", "road_track"):
+        for feat in buckets.get(cat, []):
+            if _is_polygon(feat):
+                continue
+            width = max(1, int(_way_width_m(feat, cat) / proj.meters_per_tile))
+            for ring in _feature_coords_px(feat, proj):
+                if len(ring) < 2:
+                    continue
+                draw.line(ring, fill=1, width=width)
+                hit = True
+    if hit:
+        veg.paste(Image.new("RGB", veg.size, C.VEG_NOTHING), (0, 0), mask)
+
+
 def _clear_building_vegetation(veg: Image.Image, feats: list[OSMFeature],
                                proj: Projector) -> None:
     """No trees or bushes inside a building.
@@ -1809,30 +2355,358 @@ def _places(feats: list[OSMFeature], proj: Projector) -> list[dict]:
     return out
 
 
-AREA_TAGS = {"landuse", "amenity", "leisure", "name", "religion"}
+def feature_id(feat, index: int) -> str:
+    """Stable id for an exported feature. Ways and relations keep their OSM id
+    so an edit survives a rebuild of the file; a feature with no id falls back
+    to its position, which is stable until the map is generated again."""
+    osm_id = getattr(feat, "osm_id", None)
+    kind = getattr(feat, "kind", "")
+    if osm_id:
+        prefix = "r" if kind == "relation" else "w"
+        return f"{prefix}{osm_id}"
+    return f"i{index}"
+
+
+def _tagged_feature(feat, features: list, properties: dict, geometry: dict) -> None:
+    """Append a GeoJSON Feature. The id is its place in that feature list."""
+    fid = feature_id(feat, len(features))
+    props = {"fid": fid}
+    props.update({k: v for k, v in properties.items() if k != "fid"})
+    features.append({
+        "type": "Feature",
+        "id": fid,
+        "properties": props,
+        "geometry": geometry,
+    })
+
+
+def _area_polygons(feat: OSMFeature):
+    """Outer rings as GeoJSON polygons, or None when this feature is not an area."""
+    if not _is_polygon(feat):
+        return None
+    if feat.kind == "way":
+        rings = [[[lon, lat] for lat, lon in feat.geometry]]
+    else:
+        rings = [[[lon, lat] for lat, lon in ring]
+                 for role, ring in feat.role_geoms if role != "inner"]
+    polys = [[ring] for ring in rings if len(ring) >= 3]
+    return polys or None
+
+
+def _area_exports(buckets: dict[str, list[OSMFeature]]):
+    """Area polygons in the order `_areas.geojson` writes them.
+
+    Edit fids are assigned from this same walk, so a category override finds
+    the feature the file named.
+    """
+    yield from _categorised_areas(buckets, AREA_CATEGORIES)
+
+
+def _categorised_areas(buckets: dict[str, list[OSMFeature]], categories):
+    for cat in categories:
+        for feat in buckets.get(cat, []):
+            # Track centre lines share the railway category with the yards,
+            # and runways share the airport category with the field. Only the
+            # grounds are an area a building can stand in.
+            if cat == "railway" and not is_rail_area(feat.tags):
+                continue
+            if cat == "airport" and not is_airport_area(feat.tags):
+                continue
+            polys = _area_polygons(feat)
+            if polys:
+                yield cat, feat, polys
+
+
+def _zones_geojson(buckets: dict[str, list[OSMFeature]]) -> dict:
+    """Land-use polygons for the generate-tab zoning overlay."""
+    features = []
+    for cat, feat, polys in _categorised_areas(buckets, ZONE_CATEGORIES):
+        _tagged_feature(feat, features,
+                        {"category": cat,
+                         **{k: v for k, v in feat.tags.items() if k in AREA_TAGS}},
+                        {"type": "MultiPolygon", "coordinates": polys})
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _write_biomes(cover, output_dir: str, map_name: str) -> None:
+    """The game's biome index, plus the coloured overlay the window shows."""
+    cover.save(os.path.join(output_dir, f"{map_name}_biome.png"))
+    cover.save_overlay(os.path.join(output_dir, f"{map_name}_biome_overlay.png"))
+    with open(os.path.join(output_dir, f"{map_name}_biome_legend.json"),
+              "w", encoding="utf-8") as handle:
+        json.dump(biomes.overlay_legend(), handle)
+
+
+def _roads_geojson(feats, classify) -> dict:
+    """Highway centrelines in lon/lat, for the classes the paper map draws."""
+    features = []
+    for feat in feats:
+        if _is_polygon(feat) or feat.kind != "way" or len(feat.geometry) < 2:
+            continue
+        cat = classify(feat.tags)
+        if cat not in ROAD_EXPORT_CATEGORIES:
+            continue
+        coords = [[lon, lat] for lat, lon in feat.geometry]
+        if len(coords) < 2:
+            continue
+        _tagged_feature(feat, features, {
+            "name": feat.tags.get("name") or "",
+            "category": cat,
+            "width": _way_width_m(feat, cat),
+        }, {"type": "LineString", "coordinates": coords})
+    return {"type": "FeatureCollection", "features": features}
+
+
+# Tags that classify() returns as this category, and nothing earlier in that
+# function. Vegetation paint calls classify() again, so a recategorised area
+# has to carry these instead of its original tags. Ground paint uses the
+# bucket, which is set to the same category.
+_PAINT_TAGS = {
+    "residential": {"landuse": "residential"},
+    "commercial": {"landuse": "commercial"},
+    "industrial": {"landuse": "industrial"},
+    "military": {"landuse": "military"},
+    "schoolyard": {"amenity": "school"},
+    "hospital_grounds": {"amenity": "hospital"},
+    "worship_grounds": {"amenity": "place_of_worship"},
+    "cemetery": {"landuse": "cemetery"},
+    "parking": {"amenity": "parking"},
+    "sports": {"leisure": "sports_centre"},
+    "airport": {"aeroway": "aerodrome"},
+    "railway": {"landuse": "railway"},
+    "orchard": {"landuse": "orchard"},
+    "forest": {"landuse": "forest"},
+    "scrub": {"natural": "scrub"},
+    "tree_single": {"natural": "tree"},
+    "hedge": {"barrier": "hedge"},
+    "wetland": {"natural": "wetland"},
+    "park": {"leisure": "park"},
+    "grass": {"landuse": "grass"},
+    "farmland": {"landuse": "farmland"},
+    "water": {"natural": "water"},
+    "sand": {"natural": "sand"},
+    "dirt": {"landuse": "brownfield"},
+    "playground": {"leisure": "playground"},
+    "track": {"leisure": "track"},
+    "pool": {"leisure": "swimming_pool"},
+    "plaza": {"place": "square"},
+}
+
+
+def _edit_field(rec, key):
+    if isinstance(rec, dict):
+        return rec.get(key)
+    if rec is None:
+        return None
+    return getattr(rec, key, None)
+
+
+def _edit_deleted(rec) -> bool:
+    flag = _edit_field(rec, "deleted")
+    return flag is True or flag == 1
+
+
+def _edit_category(rec) -> str:
+    raw = _edit_field(rec, "category")
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip()
+
+
+def _edit_dict(edits, key) -> dict:
+    if isinstance(edits, dict):
+        raw = edits.get(key)
+    else:
+        raw = getattr(edits, key, None)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _edit_list(edits, key) -> list:
+    if isinstance(edits, dict):
+        raw = edits.get(key)
+    else:
+        raw = getattr(edits, key, None)
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, tuple):
+        return list(raw)
+    return []
+
+
+def _read_edits_file(out_dir, map_name):
+    """areas and added_areas from the overlay file, when edits.py cannot load."""
+    path = os.path.join(out_dir, f"{map_name}_edits.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_edits(out_dir, map_name):
+    """The edit overlay, or None when there is nothing to apply.
+
+    knoxbuild.edits is imported here, not at startup, so a generate still
+    finishes while that module is being written. If the import or the load
+    fails, the JSON is read directly and only its areas are used.
+    """
+    try:
+        from knoxbuild.edits import Edits
+        return Edits.load(out_dir, map_name)
+    except Exception:
+        return _read_edits_file(out_dir, map_name)
+
+
+def _latlon_ring(ring) -> list[tuple[float, float]] | None:
+    """A GeoJSON ring (lon, lat) as the (lat, lon) pairs the painter expects."""
+    if not isinstance(ring, (list, tuple)) or len(ring) < 3:
+        return None
+    out = []
+    for pt in ring:
+        if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+            return None
+        try:
+            lon, lat = float(pt[0]), float(pt[1])
+        except (TypeError, ValueError):
+            return None
+        out.append((lat, lon))
+    if out[0] != out[-1]:
+        out.append(out[0])
+    if len(out) < 4:
+        return None
+    return out
+
+
+def _polygon_roles(rings) -> list[tuple[str, list]]:
+    if not isinstance(rings, (list, tuple)) or not rings:
+        return []
+    # A bare ring (points) rather than a polygon (list of rings).
+    first = rings[0]
+    if (isinstance(first, (list, tuple)) and first
+            and isinstance(first[0], (int, float))):
+        rings = [rings]
+    roles = []
+    for i, ring in enumerate(rings):
+        pts = _latlon_ring(ring)
+        if pts is None:
+            continue
+        roles.append(("outer" if i == 0 else "inner", pts))
+    return roles
+
+
+def _polygon_feature(tags: dict, coords) -> OSMFeature | None:
+    roles = _polygon_roles(coords)
+    outers = [ring for role, ring in roles if role == "outer"]
+    inners = [ring for role, ring in roles if role == "inner"]
+    if not outers:
+        return None
+    if len(outers) == 1 and not inners:
+        return OSMFeature(osm_id=0, kind="way", tags=dict(tags), geometry=outers[0])
+    return OSMFeature(osm_id=0, kind="relation", tags=dict(tags),
+                      geometry=[], role_geoms=roles)
+
+
+def _feature_for_area(cat: str, geometry) -> OSMFeature | None:
+    tags = _PAINT_TAGS.get(cat)
+    if not tags or not isinstance(geometry, dict):
+        return None
+    coords = geometry.get("coordinates")
+    kind = geometry.get("type")
+    if kind == "Polygon":
+        return _polygon_feature(tags, coords)
+    if kind == "MultiPolygon" and isinstance(coords, list):
+        roles = []
+        for poly in coords:
+            roles.extend(_polygon_roles(poly))
+        if not any(role == "outer" for role, _ring in roles):
+            return None
+        return OSMFeature(osm_id=0, kind="relation", tags=dict(tags),
+                          geometry=[], role_geoms=roles)
+    return None
+
+
+def _retag(feat: OSMFeature, cat: str) -> OSMFeature:
+    return OSMFeature(osm_id=feat.osm_id, kind=feat.kind, tags=dict(_PAINT_TAGS[cat]),
+                      geometry=feat.geometry, role_geoms=feat.role_geoms)
+
+
+def _place_for_paint(buckets: dict[str, list[OSMFeature]],
+                     veg: list[OSMFeature], feat: OSMFeature, cat: str) -> None:
+    """Where the bucketing loop would have put a feature of `cat`.
+
+    Woodland and hedges are vegetation only. Cemetery, orchard and wetland
+    are a ground fill and a vegetation pass.
+    """
+    if cat in VEG_CATEGORIES:
+        veg.append(feat)
+        if cat in {"forest", "scrub", "tree_single", "hedge"}:
+            return
+    buckets.setdefault(cat, []).append(feat)
+
+
+def _areas_for_paint(buckets: dict[str, list[OSMFeature]],
+                     vegetation_feats: list[OSMFeature], edits):
+    """Ground and vegetation lists with area edits applied.
+
+    Returns the original lists when nothing about areas changed, so an
+    overlay that only renames buildings paints exactly as before. Otherwise
+    the lists are copies: `buckets` is what `_areas.geojson` is written from.
+    """
+    overlay = _edit_dict(edits, "areas")
+    added = _edit_list(edits, "added_areas")
+    if not overlay and not added:
+        return buckets, vegetation_feats
+
+    drop: set[int] = set()
+    moved: dict[int, tuple[OSMFeature, str]] = {}
+    for index, (cat, feat, _polys) in enumerate(_area_exports(buckets)):
+        rec = overlay.get(feature_id(feat, index))
+        if not rec:
+            continue
+        if _edit_deleted(rec):
+            drop.add(id(feat))
+            continue
+        new_cat = _edit_category(rec)
+        if new_cat and new_cat != cat and new_cat in _PAINT_TAGS:
+            moved[id(feat)] = (feat, new_cat)
+
+    fresh = []
+    for item in added:
+        try:
+            cat = _edit_category(item)
+            feat = _feature_for_area(cat, _edit_field(item, "geometry"))
+        except Exception:
+            continue
+        if feat is not None:
+            fresh.append((feat, cat))
+    if not drop and not moved and not fresh:
+        return buckets, vegetation_feats
+
+    skip = drop | set(moved)
+    paint_buckets = {
+        cat: [feat for feat in feats if id(feat) not in skip]
+        for cat, feats in buckets.items()
+    }
+    paint_veg = [feat for feat in vegetation_feats if id(feat) not in skip]
+    for feat, cat in moved.values():
+        _place_for_paint(paint_buckets, paint_veg, _retag(feat, cat), cat)
+    for feat, cat in fresh:
+        _place_for_paint(paint_buckets, paint_veg, feat, cat)
+    return paint_buckets, paint_veg
+
+
+AREA_TAGS = {"landuse", "amenity", "leisure", "aeroway", "railway", "name", "religion"}
 
 
 def _areas_geojson(buckets: dict[str, list[OSMFeature]]) -> dict:
     """Land-use polygons, with the category each was painted as."""
     features = []
-    for cat in AREA_CATEGORIES:
-        for f in buckets.get(cat, []):
-            if not _is_polygon(f):
-                continue
-            if f.kind == "way":
-                rings = [[[lon, lat] for lat, lon in f.geometry]]
-            else:
-                rings = [[[lon, lat] for lat, lon in ring]
-                         for role, ring in f.role_geoms if role != "inner"]
-            polys = [[r] for r in rings if len(r) >= 3]
-            if not polys:
-                continue
-            features.append({
-                "type": "Feature",
-                "properties": {"category": cat,
-                               **{k: v for k, v in f.tags.items() if k in AREA_TAGS}},
-                "geometry": {"type": "MultiPolygon", "coordinates": polys},
-            })
+    for cat, f, polys in _area_exports(buckets):
+        _tagged_feature(f, features,
+                        {"category": cat,
+                         **{k: v for k, v in f.tags.items() if k in AREA_TAGS}},
+                        {"type": "MultiPolygon", "coordinates": polys})
     return {"type": "FeatureCollection", "features": features}
 
 
@@ -1845,12 +2719,10 @@ def _lines_geojson(feats: list[OSMFeature]) -> dict:
     for f in feats:
         if f.kind != "way" or len(f.geometry) < 2:
             continue
-        features.append({
-            "type": "Feature",
-            "properties": {k: v for k, v in f.tags.items() if k in LINE_TAGS},
-            "geometry": {"type": "LineString",
-                         "coordinates": [[lon, lat] for lat, lon in f.geometry]},
-        })
+        _tagged_feature(f, features,
+                        {k: v for k, v in f.tags.items() if k in LINE_TAGS},
+                        {"type": "LineString",
+                         "coordinates": [[lon, lat] for lat, lon in f.geometry]})
     return {"type": "FeatureCollection", "features": features}
 
 
@@ -1909,17 +2781,40 @@ def _build_spawn_map(landscape: Image.Image, w: int, h: int,
 
 def _build_preview(landscape: Image.Image, vegetation: Image.Image) -> Image.Image:
     """Human-friendly PNG: landscape with trees painted dark green."""
+    import numpy as np
+
     preview = landscape.copy()
-    lp = preview.load()
-    vp = vegetation.load()
-    w, h = preview.size
-    tree_colors = {C.TREES, C.TREES_DARK_GRASS, C.SPARSE_TREES,
-                   C.BUSHES_TREES_DARK_GRASS}
-    for y in range(h):
-        for x in range(w):
-            v = vp[x, y]
-            if v in tree_colors:
-                lp[x, y] = (40, 75, 35) if v == C.TREES else (65, 95, 45)
+    width, height = preview.size
+
+    def pack(colour: tuple[int, int, int]) -> int:
+        return (colour[0] << 16) | (colour[1] << 8) | colour[2]
+
+    # One integer per tile holds the three channels, so equality is the same
+    # test as the RGB triple. Full trees are the darker green; every other
+    # tree colour is the lighter one. Bands keep the scratch arrays small.
+    trees = pack(C.TREES)
+    lighter = (
+        pack(C.TREES_DARK_GRASS),
+        pack(C.SPARSE_TREES),
+        pack(C.BUSHES_TREES_DARK_GRASS),
+    )
+    for top in range(0, height, 512):
+        bottom = min(height, top + 512)
+        band = np.array(vegetation.crop((0, top, width, bottom)), dtype=np.uint8)
+        key = np.empty((bottom - top, width), dtype=np.uint32)
+        key[:] = band[..., 0]
+        key <<= 8
+        key += band[..., 1]
+        key <<= 8
+        key += band[..., 2]
+        pale = (key == lighter[0]) | (key == lighter[1]) | (key == lighter[2])
+        dark = key == trees
+        if not pale.any() and not dark.any():
+            continue
+        out = np.array(preview.crop((0, top, width, bottom)), dtype=np.uint8)
+        out[pale] = (65, 95, 45)
+        out[dark] = (40, 75, 35)
+        preview.paste(Image.fromarray(out, "RGB"), (0, top))
     return preview
 
 
@@ -1954,7 +2849,23 @@ ADDRESS_SETBACK_M = 2.0
 ADDRESS_PUSH_M = 18.0            # as far as a house is moved to get clear
 # Every road a house has to stand clear of: the ones with a carriageway. A
 # footpath or a drive may run right past the door.
-ADDRESS_AVOIDS_ROADS = {"road_major", "road_medium", "road_minor", "road_service"}
+ADDRESS_AVOIDS_ROADS = {"road_major", "road_medium", "road_minor", "road_service",
+                         "road_track", "dirt_path"}
+# A residential street with no roof in OpenStreetMap and none from Overture
+# still reads as a suburb. One house each side, stepped along the centre
+# line. The step clears an upright 9 by 11 m house on a diagonal street.
+STREET_HOUSE_STEP_M = 16.0
+STREET_HOUSE_END_M = 14.0       # leave the junction for the cross street
+STREET_FILL_HIGHWAYS = {"residential", "living_street"}
+MAX_STREET_HOUSES = 100000
+STREET_HOUSE_FIRST_ID = -3_000_000_000
+# Land that is already something else. A house does not go in it.
+STREET_HOUSE_AVOIDS = {
+    "park", "grass", "playground", "sports", "water", "forest", "scrub",
+    "wetland", "farmland", "orchard", "cemetery", "sand", "dirt",
+    "schoolyard", "hospital_grounds", "commercial", "industrial",
+    "military", "airport", "railway", "worship_grounds", "parking", "plaza",
+}
 
 
 def _off_the_road(x: float, y: float, need: float, roads, road_half,
@@ -2068,6 +2979,194 @@ def _houses_from_addresses(feats: list["OSMFeature"], buildings: list["OSMFeatur
     return made
 
 
+def _area_polygons_px(feat: "OSMFeature", proj: "Projector") -> list:
+    """This area as shapely polygons in tile space, holes kept."""
+    from shapely.geometry import Polygon
+
+    made = []
+    if not _is_polygon(feat):
+        return made
+    if feat.kind == "way":
+        ring = [proj.to_px(la, lo) for la, lo in feat.geometry]
+        candidates = [(ring, [])] if len(ring) >= 4 else []
+    else:
+        holes, outers = [], []
+        for role, ring in feat.role_geoms:
+            projected = [proj.to_px(la, lo) for la, lo in ring]
+            if len(projected) < 4:
+                continue
+            if role == "inner":
+                holes.append(projected)
+            else:
+                outers.append(projected)
+        candidates = []
+        for outer in outers:
+            try:
+                shell = Polygon(outer)
+            except (ValueError, TypeError):
+                continue
+            if not shell.is_valid:
+                shell = shell.buffer(0)
+            use = []
+            for hole in holes:
+                try:
+                    hp = Polygon(hole)
+                except (ValueError, TypeError):
+                    continue
+                if not hp.is_empty and shell.contains(hp.representative_point()):
+                    use.append(hole)
+            candidates.append((outer, use))
+    for outer, holes in candidates:
+        try:
+            poly = Polygon(outer, holes) if holes else Polygon(outer)
+        except (ValueError, TypeError):
+            continue
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly is not None and not poly.is_empty:
+            made.append(poly)
+    return made
+
+
+def _houses_along_streets(buckets: dict, buildings: list["OSMFeature"],
+                          proj: "Projector", clip) -> list["OSMFeature"]:
+    """Houses along residential streets that no source has a roof for.
+
+    OpenStreetMap and Overture both leave whole blocks blank. The street is
+    still there, so a house goes on each side, clear of the pavement and of
+    every footprint and land use already mapped.
+    """
+    from shapely.geometry import LineString, Point, Polygon, box
+    from shapely.prepared import prep
+    from shapely.strtree import STRtree
+
+    roads, road_half = [], []
+    streets = []
+    for cat in ADDRESS_AVOIDS_ROADS:
+        for feat in buckets.get(cat, []):
+            if feat.kind != "way" or len(feat.geometry) < 2:
+                continue
+            if feat.tags.get("area") == "yes":
+                continue
+            if feat.tags.get("junction") in {"roundabout", "circular"}:
+                continue
+            line = LineString([proj.to_px(la, lo) for la, lo in feat.geometry])
+            if line.is_empty or line.length <= 0:
+                continue
+            half = _way_width_m(feat, cat) / proj.meters_per_tile / 2
+            roads.append(line)
+            road_half.append(half)
+            highway = feat.tags.get("highway")
+            if cat != "road_minor" or highway not in STREET_FILL_HIGHWAYS:
+                continue
+            if feat.tags.get("tunnel") in {"yes", "building_passage"}:
+                continue
+            if feat.tags.get("bridge") in {"yes", "viaduct", "aqueduct"}:
+                continue
+            streets.append((line, half))
+    if not streets:
+        return []
+
+    shapes = []
+    for feat in buildings:
+        for ring in _feature_coords_px(feat, proj):
+            if len(ring) < 3:
+                continue
+            try:
+                poly = Polygon(ring)
+            except (ValueError, TypeError):
+                continue
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if not poly.is_empty:
+                shapes.append(poly)
+    tree = STRtree(shapes) if shapes else None
+
+    blocked = []
+    for cat in STREET_HOUSE_AVOIDS:
+        for feat in buckets.get(cat, []):
+            blocked.extend(_area_polygons_px(feat, proj))
+    block_tree = STRtree(blocked) if blocked else None
+    road_tree = STRtree(roads) if roads else None
+    inside = prep(clip) if clip is not None else None
+
+    mpt = proj.meters_per_tile
+    step = STREET_HOUSE_STEP_M / mpt
+    margin = STREET_HOUSE_END_M / mpt
+    setback = ADDRESS_SETBACK_M / mpt
+    clear = 2.0 / mpt
+    sidewalk = SIDEWALK_M.get("road_minor", 3.0) / mpt
+    half_w = (ADDRESS_HOUSE_M[0] / mpt) / 2
+    half_h = (ADDRESS_HOUSE_M[1] / mpt) / 2
+    reach = max(half_w, half_h)
+    apart = math.hypot(ADDRESS_HOUSE_M[0], ADDRESS_HOUSE_M[1]) / mpt
+    taken: dict[tuple[int, int], list] = {}
+    cell = max(1.0, apart)
+    made = []
+    next_id = STREET_HOUSE_FIRST_ID
+
+    for line, half in streets:
+        if len(made) >= MAX_STREET_HOUSES:
+            break
+        length = line.length
+        if length < step + margin:
+            continue
+        offset = half + sidewalk + setback + reach
+        dist = margin
+        while dist <= length - margin:
+            if len(made) >= MAX_STREET_HOUSES:
+                break
+            at = line.interpolate(dist)
+            ahead = line.interpolate(min(length, dist + 2.0))
+            dx, dy = ahead.x - at.x, ahead.y - at.y
+            norm = math.hypot(dx, dy)
+            if norm < 1e-6:
+                dist += step
+                continue
+            px, py = -dy / norm, dx / norm
+            for side in (-1.0, 1.0):
+                if len(made) >= MAX_STREET_HOUSES:
+                    break
+                x = at.x + px * offset * side
+                y = at.y + py * offset * side
+                if (x - half_w < 0 or y - half_h < 0
+                        or x + half_w >= proj.width or y + half_h >= proj.height):
+                    continue
+                here = Point(x, y)
+                if inside is not None and not inside.contains(here):
+                    continue
+                house = box(x - half_w, y - half_h, x + half_w, y + half_h)
+                if block_tree is not None and any(
+                        blocked[int(i)].intersects(house)
+                        for i in block_tree.query(house)):
+                    continue
+                if tree is not None and any(
+                        shapes[int(i)].distance(house) <= clear
+                        for i in tree.query(house.buffer(clear))):
+                    continue
+                if road_tree is not None and any(
+                        roads[int(i)].distance(house) < road_half[int(i)] + sidewalk
+                        for i in road_tree.query(house.buffer(offset))):
+                    continue
+                key = (int(x // cell), int(y // cell))
+                crowd = [p for gx in (-1, 0, 1) for gy in (-1, 0, 1)
+                         for p in taken.get((key[0] + gx, key[1] + gy), ())]
+                if any((qx - x) ** 2 + (qy - y) ** 2 < apart * apart
+                       for qx, qy in crowd):
+                    continue
+                taken.setdefault(key, []).append((x, y))
+                ring = [(x - half_w, y - half_h), (x + half_w, y - half_h),
+                        (x + half_w, y + half_h), (x - half_w, y + half_h),
+                        (x - half_w, y - half_h)]
+                made.append(OSMFeature(
+                    osm_id=next_id, kind="way",
+                    tags={"building": "house"},
+                    geometry=[proj.to_latlon(rx, ry) for rx, ry in ring]))
+                next_id -= 1
+            dist += step
+    return made
+
+
 BUILDING_TAGS = {
     "building", "building:levels", "building:part", "building:material",
     "building:use", "height", "levels", "roof:levels", "roof:shape",
@@ -2084,15 +3183,13 @@ def _buildings_geojson(feats: list[OSMFeature]) -> dict:
         if f.kind == "way":
             coords = [[lon, lat] for lat, lon in f.geometry]
             if len(coords) >= 3:
-                features.append({
-                    "type": "Feature",
-                    # amenity/shop/leisure carry what a building actually is
-                    # far more reliably than the building tag alone, and
-                    # knoxbuild uses them to pick materials and room plans.
-                    "properties": {k: v for k, v in f.tags.items()
-                                   if k in BUILDING_TAGS},
-                    "geometry": {"type": "Polygon", "coordinates": [coords]},
-                })
+                # amenity/shop/leisure carry what a building actually is
+                # far more reliably than the building tag alone, and
+                # knoxbuild uses them to pick materials and room plans.
+                _tagged_feature(
+                    f, features,
+                    {k: v for k, v in f.tags.items() if k in BUILDING_TAGS},
+                    {"type": "Polygon", "coordinates": [coords]})
         elif f.kind == "relation":
             polys = []
             for role, ring in f.role_geoms:
@@ -2102,10 +3199,8 @@ def _buildings_geojson(feats: list[OSMFeature]) -> dict:
                 if len(coords) >= 3:
                     polys.append([coords])
             if polys:
-                features.append({
-                    "type": "Feature",
-                    "properties": {k: v for k, v in f.tags.items()
-                                   if k in BUILDING_TAGS},
-                    "geometry": {"type": "MultiPolygon", "coordinates": polys},
-                })
+                _tagged_feature(
+                    f, features,
+                    {k: v for k, v in f.tags.items() if k in BUILDING_TAGS},
+                    {"type": "MultiPolygon", "coordinates": polys})
     return {"type": "FeatureCollection", "features": features}
