@@ -1,6 +1,6 @@
 """Split one selection into mods that sit against each other.
 
-Each mod is 20 cells by 20 cells. A cell is 300 tiles, so the seam between
+Each mod is 25 cells by 25 cells. A cell is 300 tiles, so the seam between
 two mods is a cell edge: they never write the same cell, and enabling all of
 them continues the streets across the join.
 """
@@ -13,9 +13,9 @@ from dataclasses import dataclass
 
 from generator.pz_colors import CELL_SIZE
 
-# Cells on a side of one mod. 20 cells is 6000 tiles, and the next mod starts
+# Cells on a side of one mod. 25 cells is 7500 tiles, and the next mod starts
 # on the next cell, so the pieces meet and do not share a cell.
-MOD_CELLS = 20
+MOD_CELLS = 25
 
 
 def mod_side_tiles() -> int:
