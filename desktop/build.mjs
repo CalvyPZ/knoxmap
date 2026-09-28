@@ -26,7 +26,7 @@ function arg(name, fallback) {
 
 function changelogVersion() {
   try {
-    const text = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const text = fs.readFileSync(path.join(root, 'docs', 'CHANGELOG.md'), 'utf8');
     const found = text.match(/^##\s+(\d[\w.]*)/m);
     if (found) return found[1];
   } catch (_) { /* package.json's version is enough */ }

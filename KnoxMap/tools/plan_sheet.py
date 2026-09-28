@@ -36,7 +36,7 @@ def panel(storey, stairs, title, roofs=None):
     d.text((PAD, 6), title, fill=(225, 225, 225))
 
     def at(x, y):
-        return storey.grid[y][x] if 0 <= x < w and 0 <= y < h else 0
+        return int(storey.grid[y, x]) if 0 <= x < w and 0 <= y < h else 0
 
     def px(x, y):
         return PAD + x * S, PAD + y * S

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Launch KnoxMap on Linux or macOS. First run? setup.sh does the rest.
+# Launch KnoxMap on Linux or macOS.
+# Create .venv in this folder first (../docs/LINUX.md). If it is missing, this
+# script still tries ./setup.sh, which the repository no longer ships.
 #
 # KNOXMAP_BROWSER=1 ./knoxmap.sh   opens it in your browser even where there
 #                                  is a desktop toolkit for a real window.

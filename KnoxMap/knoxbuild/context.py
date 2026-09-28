@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 # Coverage is measured on a coarse grid and averaged over a 3x3 window of it,
 # so a building sees roughly the 120 m around it - a block or two. Distances
@@ -63,6 +64,10 @@ class Context:
 
         tagged = [(x, y, lv) for x, y, _a, lv in buildings if lv is not None]
         self._tagged = np.array(tagged, dtype=float).reshape(-1, 3)
+        # Centres only. Levels stay in _tagged, in the order the buildings
+        # were given, which is the order the old scan walked them.
+        self._tree = (cKDTree(self._tagged[:, :2])
+                      if len(self._tagged) else None)
 
     def density(self, x: float, y: float) -> float:
         gh, gw = self.coverage.shape
@@ -72,10 +77,18 @@ class Context:
 
     def neighbour_levels(self, x: float, y: float) -> float | None:
         """Median tagged storey count nearby, or None when too few say."""
-        if len(self._tagged) < NEIGHBOUR_SAMPLES:
+        if self._tree is None or len(self._tagged) < NEIGHBOUR_SAMPLES:
             return None
-        d2 = (self._tagged[:, 0] - x) ** 2 + (self._tagged[:, 1] - y) ** 2
-        near = self._tagged[d2 <= self.radius ** 2, 2]
+        idx = self._tree.query_ball_point((x, y), self.radius)
+        if len(idx) < NEIGHBOUR_SAMPLES:
+            return None
+        # query_ball_point walks the tree, not the building list. Sorting
+        # by index puts neighbours back in the order the full scan returned
+        # them, so the median sees the same sequence.
+        idx.sort()
+        picked = self._tagged[idx]
+        d2 = (picked[:, 0] - x) ** 2 + (picked[:, 1] - y) ** 2
+        near = picked[d2 <= self.radius ** 2, 2]
         if len(near) < NEIGHBOUR_SAMPLES:
             return None
         return float(np.median(near))

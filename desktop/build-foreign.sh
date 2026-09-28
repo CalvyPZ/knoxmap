@@ -49,7 +49,7 @@ echo "Packing the Linux command line..."
 /tmp/venv/bin/pyinstaller --noconfirm \
   --distpath /tmp/build/releases/temp --workpath /tmp/build/releases/temp/work-cli \
   /tmp/build/desktop/knoxmap-cli.spec
-ver=$(awk '/^## [0-9]/{print $2; exit}' /tmp/build/CHANGELOG.md)
+ver=$(awk '/^## [0-9]/{gsub(/\r/, ""); print $2; exit}' /tmp/build/docs/CHANGELOG.md)
 cp -f /tmp/build/releases/temp/knoxmap-cli "/knoxmap/releases/KnoxMap-v${ver}-linux-cli"
 chmod 755 "/knoxmap/releases/KnoxMap-v${ver}-linux-cli"
 
@@ -96,7 +96,7 @@ mkdir -p "$site"
 for name in knoxmap.py knoxmap_cli.py app.py knoxpaths.py knoxlog.py updater.py knoxmap_setup.py knoxstop.py; do
   cp "/tmp/build/KnoxMap/$name" "$dest/"
 done
-cp /tmp/build/CHANGELOG.md "$dest/"
+cp /tmp/build/docs/CHANGELOG.md "$dest/CHANGELOG.md"
 cp -a /tmp/build/KnoxMap/generator /tmp/build/KnoxMap/knoxbuild /tmp/build/KnoxMap/tools \
   /tmp/build/KnoxMap/templates /tmp/build/KnoxMap/static /tmp/build/KnoxMap/lang "$dest/"
 mkdir -p "$dest/worlded"

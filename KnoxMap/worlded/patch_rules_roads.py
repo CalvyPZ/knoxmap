@@ -106,6 +106,30 @@ RULES = [
     ("Yard bed_e", (12, 37, 221), "carpentry_03_043", "0_Furniture"),
     ("Yard bed_se", (12, 37, 222), "carpentry_03_052", "0_Furniture"),
     ("Yard bed_soil", (12, 37, 223), "floors_exterior_natural_01_018", "0_FloorOverlay6"),
+    # Stop signs from street_decoration_01. 0 and 1 are the fronts (south,
+    # then east, the two sides the isometric camera sees as a face); 2 and 3
+    # are the backs (north, then west).
+    ("Stop sign N", (12, 39, 200), "street_decoration_01_2", "0_Furniture"),
+    ("Stop sign E", (12, 39, 201), "street_decoration_01_1", "0_Furniture"),
+    ("Stop sign S", (12, 39, 202), "street_decoration_01_0", "0_Furniture"),
+    ("Stop sign W", (12, 39, 203), "street_decoration_01_3", "0_Furniture"),
+    # Signal poles on the same row as the lamp arms, which run N, E, S, W
+    # from index 8. 12 reaches north, 13 east, 14 south, 15 west.
+    ("Traffic signal N", (12, 39, 204), "lighting_outdoor_01_12", "0_Furniture"),
+    ("Traffic signal E", (12, 39, 205), "lighting_outdoor_01_13", "0_Furniture"),
+    ("Traffic signal S", (12, 39, 206), "lighting_outdoor_01_14", "0_Furniture"),
+    ("Traffic signal W", (12, 39, 207), "lighting_outdoor_01_15", "0_Furniture"),
+    # A bar across the lane. 32 is the thick east-west bar; the north-south
+    # bar is the faded edge line, which is the thickest vertical stroke the
+    # sheet has. N and S run east-west, W and E run north-south.
+    ("Stop line N", (12, 39, 208), "street_trafficlines_01_32", "0_FloorOverlay5"),
+    ("Stop line W", (12, 39, 209), "street_trafficlines_01_0", "0_FloorOverlay5"),
+    ("Stop line E", (12, 39, 210), "street_trafficlines_01_4", "0_FloorOverlay5"),
+    ("Stop line S", (12, 39, 211), "street_trafficlines_01_6", "0_FloorOverlay5"),
+    ("Crosswalk N", (12, 39, 212), "street_trafficlines_01_2", "0_FloorOverlay5"),
+    ("Crosswalk W", (12, 39, 213), "street_trafficlines_01_0", "0_FloorOverlay5"),
+    # The street-name blade, street_decoration_01_22.
+    ("Street name", (12, 39, 214), "street_decoration_01_22", "0_Furniture"),
 ]
 
 # Rules for Erika's Tiles (workshop 3346506593), written only once Setup has

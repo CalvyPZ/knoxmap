@@ -130,6 +130,12 @@ def world_size(pzw: Path) -> tuple[int, int]:
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
+def project_cells(pzw: Path) -> set[tuple[int, int]]:
+    from knoxbuild.world import project_cells as _cells
+
+    return _cells(pzw)
+
+
 def _tool_path(path: Path) -> str:
     """A file as the map tools name it: forward slashes on Windows, and
     otherwise what the compiler in use can open - its own name for a native
@@ -410,11 +416,20 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
         if not w or not h:
             raise ValueError(f"Could not read the world size from {pzw.name}")
 
+        listed = project_cells(pzw)
+
         if only_cells:
             batches = [tuple(int(v) for v in cells[:4]) for cells in only_cells]
         else:
             batches = [(x, y, min(x + batch - 1, w - 1), min(y + batch - 1, h - 1))
                        for y in range(0, h, batch) for x in range(0, w, batch)]
+        if listed:
+            batches = [rect for rect in batches
+                       if any((cx, cy) in listed
+                              for cy in range(rect[1], rect[3] + 1)
+                              for cx in range(rect[0], rect[2] + 1))]
+        if not batches:
+            return len(list(lots.glob("*.lotheader"))) if lots.is_dir() else 0
         started = time.time()
         failures: list[dict] = []
         # Batches are done one at a time, in this order, and the counter says

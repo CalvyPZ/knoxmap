@@ -1,7 +1,7 @@
 @echo off
 rem Build the patched, headless PZWorldEd_cli.exe from source.
 rem
-rem Most people never need this: Setup.bat downloads the prebuilt compiler.
+rem Most people never need this: first-run setup downloads the prebuilt compiler.
 rem Needs: Visual Studio 2022 Build Tools (C++), Qt 5.14.2 msvc2017_64, git.
 rem
 rem   build_worlded.bat [path to Qt 5.14.2 msvc2017_64]

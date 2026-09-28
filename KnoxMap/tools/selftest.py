@@ -267,7 +267,7 @@ def check_1_3_6(check, out: str, tbx: list[str], pzw_text: str, log: str) -> Non
     per_room = {}
     for role, x, y, _o in mall.furniture:
         if role == "switch":
-            per_room[mall.grid[y][x]] = per_room.get(mall.grid[y][x], 0) + 1
+            per_room[int(mall.grid[y, x])] = per_room.get(int(mall.grid[y, x]), 0) + 1
     check(max(per_room.values(), default=0) >= 4,
           f"a big room has several light switches ({max(per_room.values(), default=0)})")
 
@@ -968,10 +968,10 @@ def check_wall_corners(check) -> None:
     from knoxbuild.settings import Settings
 
     def walls_of(grid):
-        h, w = len(grid), len(grid[0])
+        h, w = grid.shape
 
         def inside(x, y):
-            return 0 <= x < w and 0 <= y < h and bool(grid[y][x])
+            return 0 <= x < w and 0 <= y < h and bool(grid[y, x])
 
         edges = set()
         for y in range(h):
@@ -1039,10 +1039,10 @@ def check_wall_corners(check) -> None:
 
 def _sides_for(grid, x, y, d):
     """The room ids either side of a wall edge; 0 is outside."""
-    h, w = len(grid), len(grid[0])
+    h, w = grid.shape
 
     def at(px, py):
-        return grid[py][px] if 0 <= px < w and 0 <= py < h else 0
+        return int(grid[py, px]) if 0 <= px < w and 0 <= py < h else 0
 
     return (at(x - 1, y), at(x, y)) if d == "W" else (at(x, y - 1), at(x, y))
 

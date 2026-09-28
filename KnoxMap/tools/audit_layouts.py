@@ -28,9 +28,9 @@ KINDS = [None, None, "apartment", "apartment", "shop", "school", "civic",
 def door_pair(storey, door):
     x, y, d = door
     if d == "W" and 0 < x < storey.width:
-        return storey.grid[y][x - 1], storey.grid[y][x]
+        return int(storey.grid[y, x - 1]), int(storey.grid[y, x])
     if d == "N" and 0 < y < storey.height:
-        return storey.grid[y - 1][x], storey.grid[y][x]
+        return int(storey.grid[y - 1, x]), int(storey.grid[y, x])
     return None
 
 
@@ -88,7 +88,7 @@ def audit(building, kind):
                 problems["door between two flats"] += 1
             elif ua != ub:
                 fronts[ua or ub] += 1
-        lit = {s.grid[fy][fx] for role, fx, fy, _o in s.furniture if role == "switch"}
+        lit = {int(s.grid[fy, fx]) for role, fx, fy, _o in s.furniture if role == "switch"}
         shafts = {i for i, r in enumerate(s.rooms, 1) if r.is_shaft}
         if any(i not in lit and i not in shafts for i in range(1, n + 1)):
             problems["room with no light switch"] += 1
@@ -130,7 +130,7 @@ def audit(building, kind):
                             problems["roofs overlapping"] += 1
                         covered.add((x, y))
             inside = {(x, y) for y in range(s.height) for x in range(s.width)
-                      if s.grid[y][x]}
+                      if s.grid[y, x]}
             if covered - inside:
                 problems["roof over open ground"] += 1
             if inside - covered:
@@ -150,8 +150,8 @@ def audit(building, kind):
             for i in range(2):
                 ax, ay = (lx, ly + i) if ld == "W" else (lx + i, ly)
                 bx, by = (ax - 1, ay) if ld == "W" else (ax, ay - 1)
-                sides = {s.grid[ay][ax] if 0 <= ax < s.width and 0 <= ay < s.height else 0,
-                         s.grid[by][bx] if 0 <= bx < s.width and 0 <= by < s.height else 0}
+                sides = {int(s.grid[ay, ax]) if 0 <= ax < s.width and 0 <= ay < s.height else 0,
+                         int(s.grid[by, bx]) if 0 <= bx < s.width and 0 <= by < s.height else 0}
                 kinds = {s.rooms[v - 1].is_shaft for v in sides if v}
                 if 0 in sides or kinds != {True, False}:
                     problems["lift doors not between shaft and landing"] += 1
@@ -163,7 +163,7 @@ def audit(building, kind):
         dx, dy = (0, 1) if d == "N" else (1, 0)
         run = [(x + dx * i, y + dy * i) for i in range(STAIR_RUN)]
         for s in (building.storeys[lvl], building.storeys[lvl + 1]):
-            rooms = {s.grid[ry][rx] if 0 <= rx < s.width and 0 <= ry < s.height
+            rooms = {int(s.grid[ry, rx]) if 0 <= rx < s.width and 0 <= ry < s.height
                      else 0 for rx, ry in run}
             if len(rooms) != 1 or 0 in rooms:
                 problems["stairs crossing a wall"] += 1
@@ -192,7 +192,7 @@ def main(argv):
         elif roll < 0.65:
             fp = rotated_mask(rng)
             if fp is not None:
-                w, h, mask = fp.width, fp.height, fp.mask_list()
+                w, h, mask = fp.width, fp.height, fp.mask
         levels = rng.choice((1, 2, 3, 4, 5, 6, 8, 12))
         b = build_building(w, h, levels=levels, seed=i, kind=kind, mask=mask,
                            commercial=kind not in (None, "apartment"))
@@ -203,7 +203,7 @@ def main(argv):
             failed[label] += 1
             for k, v in found.items():
                 failed["  " + k] += v
-        perim = sum(1 for row in b.storeys[0].grid for v in row if v)
+        perim = int((b.storeys[0].grid != 0).sum())
         windows.append(len(b.storeys[0].windows) / max(1, perim ** 0.5))
 
     print(f"buildings audited: {count}")

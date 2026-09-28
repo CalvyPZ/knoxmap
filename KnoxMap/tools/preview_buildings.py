@@ -79,7 +79,7 @@ def floorplan(out_dir: str, map_name: str, index: int, level: int = 0,
 
     for y in range(h):
         for x in range(w):
-            idx = plan.grid[y][x]
+            idx = int(plan.grid[y, x])
             kind = plan.rooms[idx - 1].kind if idx else "hall"
             x0, y0 = px(x, y)
             d.rectangle([x0, y0, x0 + scale, y0 + scale],
@@ -88,7 +88,7 @@ def floorplan(out_dir: str, map_name: str, index: int, level: int = 0,
     # Walls: every tile edge where the room index changes, plus the perimeter.
     def room_at(x: int, y: int) -> int:
         if 0 <= x < w and 0 <= y < h:
-            return plan.grid[y][x]
+            return int(plan.grid[y, x])
         return 0
 
     for y in range(h + 1):

@@ -484,7 +484,8 @@ KnoxMap is not made, endorsed or supported by The Indie Stone.
 BIG_MAP_CELLS = 40
 
 
-def write_how_to_play(mod_root: str, name: str, cells: int, big: bool) -> None:
+def write_how_to_play(mod_root: str, name: str, cells: int, big: bool,
+                      reset_loot: bool = True) -> None:
     """A short note beside the mod: how to turn it on, and what a big map
     needs from the game."""
     lines = [
@@ -499,12 +500,15 @@ def write_how_to_play(mod_root: str, name: str, cells: int, big: bool) -> None:
         "",
         "If the map is not in the list, close the game completely and start it",
         "again: Build 42 only reads the mods folder at startup.",
-        "",
-        "In the game",
-        "-----------",
-        "Right-click the ground for \"Reset loot\" to refill the containers in a",
-        "building, or everything within 30 tiles, without starting a new save.",
     ]
+    if reset_loot:
+        lines += [
+            "",
+            "In the game",
+            "-----------",
+            "Right-click the ground for \"Reset loot\" to refill the containers in a",
+            "building, or everything within 30 tiles, without starting a new save.",
+        ]
     if big:
         lines += [
             "",
@@ -546,9 +550,31 @@ def folder_name(title: str, fallback: str) -> str:
     return safe or fallback
 
 
+def _copy_editable(project_dir: str, mod_root: str) -> None:
+    """The WorldEd project beside the mod, so the map can be opened and changed."""
+    dest = os.path.join(mod_root, "editable")
+    if os.path.isdir(dest):
+        shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(dest, exist_ok=True)
+    for name in sorted(os.listdir(project_dir)):
+        src = os.path.join(project_dir, name)
+        low = name.lower()
+        if os.path.isdir(src):
+            if name in ("tmx", "buildings"):
+                shutil.copytree(src, os.path.join(dest, name))
+            continue
+        if (low.endswith(".pzw") or low.endswith(".bmp") or low.endswith(".csv")
+                or low.endswith(".geojson") or low.endswith("_info.json")
+                or low.endswith("_structures.json") or low.endswith("_places.json")
+                or low.endswith("_population.json") or low.endswith("_guncache.json")):
+            shutil.copy2(src, os.path.join(dest, name))
+
+
 def package(project_dir: str, name: str, mod_id: str,
             lots_dir: str | None = None, mods_dir: str | None = None,
-            description: str = "") -> tuple[str, int, list[str]]:
+            description: str = "",
+            spawn_selector: bool = True, reset_loot_menu: bool = True,
+            rifle: bool = True, editable_copy: bool = False) -> tuple[str, int, list[str]]:
     """Write the mod folder. Returns (mod_root, cell file count, extras)."""
     lots_dir = lots_dir or os.path.join(project_dir, "lots")
     mods_dir = mods_dir or default_mods_dir()
@@ -576,6 +602,11 @@ def package(project_dir: str, name: str, mod_id: str,
 
     for src in cells + extras:
         shutil.copy2(src, os.path.join(map_dir, os.path.basename(src)))
+    # Build 42 reads foraging zones and map biomes from
+    # media/maps/<name>/maps/biomemap_<x>_<y>.png (256 tiles per cell).
+    biome_src = os.path.join(project_dir, "maps")
+    if os.path.isdir(biome_src):
+        shutil.copytree(biome_src, os.path.join(map_dir, "maps"))
     # The paper map in the binary form Build 42 reads; from worldmap.xml alone
     # it shows street names and nothing else (knoxbuild/worldmap_bin.py).
     n_map_features = 0
@@ -607,9 +638,11 @@ def package(project_dir: str, name: str, mod_id: str,
     has_lifts = os.path.isdir(buildings) and any(
         "fixtures_escalators_01_4" in open(os.path.join(buildings, f), encoding="utf-8").read()
         for f in os.listdir(buildings) if f.endswith(".tbx"))
-    works_with = (["Elevators (working lifts)"] if has_lifts else []) + \
-        ["Spawn Selector (choose where to start)"]
-    desc = f"{desc} Optional: {', '.join(works_with)}."
+    works_with = ["Elevators (working lifts)"] if has_lifts else []
+    if spawn_selector:
+        works_with.append("Spawn Selector (choose where to start)")
+    if works_with:
+        desc = f"{desc} Optional: {', '.join(works_with)}."
 
     # lots=Muldraugh, KY tells the game which vanilla lot set to inherit room
     # and tile definitions from; every community map sets it.
@@ -656,10 +689,18 @@ def package(project_dir: str, name: str, mod_id: str,
     write_attribution(project_dir, mod_root, name)
     n_cells = sum(1 for c in cells if c.endswith(".lotheader"))
     big_map = n_cells >= BIG_MAP_CELLS
-    write_how_to_play(mod_root, name, n_cells, big_map)
-    n_pois = write_spawn_selector(project_dir, mod_root, mod_id, name)
-    reset_loot = write_reset_loot(mod_root)
-    gun_cache = write_gun_cache(project_dir, mod_root, mod_id)
+    write_how_to_play(mod_root, name, n_cells, big_map, reset_loot=reset_loot_menu)
+    n_pois = 0
+    reset_loot = None
+    gun_cache = None
+    if spawn_selector:
+        n_pois = write_spawn_selector(project_dir, mod_root, mod_id, name)
+    if reset_loot_menu:
+        reset_loot = write_reset_loot(mod_root)
+    if rifle:
+        gun_cache = write_gun_cache(project_dir, mod_root, mod_id)
+    if editable_copy:
+        _copy_editable(project_dir, mod_root)
     extra_names = [os.path.basename(e) for e in extras]
     if n_spawns:
         extra_names.append(f"spawnpoints.lua ({n_spawns} spawn points)")
@@ -668,7 +709,10 @@ def package(project_dir: str, name: str, mod_id: str,
     if zone_counts:
         extra_names.append(f"objects.lua ({zone_counts.get('ParkingStall', 0)} parking stalls, "
                            f"{zone_counts.get('TownZone', 0)} town zones)")
-    extra_names.append(f"Spawn Selector support ({n_pois} places)")
+    if spawn_selector:
+        extra_names.append(f"Spawn Selector support ({n_pois} places)")
+    if editable_copy:
+        extra_names.append("editable/ (WorldEd project)")
     if reset_loot:
         extra_names.append("Reset loot menu")
     if gun_cache:

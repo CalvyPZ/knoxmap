@@ -152,7 +152,8 @@ def picture(map_dir: str | Path, out_png: str | Path | None = None,
 
 
 def pictures_of(map_dir: str | Path, into: str | Path | None = None,
-                size: tuple[int, int] = SIZE) -> list[Path]:
+                size: tuple[int, int] = SIZE,
+                shots: tuple[str, ...] | None = None) -> list[Path]:
     """The set worth having of a finished map, written into the map's folder.
 
     The whole town, then the middle of it close enough to see, then the same
@@ -169,6 +170,11 @@ def pictures_of(map_dir: str | Path, into: str | Path | None = None,
     wanted = [("town.png", (0, 0, w, h), True),
               ("close.png", middle, True),
               ("inside.png", middle, False)]
+    # None draws the whole set. A list draws only the shots the window
+    # switched on, and leaves the others already on disk alone.
+    if shots is not None:
+        keep = set(shots)
+        wanted = [item for item in wanted if item[0].removesuffix(".png") in keep]
     made = []
     for filename, box, roofs in wanted:
         try:
