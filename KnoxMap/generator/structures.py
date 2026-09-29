@@ -65,7 +65,8 @@ STATUES = ["location_community_cemetary_01_11", "location_community_cemetary_01_
 FOUNTAIN = "location_community_park_01_48"
 POST_EVERY = 8
 
-ROAD_CATS = {"road_major", "road_medium", "road_minor", "road_service"}
+ROAD_CATS = {"road_major", "road_medium", "road_minor", "road_service",
+             "pedestrian"}
 PATH_CATS = {"paved_path", "dirt_path", "road_track"}
 # What a deck has to clear. Footpaths pass under a bridge at its abutment
 # often enough that lifting a road over each would raise half the bridges in a

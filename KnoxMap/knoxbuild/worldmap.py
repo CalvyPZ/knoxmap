@@ -62,6 +62,7 @@ BUILDING_VALUE = {
 HIGHWAY_VALUE = {
     "road_major": "primary", "road_medium": "secondary",
     "road_minor": "tertiary", "road_service": "tertiary",
+    "pedestrian": "tertiary",
     "dirt_path": "trail", "paved_path": "trail", "road_track": "trail",
 }
 RAIL_WIDTH_M = 4.0
@@ -70,7 +71,7 @@ AREA_VALUE = {"water": ("water", "river"), "pool": ("water", "river"),
 # Streets worth a name on the map. Footpaths carry names too, but labelling
 # every alley and pavement buries the streets people navigate by.
 NAMED_CLASSES = {"road_major", "road_medium", "road_minor", "road_service",
-                 "road_track"}
+                 "road_track", "pedestrian"}
 SIMPLIFY = 0.5     # tiles; the map is drawn far smaller than one tile per pixel
 
 
@@ -173,7 +174,7 @@ def write(out_dir: str, map_name: str, proj, info: dict,
             knoxstop.check(should_stop, "the buildings")
         if feat.kind == "node":
             continue
-        cat = osm.classify(feat.tags)
+        cat = osm.classify(feat.tags, _is_polygon(feat))
         if cat in HIGHWAY_VALUE and not _is_polygon(feat):
             line = _line(feat, proj)
             if line is None:

@@ -244,6 +244,11 @@ def _say_if_it_will_not_start() -> None:
     answer has nothing to do with the map. Better to find it here, in the
     seconds after the compiler is installed, and say it in words.
     """
+    # Before asking, make the bundled Qt outrank anything LD_LIBRARY_PATH
+    # names. It is what the check would otherwise catch it failing on.
+    fixed = knoxpaths.force_bundled_qt()
+    if fixed:
+        say(f"      pointed {fixed} files at the Qt they ship with")
     trouble = knoxpaths.compiler_trouble()
     if trouble:
         say("")

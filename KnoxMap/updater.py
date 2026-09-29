@@ -377,8 +377,10 @@ def _fetch_releases() -> list[dict]:
                                             "Accept": "application/vnd.github+json"},
                      timeout=15)
     r.raise_for_status()
-    found = [rel for rel in r.json()
-             if not rel.get("draft") and not rel.get("prerelease") and _asset(rel)]
+    # The same rule the automatic check uses: a version tag, published, with
+    # a file on it for this PC. A release with nothing to download is not one
+    # anybody can be switched to.
+    found = [rel for rel in r.json() if _for_this_system(rel)]
     found.sort(key=lambda rel: _parse(rel.get("tag_name", "")), reverse=True)
     _releases_cache.update(at=time.time(), releases=found)
     return found

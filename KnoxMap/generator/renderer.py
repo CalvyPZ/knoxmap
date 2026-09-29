@@ -205,7 +205,7 @@ class Projector:
 
 # Roads that count towards a town's street grid. Paths wander, and a motorway
 # slicing through at its own angle should not turn the town around it.
-GRID_ROADS = {"road_minor", "road_medium", "road_service"}
+GRID_ROADS = {"road_minor", "road_medium", "road_service", "pedestrian"}
 # How strongly the streets must agree on a direction before the map is turned
 # to it: 1 is a perfect grid, 0 no preference. Measured on test maps, gridded
 # towns sit well above this and old organic centres below it.
@@ -368,7 +368,7 @@ def dominant_road_angle(features: Iterable[OSMFeature], south: float, west: floa
     proj = Projector.build(south, west, north, east, 1.0)
     sin_sum = cos_sum = total = 0.0
     for feat in features:
-        if feat.kind != "way" or classify(feat.tags) not in GRID_ROADS:
+        if feat.kind != "way" or classify(feat.tags, _is_polygon(feat)) not in GRID_ROADS:
             continue
         pts = [proj.to_px(la, lo) for la, lo in feat.geometry]
         for (ax, ay), (bx, by) in zip(pts, pts[1:]):
@@ -427,6 +427,7 @@ LANDSCAPE_ORDER = [
     "pier",           # jetties and breakwaters, over the water
     "parking",        # car park tarmac
     "plaza",          # paved pedestrian square
+    "pedestrian",     # pedestrian zone, paved wall to wall
     "road_service",   # alleys and driveways
     "road_minor",
     "road_medium",
@@ -461,6 +462,10 @@ ROAD_WIDTHS_M = {
     "road_medium": 8.0,
     "road_minor": 6.0,
     "road_service": 3.5,
+    # A pedestrian zone is as wide as the square it paves, not as wide as
+    # a lane; mapped as lines with no area round them, this is what fills
+    # the space between the buildings.
+    "pedestrian": 9.0,
     "dirt_path": 2.5,
     "paved_path": 2.5,
     "road_track": 4.0,
@@ -514,6 +519,7 @@ LANDSCAPE_FILL = {
     # pavement. Main roads get the worn speckled tarmac so they stand apart
     # from the smooth tarmac of ordinary streets; both blend at the edges.
     "road_service": C.DARKEST_ASPHALT,
+    "pedestrian": C.PAVING,
     "road_minor": C.MEDIUM_ASPHALT,
     "road_medium": C.MEDIUM_ASPHALT,
     "road_major": C.DARKEST_ASPHALT,
@@ -819,7 +825,7 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
             fence_feats.append(feat)
         elif barrier == "hedge" and feat.kind == "way":
             vegetation_feats.append(feat)
-        cat = classify(feat.tags)
+        cat = classify(feat.tags, _is_polygon(feat))
         if cat is None:
             continue
         if cat in {"fence", "hedge"}:
@@ -1732,7 +1738,8 @@ def _pave_dense_ground(landscape: Image.Image, building_feats: list[OSMFeature],
     w, h = landscape.size
     frame = box(0, 0, w, h)
     streets = []
-    for cat in ("road_major", "road_medium", "road_minor", "road_service"):
+    for cat in ("road_major", "road_medium", "road_minor", "road_service",
+                "pedestrian"):
         for feat in buckets.get(cat, []):
             if feat.kind == "way" and not _is_polygon(feat):
                 pts = [proj.to_px(la, lo) for la, lo in feat.geometry]
@@ -1874,7 +1881,7 @@ def _paint_vegetation(veg: Image.Image, landscape: Image.Image,
                       density: float = 1.0) -> None:
     _paint_vegetation_extras(veg, landscape, feats, proj)
     _paint_woodland(veg, landscape,
-                    [f for f in feats if classify(f.tags) in
+                    [f for f in feats if classify(f.tags, _is_polygon(f)) in
                      {"forest", "scrub", "tree_single"}], proj, density)
 
 
@@ -1899,7 +1906,7 @@ def _paint_woodland(veg: Image.Image, landscape: Image.Image,
     scrub_draw = ImageDraw.Draw(scrub_mask)
 
     for feat in feats:
-        cat = classify(feat.tags)
+        cat = classify(feat.tags, _is_polygon(feat))
         rings = _feature_coords_px(feat, proj)
         if cat == "forest":
             if _is_polygon(feat):
@@ -1991,7 +1998,7 @@ def _paint_vegetation_extras(veg: Image.Image, landscape: Image.Image,
         return mask
 
     for feat in feats:
-        cat = classify(feat.tags)
+        cat = classify(feat.tags, _is_polygon(feat))
         if feat.tags.get("barrier") == "hedge":
             width = max(1, int(round(1.5 / proj.meters_per_tile)))
             for ring in _feature_coords_px(feat, proj):
@@ -2850,7 +2857,7 @@ ADDRESS_PUSH_M = 18.0            # as far as a house is moved to get clear
 # Every road a house has to stand clear of: the ones with a carriageway. A
 # footpath or a drive may run right past the door.
 ADDRESS_AVOIDS_ROADS = {"road_major", "road_medium", "road_minor", "road_service",
-                         "road_track", "dirt_path"}
+                         "road_track", "dirt_path", "pedestrian"}
 # A residential street with no roof in OpenStreetMap and none from Overture
 # still reads as a suburb. One house each side, stepped along the centre
 # line. The step clears an upright 9 by 11 m house on a diagonal street.
@@ -2927,7 +2934,7 @@ def _houses_from_addresses(feats: list["OSMFeature"], buildings: list["OSMFeatur
     # be pushed off the one it belongs to.
     roads, road_half = [], []
     for f in feats:
-        cat = classify(f.tags)
+        cat = classify(f.tags, _is_polygon(f))
         if cat not in ADDRESS_AVOIDS_ROADS:
             continue
         for ring in _feature_coords_px(f, proj):

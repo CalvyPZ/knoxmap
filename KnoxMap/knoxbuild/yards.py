@@ -15,6 +15,7 @@ grass, dark tarmac drives the next, then wooden fences.
 from __future__ import annotations
 
 import os
+import random
 import re
 import shutil
 from collections import deque
@@ -35,6 +36,38 @@ YARD_SIDE = 2            # how far the fence stands out past the house's sides
 PAVED = (C.PALE_CONCRETE, C.MEDIUM_ASPHALT, C.DARK_ASPHALT, C.DARKEST_ASPHALT)
 CROSSABLE = (C.DARK_GRASS, C.MEDIUM_GRASS, C.LIGHT_GRASS, C.DIRT)
 YARD_FENCE_STYLES = ("tall_wooden", "short_wooden", "white_picket", "short_chainlink")
+
+# A light by the front door. Knox County has one on 92% of its houses and a
+# railing on 71%; generated ones had a light on 1%, which is most of why they
+# read as unfinished from the street. Seven in ten of the game's sit within a
+# tile of a door, all but 3% on the ground outside the wall rather than on the
+# building's own tiles, so that is where these go.
+#
+# Which sprite goes on which wall was read off the vanilla map, not guessed:
+# for every outdoor light standing outside a house with house tiles on exactly
+# one side, that side. The five sets below each came back 96-100% one-sided
+# over 60 to 140 sightings. The key is the side the house is on, seen from the
+# light's own tile.
+PORCH_LIGHTS = [
+    {"N": "lighting_outdoor_01_24", "W": "lighting_outdoor_01_25",
+     "S": "lighting_outdoor_01_28", "E": "lighting_outdoor_01_29"},
+    {"N": "lighting_outdoor_01_26", "W": "lighting_outdoor_01_27",
+     "S": "lighting_outdoor_01_30", "E": "lighting_outdoor_01_31"},
+    {"N": "lighting_outdoor_01_32", "W": "lighting_outdoor_01_33",
+     "S": "lighting_outdoor_01_36", "E": "lighting_outdoor_01_37"},
+    {"N": "lighting_outdoor_01_34", "W": "lighting_outdoor_01_35",
+     "S": "lighting_outdoor_01_39", "E": "lighting_outdoor_01_38"},
+    {"N": "lighting_outdoor_01_40", "W": "lighting_outdoor_01_41",
+     "S": "lighting_outdoor_01_44", "E": "lighting_outdoor_01_45"},
+]
+PORCH_LIGHT_SHARE = 0.92
+# The square the light stands on usually carries the house wall as well, and
+# what is written last is drawn last: on the Furniture layer the wall went on
+# top and the light was invisible. Every one of the 659 vanilla porch lights
+# that shares a square with an exterior wall is written after it.
+PORCH_LIGHT_LAYER = "WallFurniture"
+# The side the house is on, from the tile the light stands on.
+_SIDE = {(0, -1): "N", (0, 1): "S", (-1, 0): "W", (1, 0): "E"}
 
 
 def _outside_doors(tbx_path: str) -> list[tuple[int, int, int, int]]:
@@ -65,11 +98,14 @@ def _outside_doors(tbx_path: str) -> list[tuple[int, int, int, int]]:
 
 
 def paint_paths(out_dir: str, map_name: str, rows: list[dict], occupied,
-                drives: list | None = None) -> tuple[int, list]:
+                drives: list | None = None,
+                lights: list | None = None) -> tuple[int, list]:
     """Dress every house in `rows`. Returns (houses dressed, back-yard fence lines).
 
     Each drive's parking space, (x, y, width, height) at its house end, is
-    added to `drives` when it is given: the car belongs there."""
+    added to `drives` when it is given: the car belongs there. Porch lights
+    are added to `lights` the same way, as (x, y, level, layer, tile) for
+    whoever writes them into a .tbx."""
     bmp = os.path.join(out_dir, f"{map_name}.bmp")
     base = os.path.join(out_dir, f"{map_name}_ground_base.bmp")
     veg_path = os.path.join(out_dir, f"{map_name}_veg.bmp")
@@ -107,6 +143,7 @@ def paint_paths(out_dir: str, map_name: str, rows: list[dict], occupied,
 
     dressed = 0
     fences = []
+    rng = random.Random(0xB17E)
     for row in rows:
         if row.get("kind") != "house":
             continue
@@ -119,6 +156,26 @@ def paint_paths(out_dir: str, map_name: str, rows: list[dict], occupied,
         sx, sy = bx0 + ox, by0 + oy
         dx, dy = ox - ix, oy - iy          # out of the door, towards the street
         px, py = -dy, dx                   # along the front of the house
+
+        # A light on the wall beside the door. It goes outside the building,
+        # past the edge of the house's own .tbx, so it is written as a loose
+        # tile. Ahead of the path and the stoop because it does not depend on
+        # either: a house with nowhere to run a path still has a front light.
+        side = _SIDE.get((-dx, -dy))
+        if lights is not None and side and rng.random() < PORCH_LIGHT_SHARE:
+            style = rng.choice(PORCH_LIGHTS)
+            for k in (1, -1):
+                lx, ly = sx + px * k, sy + py * k
+                if not (0 <= lx < w and 0 <= ly < h) or occupied[ly, lx]:
+                    continue
+                # Only where the house really is behind it: beside a door in a
+                # corner, one of the two faces open ground.
+                wx, wy = lx - dx, ly - dy
+                if not (0 <= wx < w and 0 <= wy < h and occupied[wy, wx]):
+                    continue
+                lights.append((lx, ly, 0, PORCH_LIGHT_LAYER, style[side]))
+                break
+
         if not free(sx, sy):
             continue
 

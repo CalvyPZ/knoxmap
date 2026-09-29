@@ -38,9 +38,13 @@ local NEEDED_CAPACITY = 12
 --- The container out of whatever OnFillContainer was called with.
 -- The event passes (roomName, containerType, container), but rather than
 -- trust an argument order across game versions this takes whichever of them
--- answers getSourceGrid - only a container does.
+-- answers getSourceGrid - only a container does. The plain ones are turned
+-- away on their type first: a method call on a string raises "Tried to call
+-- nil", which the pcall catches but the game still logs.
+local PLAIN = { string = true, number = true, boolean = true, ["function"] = true }
+
 local function asContainer(value)
-    if value == nil then return nil end
+    if value == nil or PLAIN[type(value)] then return nil end
     local ok, grid = pcall(function() return value:getSourceGrid() end)
     if ok and grid then return value end
     return nil

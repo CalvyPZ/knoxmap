@@ -800,6 +800,27 @@ def api_landmarks():
 
 # Enough for a town boundary traced in detail; more is a mistake or an abuse.
 MAX_SHAPE_POINTS = 20000
+# Smaller than this and the outline is a line, not a selection: about a
+# hundredth of a square kilometre, well under the smallest map worth building.
+MIN_SHAPE_AREA_DEG2 = 1e-6
+
+
+def _shape_area_deg2(polys: list) -> float:
+    """The area the outer rings enclose, in square degrees.
+
+    The shoelace sum, not shapely: this runs on every generate request, before
+    anything has decided the map is worth loading a geometry library for.
+    """
+    total = 0.0
+    for rings in polys:
+        if not rings:
+            continue
+        ring = rings[0]
+        acc = 0.0
+        for (x0, y0), (x1, y1) in zip(ring, ring[1:]):
+            acc += x0 * y1 - x1 * y0
+        total += abs(acc) / 2.0
+    return total
 
 
 def _shape_rings(shape: dict) -> list:
@@ -840,6 +861,15 @@ def _clean_shape(raw) -> tuple[dict | None, str | None]:
         return None, "The selection shape has no area."
     if points > MAX_SHAPE_POINTS:
         return None, f"The selection outline has {points:,} points; the most is {MAX_SHAPE_POINTS:,}."
+    # An outline with three points on one line, or one drawn as a single
+    # stroke that never opened out, passes every test above and covers no
+    # ground. The renderer takes it at its word and turns everything outside
+    # it - which is the whole map - back into grass, so the generation runs to
+    # the end and hands over a meadow. Saying so here is the only place the
+    # user can still do anything about it.
+    if _shape_area_deg2(cleaned) < MIN_SHAPE_AREA_DEG2:
+        return None, ("The drawn selection covers no area. Draw it again as "
+                      "an outline around the place rather than a single line.")
     if kind == "Polygon":
         return {"type": "Polygon", "coordinates": cleaned[0]}, None
     return {"type": "MultiPolygon", "coordinates": cleaned}, None

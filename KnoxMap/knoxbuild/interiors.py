@@ -404,6 +404,12 @@ CHOICES = {
                  "wardrobe_tan"],
     "dresser": ["dresser", "dresser_alt", "dresser_black", "dresser_tan"],
     "counter": ["counter"] + [f"counter_{i}" for i in range(1, 8)],
+    # Every kitchen in a town had the same steel double sink and every
+    # bathroom the same white basin, which is what reads as institutional.
+    # Vanilla spreads across nine sets; these are the ones whose facings we
+    # could confirm off the map itself.
+    "sink": ["sink", "sink_cream"],
+    "kitchen_sink": ["kitchen_sink", "kitchen_sink_steel", "kitchen_sink_dark"],
 }
 
 
@@ -466,7 +472,10 @@ def bed_against_wall(plan, idx: int, room, slots, occupied: set, door_tiles: set
             occupied.update(foot)
             L._occ_mark(plan, got, L.B_ITEM)
             L._occ_mark(plan, foot, L.B_ITEM)
-            if side_table and side_table in C.FURNITURE:
+            # A bedside table with no sprite for this wall is left out rather
+            # than drawn facing its own back; the bed still gets its wall.
+            if side_table and side_table in C.FURNITURE \
+                    and not (side in ("S", "E") and side_table in L.NORTH_WEST_ONLY):
                 t_or = L._facing(side_table, side)
                 for fx, fy in flank:
                     tc = L._cells_for(side_table, fx, fy, t_or)

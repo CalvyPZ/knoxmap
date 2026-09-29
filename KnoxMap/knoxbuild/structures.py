@@ -59,6 +59,33 @@ def build_structures(out_dir: str, map_name: str, bdir: str) -> tuple[list, dict
                         "monuments": data.get("monuments", 0), "tiles": len(rows)}
 
 
+def pack_loose(bdir: str, map_name: str, tag: str, tiles: list,
+               on_top: bool = False) -> list:
+    """Loose (x, y, level, layer, tile) squares written as one .tbx per cell.
+
+    A lot spanning cells is refused by WorldEd, so they are grouped by the
+    cell they fall in and each group placed at its own corner.
+    """
+    from .world import Placement
+
+    by_cell: dict[tuple[int, int], list] = {}
+    for t in tiles:
+        by_cell.setdefault((t[0] // CELL, t[1] // CELL), []).append(t)
+    placements = []
+    for (cx, cy), group in sorted(by_cell.items()):
+        gx0 = min(t[0] for t in group)
+        gy0 = min(t[1] for t in group)
+        gw = max(t[0] for t in group) - gx0 + 1
+        gh = max(t[1] for t in group) - gy0 + 1
+        fname = f"{map_name}_{tag}_{cx}_{cy}.tbx"
+        with open(os.path.join(bdir, fname), "w", encoding="utf-8") as f:
+            f.write(render_tiles_tbx(gw, gh, [(x - gx0, y - gy0, z, layer, tile)
+                                              for x, y, z, layer, tile in group]))
+        placements.append(Placement(f"buildings/{fname}", gx0, gy0, gw, gh,
+                                    on_top=on_top))
+    return placements
+
+
 def render_tiles_tbx(width: int, height: int, tiles: list) -> str:
     """A building with no rooms whose floors hold only user-drawn tiles."""
     names = sorted({t[4] for t in tiles})

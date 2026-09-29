@@ -37,6 +37,7 @@ import numpy as np
 import shapely
 from shapely import STRtree
 from shapely.geometry import Polygon, box
+from shapely.validation import make_valid
 
 XML_CELL = 300
 BIN_CELL = 256
@@ -67,20 +68,76 @@ def _features(xml_path: str):
             yield rings, props
 
 
+# A polygon smaller than this draws as nothing and is not worth the risk.
+MIN_AREA = 1.0
+
+
+def _polygons(shape):
+    """Every polygon in whatever a clip or a repair handed back. make_valid
+    can answer with a collection holding loose lines beside the shapes."""
+    if shape.geom_type == "Polygon":
+        if not shape.is_empty:
+            yield shape
+    elif hasattr(shape, "geoms"):
+        for part in shape.geoms:
+            yield from _polygons(part)
+
+
+def _ring(points) -> list | None:
+    """One ring at whole tiles, or None if rounding has collapsed it."""
+    out = []
+    for x, y in points:
+        point = (round(x), round(y))
+        if not out or point != out[-1]:
+            out.append(point)
+    while len(out) > 1 and out[0] == out[-1]:
+        out.pop()
+    return out if len(set(out)) >= 3 else None
+
+
+def _clean(rings) -> list[list]:
+    """Rings rounded to whole tiles, checked again after the rounding.
+
+    Rounding is what breaks them: corners land on the same tile and the shape
+    collapses, or edges cross. The game cannot triangulate either, and throws
+    in WorldMapRenderer.fillPolygon when the map is zoomed out.
+    """
+    tidy = [r for r in (_ring(ring) for ring in rings) if r]
+    if not tidy:
+        return []
+    try:
+        shape = Polygon(tidy[0], tidy[1:])
+        if not shape.is_valid:
+            # make_valid over buffer(0): buffer keeps only the lobes that wind
+            # the right way, so half of a crossed outline would disappear.
+            shape = make_valid(shape)
+    except Exception:  # noqa: BLE001 - a broken outline is left off, not fatal
+        return []
+    out = []
+    for part in _polygons(shape):
+        if part.area < MIN_AREA:
+            continue
+        piece = [r for r in (_ring(ring.coords)
+                             for ring in [part.exterior, *part.interiors]) if r]
+        if not piece:
+            continue
+        # A repair can put a corner on a half tile, so the rounding above may
+        # have broken it again. Whatever is left is what gets written.
+        try:
+            final = Polygon(piece[0], piece[1:])
+        except Exception:  # noqa: BLE001
+            continue
+        if final.is_valid and not final.is_empty and final.area >= MIN_AREA:
+            out.append(piece)
+    return out
+
+
 def _polygons_to_pieces(clipped, x0, y0):
     """Ring lists for the polygons in one clipped geometry, cell-local."""
     out = []
-    for part in getattr(clipped, "geoms", [clipped]):
-        if part.geom_type != "Polygon" or part.is_empty or part.area < 0.25:
-            continue
-        piece = []
-        for ring in [part.exterior, *part.interiors]:
-            pts = [(round(x) - x0, round(y) - y0) for x, y in list(ring.coords)[:-1]]
-            tidy = [p for k, p in enumerate(pts) if k == 0 or p != pts[k - 1]]
-            if len(tidy) >= 3:
-                piece.append(tidy)
-        if piece:
-            out.append(piece)
+    for part in _polygons(clipped):
+        out.extend(_clean([[(x - x0, y - y0) for x, y in ring.coords]
+                           for ring in [part.exterior, *part.interiors]]))
     return out
 
 
@@ -90,7 +147,7 @@ def _pieces(rings, cell_x, cell_y):
     try:
         shape = Polygon(rings[0], rings[1:])
         if not shape.is_valid:
-            shape = shape.buffer(0)
+            shape = make_valid(shape)
         clipped = shape.intersection(box(x0, y0, x0 + BIN_CELL, y0 + BIN_CELL))
         return _polygons_to_pieces(clipped, x0, y0)
     except Exception:  # noqa: BLE001 - a broken outline is left off, not fatal
@@ -191,7 +248,7 @@ def _append_clipped(cells, rings, props, cell_list) -> None:
     try:
         shape = Polygon(rings[0], rings[1:])
         if not shape.is_valid:
-            shape = shape.buffer(0)
+            shape = make_valid(shape)
         if shape.is_empty:
             return
     except Exception:  # noqa: BLE001
@@ -234,11 +291,8 @@ def _within_budget(features: list) -> list:
                 continue
             if shape.is_empty or shape.geom_type != "Polygon" or len(shape.exterior.coords) < 4:
                 continue
-            rings = [[(round(x), round(y)) for x, y in list(r.coords)[:-1]]
-                     for r in [shape.exterior, *shape.interiors]]
-            rings = [r for r in rings if len(r) >= 3]
-            if rings:
-                simpler.append((rings, props))
+            for cleaned in _clean([r.coords for r in [shape.exterior, *shape.interiors]]):
+                simpler.append((cleaned, props))
         features = simpler
         if sum(_points(p) for p, _ in features) <= CELL_POINT_BUDGET:
             return features
@@ -282,7 +336,8 @@ def write_bin(xml_path: str, bin_path: str) -> int:
             if cx0 < 0 or cy0 < 0:
                 continue
             local = [[(x - cx0 * BIN_CELL, y - cy0 * BIN_CELL) for x, y in r] for r in rings]
-            cells.setdefault((cx0, cy0), []).append((local, props))
+            for piece in _clean(local):
+                cells.setdefault((cx0, cy0), []).append((piece, props))
             continue
         cell_list = assigned.get(i)
         if not cell_list:

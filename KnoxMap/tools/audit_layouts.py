@@ -20,6 +20,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from knoxbuild.layout import ELEVATOR_FROM_LEVELS, ELEVATOR_MIN_SIDE, STAIR_RUN, build_building, roof_rects  # noqa: E402
 
+# Doors left on a corner, as a share of all doors. It was 1.69% before they
+# were moved off; anything near that means the moving has stopped working.
+DOORS_ON_CORNERS_BUDGET = 0.2
+
 KINDS = [None, None, "apartment", "apartment", "shop", "school", "civic",
          "church", "medical", "restaurant", "shed",
          "police", "library", "fire", "military", "industrial"]
@@ -88,6 +92,20 @@ def audit(building, kind):
                 problems["door between two flats"] += 1
             elif ua != ub:
                 fronts[ua or ub] += 1
+        # A tile carrying both a west and a north wall is drawn as one corner
+        # piece, and a door on one comes out as neither door nor wall - which
+        # is what a player reads as a door that will not open.
+        from knoxbuild.layout import _facade_runs, _room_edges
+        edges = {(x, y, d) for _side, wall in _facade_runs(s.grid)
+                 for x, y, d, _ix, _iy in wall} | _room_edges(s.grid)
+        on_corner = {(x, y) for x, y, d in edges
+                     if (x, y, "N" if d == "W" else "W") in edges}
+        # Counted, not failed one at a time: a door only stays on a corner
+        # when every clean wall it could move to would shut a room off, and a
+        # shut room is worse. The rate is what has to stay down.
+        problems["stat:doors"] += len(s.doors)
+        problems["stat:on a corner"] += sum(1 for door in s.doors
+                                            if (door[0], door[1]) in on_corner)
         lit = {int(s.grid[fy, fx]) for role, fx, fy, _o in s.furniture if role == "switch"}
         shafts = {i for i, r in enumerate(s.rooms, 1) if r.is_shaft}
         if any(i not in lit and i not in shafts for i in range(1, n + 1)):
@@ -181,6 +199,7 @@ def main(argv):
     rng = random.Random(4242)
     totals = Counter()
     failed = Counter()
+    stats = Counter()
     windows = []
     for i in range(count):
         kind = KINDS[i % len(KINDS)]
@@ -199,6 +218,8 @@ def main(argv):
         found = audit(b, kind)
         label = kind or "house"
         totals[label] += 1
+        for k in [k for k in found if k.startswith("stat:")]:
+            stats[k] += found.pop(k)
         if found:
             failed[label] += 1
             for k, v in found.items():
@@ -216,7 +237,13 @@ def main(argv):
             print(f"{k:40} {v}")
     print(f"windows per sqrt(floor area), ground floor, mean: "
           f"{sum(windows) / len(windows):.2f}")
-    return 1 if problems else 0
+    # A door on a corner is drawn as neither door nor wall. It only stays on
+    # one when every clean wall it could move to would shut a room off, so a
+    # few is right and a lot means the moving has stopped working.
+    stuck = 100.0 * stats["stat:on a corner"] / max(1, stats["stat:doors"])
+    print(f"doors drawn as wall, on a corner: {stats['stat:on a corner']} of "
+          f"{stats['stat:doors']} ({stuck:.3f}%)")
+    return 1 if problems or stuck > DOORS_ON_CORNERS_BUDGET else 0
 
 
 if __name__ == "__main__":

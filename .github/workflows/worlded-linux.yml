@@ -103,7 +103,11 @@ jobs:
           # the machine's own graphics stack - Qt above all, so it runs on a
           # PC with no Qt installed. Three rounds, because a library copied in
           # brings its own.
-          system='/(ld-linux[^/]*|libc|libm|libdl|libpthread|librt|libstdc\+\+|libgcc_s|libGL|libGLX|libGLdispatch|libEGL|libOpenGL|libX11|libxcb|libdrm|libgbm|libwayland-[a-z]+)[.-]'
+          # glib and harfbuzz are left to the machine too: every desktop has
+          # them, and a bundled copy older than the system GTK it ends up
+          # beside fails on symbols GTK expects (g_dir_unref,
+          # hb_ot_color_has_paint on Ubuntu 24.04).
+          system='/(ld-linux[^/]*|libc|libm|libdl|libpthread|librt|libstdc\+\+|libgcc_s|libGL|libGLX|libGLdispatch|libEGL|libOpenGL|libX11|libxcb|libdrm|libgbm|libwayland-[a-z]+|libglib-2\.0|libgobject-2\.0|libgio-2\.0|libgmodule-2\.0|libharfbuzz)[.-]'
           for round in 1 2 3; do
             for f in "$out/PZWorldEd_cli" "$out"/lib/*.so* "$out"/plugins/platforms/*.so; do
               [ -e "$f" ] || continue
@@ -114,11 +118,26 @@ jobs:
             done
           done
           # Found beside the program rather than wherever a distro keeps it.
-          patchelf --set-rpath '$ORIGIN/lib' "$out/PZWorldEd_cli"
-          for lib in "$out"/lib/*.so*; do patchelf --set-rpath '$ORIGIN' "$lib"; done
-          for plugin in "$out"/plugins/platforms/*.so; do
-            patchelf --set-rpath '$ORIGIN/../../lib' "$plugin"
+          # --force-rpath writes DT_RPATH, not DT_RUNPATH. The difference is
+          # the whole problem on Linux: the loader searches DT_RPATH before
+          # LD_LIBRARY_PATH and DT_RUNPATH after it, and Steam, Proton and
+          # several desktops export an LD_LIBRARY_PATH with a system Qt on
+          # it. With RUNPATH that Qt wins, and Qt aborts on the spot with
+          # "Cannot mix incompatible Qt library". With RPATH nothing in the
+          # environment can get in front of the Qt this ships with.
+          patchelf --force-rpath --set-rpath '$ORIGIN/lib' "$out/PZWorldEd_cli"
+          for lib in "$out"/lib/*.so*; do
+            patchelf --force-rpath --set-rpath '$ORIGIN' "$lib"
           done
+          for plugin in "$out"/plugins/platforms/*.so; do
+            patchelf --force-rpath --set-rpath '$ORIGIN/../../lib' "$plugin"
+          done
+          # Qt looks for plugins under the prefix it was compiled with, which
+          # is a system path on the machine that built it. qt.conf replaces
+          # that prefix, and it is the first thing Qt reads: without it the
+          # bundled Qt loads the system's imageformats plugins, and those
+          # drag the system's Qt in behind them.
+          printf '[Paths]\nPlugins=plugins\n' > "$out/qt.conf"
           du -sh "$out"
 
       - name: Nothing it needs is missing
@@ -128,6 +147,24 @@ jobs:
                      grep 'not found' || true)
           [ -z "$missing" ] || { echo "$missing"; exit 1; }
           echo "every library resolves"
+          # And on RPATH, not RUNPATH, or an inherited LD_LIBRARY_PATH gets in
+          # front of the bundled Qt and Qt aborts before WorldEd runs a line.
+          for f in "$out/PZWorldEd_cli" "$out"/lib/*.so* "$out"/plugins/platforms/*.so; do
+            [ -e "$f" ] && [ ! -L "$f" ] || continue
+            if readelf -d "$f" | grep -q 'RUNPATH'; then
+              echo "$f still records RUNPATH"; exit 1
+            fi
+          done
+          echo "every binary records RPATH"
+          # It has to still run with a hostile LD_LIBRARY_PATH in front of it.
+          hostile=$(mktemp -d)
+          cp "$out/lib/libQt5Core.so.5" "$hostile/" 2>/dev/null || true
+          LD_LIBRARY_PATH="$hostile" QT_QPA_PLATFORM=offscreen \
+            timeout 20 "$out/PZWorldEd_cli" --generate-map=/nope.pzw 2>&1 |
+            tee run.log || true
+          grep -q 'Cannot mix incompatible Qt' run.log &&
+            { echo "the bundled Qt lost to LD_LIBRARY_PATH"; exit 1; }
+          echo "it starts with a foreign Qt on LD_LIBRARY_PATH"
 
       - name: It runs
         run: |

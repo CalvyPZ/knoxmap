@@ -2,17 +2,17 @@
 
 ## 1.5
 
-- **KnoxMap is one file.** Windows gets `KnoxMap-v…-windows.exe`, Linux an
+- **KnoxMap is one file.** Windows gets `KnoxMap-vΓÇª-windows.exe`, Linux an
   AppImage, macOS a dmg. Python and the libraries are already inside. Put the file
   anywhere and open it. Maps, logs and the first-run downloads sit in the
   folder beside it (on a Mac that lives in Applications, they sit in a
   `KnoxMap` folder in your home directory). The map tools and the game's
   tiles are still fetched the first time, from the tools' own release and
-  from your own copy of Project Zomboid — they are not inside the file. That
+  from your own copy of Project Zomboid ΓÇö they are not inside the file. That
   first-run setup happens inside the program. There is no setup script to run.
 
   The window is the same Electron window on every system. The page is
-  unchanged — the map, the search, the pipeline — and Python still serves it
+  unchanged ΓÇö the map, the search, the pipeline ΓÇö and Python still serves it
   and still does the work. A source checkout opens that window from `desktop/`
   after `npm install` when `desktop/main.js` is present, or the browser when
   it is not, or when `KNOXMAP_BROWSER=1`.
@@ -26,8 +26,8 @@
 
   On Linux the window no longer needs GTK or Qt installed for Python. It does
   need the ordinary desktop libraries, which a desktop already has. If the
-  sandbox cannot start — the helper is not setuid, or AppArmor will not allow
-  a user namespace — KnoxMap opens it once more without the sandbox. The page
+  sandbox cannot start ΓÇö the helper is not setuid, or AppArmor will not allow
+  a user namespace ΓÇö KnoxMap opens it once more without the sandbox. The page
   is only this computer's.
 
 - **The map comes from a regional extract.** Generate no longer asks Overpass
@@ -72,6 +72,366 @@
   rings with an island, not discs of tarmac. The download now asks for those
   nodes, so the first generate after this version fetches the area again.
 
+- **Upstream through 1.4.6 is in this copy.** Interior plans, porch lights, Overpass tiles that arrive empty, paper-map outlines, dedicated-server notes, and the Linux Qt fixes. The notes for those releases follow this one.
+
+## 1.4.6
+
+- **A map is not empty because a server said nothing** (`generator/osm.py`).
+  Two ways the download reported success and brought back no town. Overpass
+  answers a query it could not finish with HTTP 200, the part it managed in
+  `elements` and the reason in `remark`; only the status was read, so a
+  half-downloaded tile went in as a finished one. And `overpass.osm.ch`
+  answers every query with 200 and an empty list ΓÇö a one-block query that
+  `overpass-api.de` returns 674 elements for. Tiles are dealt to the instances
+  in turn, so a third of a city's tiles were handed to it and came back as
+  open ground, which is why a town rendered as a meadow with its river still
+  in it: the river was in the tiles that did arrive. A `remark` is now a
+  failed tile, and an empty answer has to be confirmed by a second instance
+  before the tile counts as empty. `overpass.openstreetmap.fr` is dropped; it
+  has been 403 "only available to white-listed usages" on every request.
+
+- **An outline with no area is refused** (`app.py`). A lasso drawn as one
+  stroke, or a traced outline whose points land on each other, passed as a
+  valid polygon that encloses nothing. The map is clipped to the drawn shape,
+  so everything outside it ΓÇö all of it ΓÇö went back to grass, and the
+  generation ran to the end and handed over a meadow. It is turned down now
+  with a reason, before the download.
+
+## 1.4.5
+
+- **Public squares are paved** (`generator/osm.py`, `generator/renderer.py`). A
+  pedestrian zone was read as a service alley and painted 3.5 m wide, so Madrid's
+  Puerta del Sol ΓÇö a mesh of pedestrian ways with no polygon anywhere ΓÇö came out
+  as stripes on a lawn. And an arcade, tagged as a passage through a building,
+  was read as a tunnel and dropped, which took all 11,437 m┬▓ of Plaza Mayor with
+  it. A pedestrian zone is its own class now, paved 9 m wide; a pedestrian way
+  that closes on itself is a square whether or not it says `area=yes`; and a
+  building passage is at ground level, not under it. Plaza Mayor, Puerta del Sol
+  and Plaza de Santa Ana all paved, checked by downloading the real thing.
+
+- **A school is a school inside** (`knoxbuild/layout.py`). The fill list was
+  cycled round-robin once the mix was spent, so every kind in it got an equal
+  share however silly: a school came out with 61 lavatories and 58 offices to
+  its 63 classrooms, a police station with seven locker rooms, a church with as
+  many storerooms as nave. Each kind has a share of a floor now. Schools gained
+  a canteen, a laboratory, gym stores and janitors; barracks lost the police
+  office that was in them.
+
+- **Cells the game knows what to put in** (`knoxbuild/layout.py`). Every room
+  name was checked against the 586 in Knox County and `cells` was the only one
+  the game does not have ΓÇö it calls them `prisoncells`, and there are 540. The
+  name is what the loot tables key off, so ours were furnished and then spawned
+  nothing. The station leaned on `policestorage` as well, which has two rooms in
+  the whole county.
+
+- **Rooms the size the game builds them** (`knoxbuild/layout.py`). Every room in
+  Knox County, measured by what it is called: a church is 39 tiles at the median
+  but 340 at the ninth decile, a library room 100, a gym 88, a warehouse 134.
+  Held to one size for every building, ours came out as a grid of cubicles where
+  the game has a hall. The cap is by kind now.
+
+- **Buildings you walk round, not through** (`knoxbuild/layout.py`). Only houses
+  ever got circulation, so a school was classrooms opening into one another. A
+  real corridor is cut through a school, a police station or a clinic ΓÇö the
+  game's halls average 122 tiles in a school, not the 24 of a relabelled room ΓÇö
+  and only where there are rooms enough to be worth serving. How much is a
+  balance measured both ways: at one extra hall per twelve rooms, 230 doors in
+  300 buildings went bedroom into bedroom; at one per six, a house was a third
+  corridor. One per eight puts a house at 23.3% circulation against the game's
+  23.7%, and bedroom-to-bedroom doors at 120 where the old plan had 771.
+
+- **No two buildings of a kind alike** (`knoxbuild/build.py`). Church, barn and
+  industrial shipped with one wall style each; police, library, fire and
+  barracks had none at all and fell through to the house styles, so a police
+  station could come out in clapboard. Every variant of a kind shared one
+  interior wall besides. Public buildings borrow the civic style, the others
+  take an exterior and an interior from the house styles ΓÇö whole, so window and
+  door tiles come with them ΓÇö and a house takes its block's style 55% of the
+  time and its own the rest, which builds a street rather than an estate.
+
+- **Nothing hanging in the air** (`knoxbuild/layout.py`, `knoxbuild/catalog.py`).
+  A piece is drawn with its base part-way up its tile when it is meant to sit on
+  something: a lamp's base is 153 pixels down a 256-pixel tile, a pot plant's
+  151, but a coffee table's top edge is at 172, so 94% of them hovered. The box
+  was the stacking one drawn a quarter of a tile up, where Knox County puts 336
+  of its 338 boxes on the one that sits on the ground. And the sink list was the
+  two that existed when it was written, so the three added in 1.4.3.2 all hung.
+
+- **A .tbx that cannot be written no longer loses a building**
+  (`knoxbuild/catalog.py`). BuildingEd wants a colour for every room name and
+  throws without one. The failure was swallowed as "left out 2 buildings that
+  could not be laid out", which is how a school and a police station vanished
+  from a town without a word. Every room kind is checked for furniture and a
+  colour now.
+
+## 1.4.4
+
+- **Lamps and pot plants stand on something that reaches them**
+  (`knoxbuild/layout.py`). A small piece is drawn with its base part-way up its
+  tile and whatever it stands on has to reach that high: a lamp's base is 153
+  pixels down a 256-pixel tile and a pot plant's 151, but a coffee table's top
+  edge is at 172 ΓÇö so both hung a quarter of a tile above the table put under
+  them. 94% of them were in the air. A bedside chest tops out at 97 and a
+  counter at 125; Knox County stands 180 of its 270 table lamps on
+  `furniture_storage_01` and not one on a low table. A chest goes under them
+  instead, and a low table already on the tile is swapped for one rather than
+  stacked with it.
+
+- **A house you walk round, not through** (`knoxbuild/layout.py`). Every room
+  opened onto every room it touched: the commonest door in a generated town was
+  one bedroom into the next, and 56% of doors joined two rooms you should not
+  have to cross. An upstairs had no circulation at all, because only a lift or
+  stair core was ever made a hall. The room the stairs arrive in is the landing
+  now, and a floor gets one more hall per five rooms until the rest all open
+  onto circulation. A door between two private rooms is priced dearly enough
+  that the plan takes any other way round, bar the pairs a real house has ΓÇö a
+  bathroom off a bedroom, and the kitchen, dining and living rooms. 56% down to
+  2%, with no room sealed off and corner doors unchanged at 0.05%.
+
+- **Bathrooms the size of bathrooms** (`knoxbuild/layout.py`). A floor is cut
+  into rooms of one target size and the bathroom then takes the smallest of
+  them, so it came out at 13.7 m┬▓ ΓÇö a bathroom the size of a bedroom, and the
+  reason bathrooms measured 7.4 pieces per 10 m┬▓ against Knox County's 12.6.
+  One region on a house floor now gives up a corner to a small room first, in
+  two cuts because a corner taken out of a rectangle leaves an L. Bathrooms
+  13.1 m┬▓ down to 10.0 with the same fittings in them; what is left of the
+  corner is a closet or a box room, which is what sits beside a bathroom in
+  the game's houses too. The smallest room a wall can enclose is 3├ù3, so 9 m┬▓
+  is as near the game's 6.5 as whole tiles allow.
+
+- **A table and chairs in the kitchen** (`knoxbuild/layout.py`). Every piece
+  of a centre group needs its own clear block with a tile of aisle all round
+  it, so in a kitchen four tiles across nothing but the bare table ever fitted:
+  one kitchen in eight had a table and there were 0.17 chairs in one, against
+  the game's 0.52 and 1.10. A table on its own is the last arrangement tried,
+  and chairs go on after the group is down, tucked against the table rather
+  than given an aisle each. Tables in 36% of kitchens, 0.70 chairs each, and a
+  mat under the table where there is room for one.
+
+- **A light by the front door** (`knoxbuild/yards.py`). Knox County hangs one
+  outside 92% of its houses; generated ones had 1%, which is most of why a
+  street of them reads as unfinished from outside. One goes on the wall beside
+  every front door, on the slab the stoop already lays. Which sprite belongs on
+  which wall was read off the vanilla map rather than guessed ΓÇö for every
+  outdoor light standing outside a house with house tiles on exactly one side,
+  that side ΓÇö and the five sets used came back 96ΓÇô100% one-sided over 60 to 140
+  sightings each. They are written as loose tiles, because they stand outside
+  the building and a house's own `.tbx` stops at its footprint. The square a
+  light stands on usually carries the house wall too, and WorldEd lays a
+  cell's lots down in the order the project lists them ΓÇö sorted by position,
+  the light went down before the wall and the wall covered it. A lot can now
+  ask to go last, which is where all 659 of Knox County's porch lights that
+  share a square with a wall are written.
+
+## 1.4.3.3
+
+- **Maps stop drifting east** (`knoxbuild/world.py`). Generating makes a new
+  output folder every time, and every folder claimed its cells in the world for
+  good, whether it was ever installed or not. So each map started further out
+  than the last ΓÇö 70, 98, 104, 110, 132, 159 on the PC this was found on ΓÇö and
+  the paper map is one grid counted from cell 0, so the town drew smaller and
+  further into the corner of an empty world with every generation. Only
+  installed maps hold a place now, and uninstalling one hands its cells back. A
+  new map lands on 70,0 again, where the first one did.
+
+- **A smoke test** (`tools/smoke_test.py`). The selftest is 200 checks and
+  several minutes; this is the end-to-end path on its own ΓÇö terrain, buildings,
+  paper map, install ΓÇö with the numbers printed rather than asserted, for
+  checking a release in a minute.
+
+## 1.4.3.2
+
+- **More than one kind of sink** (`knoxbuild/catalog.py`). Every kitchen in a
+  town had the same steel double sink and every bathroom the same white
+  basin, which is what reads as institutional; the game's own map spreads
+  across nine sets. Three more are added, and the facing of every tile was
+  read off the vanilla map rather than guessed ΓÇö for each sink standing
+  against exactly one wall of a room, which wall that was. The two sets
+  already here came back exactly as written, which is what makes the rest of
+  it trustworthy. The pedestal basins are left out: they only ever answer
+  north and west, so they have two sprites, not four.
+
+- **Not every room has a picture in it** (`knoxbuild/layout.py`). Pictures and
+  mirrors are on nearly every room's list and, unlike everything else, they
+  repeat as the list grows with the floor, so almost every room had one or
+  two and wall art came to 11.8% of everything in a house. One per room at
+  most, and only about half of rooms get one: 1.25 per room down to 0.60,
+  6.6% of the furniture. Corridors hang one every third wall slot rather
+  than on every one.
+
+- **Furniture no longer faces the wrong way** (`knoxbuild/layout.py`). A piece
+  with only north and west sprites, stood against a south or east wall, is
+  drawn with its north sprite on the far edge of the tile: a corkboard hangs
+  a tile into the room, a rack faces its own back. Which pieces that applies
+  to was a list kept by hand, so anything added later was quietly wrong ΓÇö
+  1,076 of them over 200 houses, corkboards and bedside tables worst. It is
+  worked out from the catalogue now, so a new piece cannot get it wrong.
+
+- **A shelf is whatever that room would really have** (`knoxbuild/layout.py`).
+  One generic wooden shelf was on nearly every room's list and was always the
+  same sprite, which made it the third commonest object in a town at 5.9% of
+  all furniture. The room picks now: bookshelves in living rooms, bedrooms,
+  studies and libraries, a shelf or a chest of drawers in bathrooms, wire
+  racking and crates only in storerooms, garages and works. The wooden shelf
+  is 3.5%, nobody has a warehouse rack in their bathroom, and a wall cabinet
+  hangs over a kitchen counter rather than standing on a bare wall.
+
+## 1.4.3
+
+- **Every map now ships what a dedicated server needs**
+  (`tools/make_map_mod.py`). A map mod is enough for one player; a server
+  needs three things the mod folder cannot tell it, so they are written out
+  with this map's real names: `SERVER SETUP.txt` with the exact `Mods=` and
+  `Map=` lines, and `server/<map>_spawnregions.lua` ready to copy into
+  `Zomboid/Server/`. Without the spawn region players start in Muldraugh
+  rather than on the map.
+
+- **Both notes say to add the map before the world exists.** A world is
+  written cell by cell as players walk into it, from whatever map was loaded
+  at the time, so a map added or changed afterwards leaves old cells beside
+  new ones that do not match ΓÇö which surfaces later as unexplained failures
+  rather than an error. Installing now also reports the saves already on the
+  PC, so the choice is in front of you at the moment it matters.
+
+- **The server notes cover what actually goes wrong.** A KnoxMap map is not
+  on the Workshop, so nothing fetches it for players ΓÇö every one of them
+  needs the same folder, and a player without it falls through the world
+  where the map should be. A map built with Erika's Tiles says the server and
+  the players need that mod too, with the `Mods=` and `WorkshopItems=` lines
+  to match. Map folder names are case sensitive on the Linux servers most
+  people rent. There is a short list of symptoms and their causes at the end.
+
+## 1.4.2
+
+- **The map compiler uses its own Qt plugins on Linux, not the machine's**
+  (`knoxpaths.py`, `worlded-linux.yml`). Loading the right Qt libraries was
+  only half of it: Qt looks for its plugins under the prefix it was compiled
+  with, so on Ubuntu 24.04 the bundled Qt 5.15.3 read
+  `/usr/lib/x86_64-linux-gnu/qt5/plugins`, whose `libqsvg.so` pulled the
+  system's Qt 5.15.13 in behind it and Qt aborted. `QT_PLUGIN_PATH` cannot
+  settle that, because a plugin found through the built-in prefix is loaded
+  before the environment is consulted. A `qt.conf` beside the compiler
+  replaces the prefix itself, which is the first thing Qt reads. Written on
+  setup, so an install that already exists is fixed without a reinstall.
+  Reported with the diagnosis by a player on Ubuntu 24.04.5.
+
+- **glib and harfbuzz are left to the machine.** Every desktop has them, and
+  the bundled copies were older than the system GTK they ended up beside,
+  which failed on `g_dir_unref` and `hb_ot_color_has_paint`.
+
+- **Corridors and stair halls are dressed, not blank** (`knoxbuild/layout.py`).
+  Nothing may stand in a corridor ΓÇö a flat's front door and the only way past
+  the flight both run through it ΓÇö so ours carried one picture every third
+  slot and nothing else, 1.6 pieces per 10 m┬▓ against Knox County's 7.1. The
+  walls now take pictures, mirrors and a corkboard along their inside faces,
+  and rugs go on the floor, which is the one thing you can walk over. 1.6 ΓåÆ
+  6.8 per 10 m┬▓. Most of the facade is left clear so the windows keep their
+  columns up the front of the building.
+
+- **The map compiler now loads its own Qt on Linux, whatever
+  `LD_LIBRARY_PATH` says** (`knoxpaths.py`, `worlded-linux.yml`). The bundled
+  binaries recorded their library folder as DT_RUNPATH, which the loader
+  searches *after* `LD_LIBRARY_PATH` ΓÇö and Steam, Proton and several desktops
+  export one with a system Qt on it. That Qt was found first and Qt aborted
+  before WorldEd ran a line: *Cannot mix incompatible Qt library (5.15.13)
+  with this library (5.15.3)*. Putting the bundled folder at the front of
+  `LD_LIBRARY_PATH` was not enough, because nothing done at run time outranks
+  what the loader read before starting.
+
+  The tag is now DT_RPATH, which is searched first. Future builds are made
+  that way (`patchelf --force-rpath`); an install that already exists is
+  converted in place the first time it is checked, so it heals itself without
+  a reinstall. A folder on `LD_LIBRARY_PATH` carrying a Qt of its own is also
+  dropped for the compiler, and an inherited `QT_PLUGIN_PATH` is ignored when
+  there are no bundled plugins to point at.
+
+- **Doors no longer sit on a wall corner, where the game draws neither door
+  nor wall** (`knoxbuild/layout.py`). A tile carrying both a west and a north
+  wall is one corner piece, and a door on one comes out as blank wall ΓÇö a
+  doorway that will not open. On a built town map 989 doors of 57,357 were on
+  one, spread over 741 buildings. A stuck door now moves to a clean wall the
+  room shares with some other neighbour, not just to the same boundary, and
+  every move is checked so nothing is shut off and a flat keeps exactly one
+  front door. 1.69% of doors ΓåÆ 0.057%, and `audit_layouts.py` fails if the
+  rate climbs back.
+
+- **A busy Overpass server no longer loses the map** (`generator/osm.py`). One
+  tile failing threw the whole download away uncached, so a town that fetched
+  forty tiles and missed one started again from nothing. The tiles that
+  arrived are kept and only the ones that did not are asked for again. A tile
+  nothing answered in time is also quartered and retried, as a tile the server
+  refuses outright already was ΓÇö bounded, so a dropped connection costs eight
+  requests rather than sixty-four. Added `overpass.osm.ch` as a fourth
+  endpoint, and the failure now says how many tiles were missing and what to
+  do about it.
+
+- **Furniture is cleared out of the way of doorways** (`knoxbuild/layout.py`).
+  Rooms were furnished one at a time, so a shelf could land in the only
+  doorway and a counter could span the only way through. The plan was always
+  connected; the furnished building was not. Over 400 buildings, 272 had at
+  least one room nobody could walk into and 3,030 rooms of 34,331 were sealed
+  off. Now none, for 0.42% of the furniture.
+
+- **A big two-storey building is flats, not one enormous house**
+  (`knoxbuild/build.py`). A floor count of two used to settle it whatever the
+  footprint, so a terraced row came out as a single dwelling: on a 23x19
+  building, 43 rooms with 24 bedrooms, two bathrooms and one kitchen. Two
+  storeys says nothing on its own ΓÇö a terrace is two and so is a bungalow
+  with an attic ΓÇö so the footprint decides, as it already did for a building
+  with no floor count at all. The same building now lays out as eight flats
+  with a kitchen, a bathroom and a living room each. One storey is still a
+  house at any size, three or more is still flats, and `building=house` is
+  still believed.
+
+- **Paper map outlines are checked again after they are rounded to whole
+  tiles** (`knoxbuild/worldmap_bin.py`). Collapsed and self-crossing polygons
+  are repaired where they can be and dropped where they cannot, instead of
+  being written out. They were crashing the world map when it was zoomed out
+  over a dense area. Measured on two built maps: 21 bad outlines and 15 bad
+  outlines, now none.
+
+- **`KnoxMapGunCache.lua` checks an argument's type before calling a method on
+  it.** Stops the repeated "Tried to call nil" in the game's log.
+
+## 1.4.1
+
+- **KnoxMap.exe is built with MSVC** (`win/build_launcher.ps1`, on a Windows
+  runner) instead of mingw-w64, and is no longer stripped. Drops the two
+  things antivirus scores a 30 KB two-`CreateProcessW` binary on: the mingw
+  toolchain and a missing symbol table. `win/build_launcher.sh` still builds
+  the identical binary with mingw on Linux and CI still checks it, so what
+  ships is reproducible without Visual Studio. Not a substitute for signing.
+  v1.4's zip shipped the mingw build; this is the first release with the
+  MSVC one.
+
+- **PZWorldEd runs on a Windows desktop of its own** (`CreateDesktopW`,
+  `STARTUPINFOW.lpDesktop`, in `tools/compile_map.py`). Qt's windows and the
+  Generate Lots dialogs cannot be composited onto the screen at all, so
+  compiling no longer flashes windows over whatever is in front. A watcher
+  thread copies anything titled error, warning or exception - and anything
+  still open after a minute - back to the real desktop as a message box, so
+  a compiler that is genuinely stuck is still visible.
+
+- **Setup.bat fetches Python with `curl`, `certutil` and `tar`** instead of a
+  PowerShell one-liner. Same URL, same SHA-256 check, same private copy under
+  `.python`. Kaspersky flagged the PowerShell form; these are stock Windows
+  tools and are not flagged.
+
+- **Added `<game>/projectzomboid/media` to the game folder search**
+  (`knoxpaths.py`). Linux installs that nest the media folder a level deeper
+  were refused as "no game found". Checked in `tools/selftest.py`.
+
+- **Removed `btn-small` from the pipeline Stop buttons**, which sat shorter
+  than the Build and Compile buttons beside them.
+
+- **Releases publish from a tag with or without the `v`, and from a release
+  drafted by hand on GitHub** (`release: published`). `1.4.1` was tagged
+  without the `v`, so `release.yml` never ran, the release carried no files,
+  and a release with no files is invisible to the in-app updater - there is
+  nothing for it to download. `release.yml` now also refuses a tag the
+  changelog does not head, because the app reads its version from that
+  heading and would otherwise offer the same update for ever.
+
 ## 1.4
 
 - **KnoxMap.exe is built the way Windows software is built.** The launcher is
@@ -93,22 +453,22 @@
 
 - **The size limits are advice now, not a wall.** Draw too big an area and
   KnoxMap used to grey the **Generate map** button out and answer the request
-  with an error: over 400 km², over 9,000 tiles a side, or more memory than
+  with an error: over 400 km┬▓, over 9,000 tiles a side, or more memory than
   the PC had free. Somebody who wanted a whole city could not have one at
   all, whatever their machine.
 
   Every one of those is a warning now and the button stays lit. The panel says
-  what the area will cost — the tiles, the gigabytes of ground and greenery
-  held at once, how many OpenStreetMap queries — and adds that raising metres
+  what the area will cost ΓÇö the tiles, the gigabytes of ground and greenery
+  held at once, how many OpenStreetMap queries ΓÇö and adds that raising metres
   per tile is the cheapest fix, because 2 m a tile is a quarter of the memory
   of 1 m. Then it gets out of the way. Landmark lookup is the same: over
-  40 km² it is slow, so it says so instead of refusing.
+  40 km┬▓ it is slow, so it says so instead of refusing.
 
   A limit that says no is worth having only when the thing behind it cannot be
   done. These can be done; what they cost is the mapper's to spend.
 
-  What is still refused is a scale that is not a scale — zero, a negative, or
-  something absurd — because dividing the world by nothing is not a map
+  What is still refused is a scale that is not a scale ΓÇö zero, a negative, or
+  something absurd ΓÇö because dividing the world by nothing is not a map
   anybody asked for.
 
   And if a map really is too big, it now fails like a grown-up. Running out of
@@ -133,15 +493,15 @@
 
   | | OSM has | Overture adds | median size of the new ones |
   |---|---|---|---|
-  | Gifhorn, Germany | 1,962 | **60** (3%) | 38 m² — sheds and garages |
-  | Ürgüp, Turkey | 473 | **761** (62%) | 87 m² — houses |
+  | Gifhorn, Germany | 1,962 | **60** (3%) | 38 m┬▓ ΓÇö sheds and garages |
+  | ├£rg├╝p, Turkey | 473 | **761** (62%) | 87 m┬▓ ΓÇö houses |
 
   So it is **off by default**. Where OSM is complete it adds sheds and costs a
   few minutes; where OSM is thin it nearly trebles the town. You can see which
   case you are in from the preview before you turn it on.
 
-  Overture's `class` is OpenStreetMap's own building values — house,
-  apartments, barn, church — so where it has one the building arrives already
+  Overture's `class` is OpenStreetMap's own building values ΓÇö house,
+  apartments, barn, church ΓÇö so where it has one the building arrives already
   classified. The machine-found ones have none and arrive as plain
   footprints, which is what they are; the generator reads the land around
   them for the rest, as it does for any untagged building.
@@ -151,7 +511,7 @@
   listed under the optional extras with what to type. Everything else works
   without it. One fetch takes two to three minutes, nearly all of it spent
   finding which of Overture's files cover your box, so the answer is kept
-  beside the map like the Overpass one — and a map that has been fetched once
+  beside the map like the Overpass one ΓÇö and a map that has been fetched once
   re-renders with no DuckDB at all, on any PC, including one you hand the
   folder to.
 
@@ -159,8 +519,8 @@
   OpenStreetMap, which ODbL asks for; one built without it is unchanged.
 
   This does not replace the houses KnoxMap already invents from OSM's own
-  address points — those are the homes somebody numbered but never drew, 22
-  of them in Gifhorn and 20 in Ürgüp, and they are still filled in afterwards
+  address points ΓÇö those are the homes somebody numbered but never drew, 22
+  of them in Gifhorn and 20 in ├£rg├╝p, and they are still filled in afterwards
   wherever nothing stands.
 
 ## 1.3.9.2
@@ -439,14 +799,14 @@
 
 - **A town with no zombies in it.** The project told WorldEd where the zombie
   spawn map was by its bare file name, in the same block whose export folder
-  had to be made absolute for exactly this reason — so WorldEd looked for it
+  had to be made absolute for exactly this reason ΓÇö so WorldEd looked for it
   beside its own executable, found nothing, and baked every map with no
   zombies at all. Measured on the same map compiled both ways: sixteen
   chunkdata files and 23,054 bytes of zombie data with the fix, and none
   without it. Maps already made need Compile and Install again.
 - **Walls you can see straight through.** A map built with Erika's Tiles
-  said `require=\Erikas_Tiles` in its mod.info. No mod has that id — the id
-  is `Erikas_Tiles`, with nothing in front of it — so the game neither
+  said `require=\Erikas_Tiles` in its mod.info. No mod has that id ΓÇö the id
+  is `Erikas_Tiles`, with nothing in front of it ΓÇö so the game neither
   insisted on the mod nor loaded it before the map, and every tile from it
   came out missing. One compiled cell of the test town names Erika's tiles
   276 times, which is how much of a building can simply not be there.
@@ -457,7 +817,7 @@
   Pwnagee.)
 - **Upgrading a map kept its settings.** The window sent none at all when it
   redid a map for a new release, so one drawn with Knox County roads, a tree
-  density or a scale of its own came back with the defaults — and then saved
+  density or a scale of its own came back with the defaults ΓÇö and then saved
   them over the map's own.
 - **A house from an address no longer sits on the road.** Mappers put an
   address point anywhere from the doorstep to the middle of the carriageway,
@@ -466,18 +826,18 @@
   road until it is clear, and left out if it cannot be. How many houses came
   from addresses is in the map's info file and the log, so "it made none of
   mine" is a number.
-- **Español and Türkçe**, in the language menu. Spanish came from a player -
+- **Espa├▒ol and T├╝rk├ºe**, in the language menu. Spanish came from a player -
   thank you. `lang/english.txt` is still the file to copy for any other.
-- **A download per system**: `KnoxMap-v…-windows.zip`,
-  `…-linux.tar.gz`, `…-macos.tar.gz`. The tarballs keep the executable bit
+- **A download per system**: `KnoxMap-vΓÇª-windows.zip`,
+  `ΓÇª-linux.tar.gz`, `ΓÇª-macos.tar.gz`. The tarballs keep the executable bit
   a zip cannot, so `./setup.sh` runs straight out of one, and each carries
   only the launchers for its own system. The in-app updater takes the file
   built for the PC it is running on, and older releases still install.
 
 - **Linux and macOS.** `./setup.sh` once, `./knoxmap.sh` after that. Drawing
   the terrain, the buildings, the paper map and installing the mod are all
-  Python and need nothing extra; Compile runs the map tools — Windows
-  programs — through Wine, which a PC playing Project Zomboid through Proton
+  Python and need nothing extra; Compile runs the map tools ΓÇö Windows
+  programs ΓÇö through Wine, which a PC playing Project Zomboid through Proton
   already has. Without Wine every other step still works and the window says
   so, and you can finish a map by hand in WorldEd. `KNOXMAP_WINE` points at a
   particular build; a native build of the tools, dropped in
@@ -485,7 +845,7 @@
   alone by setup. See [LINUX.md](LINUX.md).
 - **A window, or your browser.** pywebview needs a desktop toolkit behind it
   that pip cannot install, so a Linux machine without one had no window at
-  all. KnoxMap now checks before it serves and opens your browser instead —
+  all. KnoxMap now checks before it serves and opens your browser instead ΓÇö
   the same app, nothing missing. `KNOXMAP_BROWSER=1` forces that anywhere.
 - Steam is found where each system keeps it: the two paths every
   distribution uses, Flatpak, Snap, macOS's Application Support, and
@@ -759,7 +1119,7 @@ map.
 - Shops fitted out like Knox County's: rows of shelving, fridges along the
   walls, a till by the door and a stockroom behind; offices with desks and
   filing cabinets; every flat with its own sofa, beds, wardrobes and kitchen.
-- Restaurants, cafés and bars fitted out like the game's own: diner and pizzeria
+- Restaurants, caf├⌐s and bars fitted out like the game's own: diner and pizzeria
   booth sets, tables with their chairs (against the wall in a narrow place), a
   counter across the back, and kitchens of steel counters, commercial ovens, a
   griddle and fryers. Narrow shops mix fridges with shelving; theatres have rows

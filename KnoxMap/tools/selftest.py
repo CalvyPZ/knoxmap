@@ -185,17 +185,29 @@ def check_1_3_6(check, out: str, tbx: list[str], pzw_text: str, log: str) -> Non
     # game caps filled containers per room, so one room the size of a factory
     # floor has loot at one end and bare shelves at the other.
     from knoxbuild.settings import Settings as _S
-    biggest = 0
+    # The cap is by what the building is: Knox County's own churches, gyms,
+    # libraries and warehouses are far bigger than a house's rooms, and held
+    # to one size they came out as a grid of cubicles.
+    over = []
     for kind, w, h in (("industrial", 140, 110), ("civic", 200, 200),
-                       ("apartment", 60, 40), (None, 30, 24)):
+                       ("apartment", 60, 40), (None, 30, 24),
+                       ("church", 40, 60), ("library", 40, 30),
+                       ("school", 60, 45)):
         plan = layout.build_building(w, h, commercial=True, seed=3, kind=kind,
                                      levels=1, settings=_S()).storeys[0]
         # Bar the landing of a block of flats, which is a corridor by
         # design and holds nothing worth filling.
-        biggest = max(biggest, max((r.x1 - r.x0 + 1) * (r.y1 - r.y0 + 1)
-                                   for r in plan.rooms if not r.is_core))
-    check(0 < biggest <= layout.MAX_ROOM_AREA,
-          f"no room is bigger than the game will fill ({biggest} tiles)")
+        biggest = max((r.x1 - r.x0 + 1) * (r.y1 - r.y0 + 1)
+                      for r in plan.rooms if not r.is_core)
+        # The cap is where the splitter stops cutting, not a hard ceiling:
+        # a region it cannot halve again without making a room narrower than
+        # three tiles comes out over. A quarter over is the slack that allows.
+        allowed = layout._room_cap(kind) * 1.25
+        if not 0 < biggest <= allowed:
+            over.append(f"{kind}:{biggest}>{allowed:.0f}")
+    check(not over,
+          f"no room is bigger than the game will fill for its kind "
+          f"({'; '.join(over) or 'none over'})")
 
     rooms = {m for t in texts.values() for m in re.findall(r'InternalName="(\w+)"', t)}
     check("policeoffice" in rooms and "policelocker" in rooms,
@@ -279,16 +291,92 @@ def check_1_3_6(check, out: str, tbx: list[str], pzw_text: str, log: str) -> Non
     check(len(aisle) >= 3,
           f"a mall's rows are a mix, not one piece repeated ({dict(aisle)})")
 
-    # The first map on a PC keeps the old origin; the next one stands clear.
+    # The first map on a PC keeps the old origin, and so does the next one:
+    # generating makes a new folder every time, and those used to claim their
+    # cells for good, so each map started further east than the last until the
+    # town drew as a speck in the corner of the paper map.
     origin = re.search(r'<worldOrigin origin="(\d+),(\d+)"', pzw_text)
     check(origin and (int(origin.group(1)), int(origin.group(2))) == WORLD_ORIGIN_CELLS,
           "the first map is built where every map used to be")
     beside = os.path.join(os.path.dirname(out), "elsewhere")
     os.makedirs(beside, exist_ok=True)
-    picked = choose_origin(beside, 3, 3)
-    check(picked[0] >= WORLD_ORIGIN_CELLS[0] + 3,
-          f"a second map is built clear of the first (cell {picked[0]},{picked[1]})")
+    # On a PC with nothing installed, whatever is sitting in output/.
+    empty = tempfile.mkdtemp(prefix="knoxmap-zomboid-")
+    was = os.environ.get("ZOMBOID_DIR")
+    os.environ["ZOMBOID_DIR"] = empty
+    try:
+        picked = choose_origin(beside, 3, 3)
+        check(picked == WORLD_ORIGIN_CELLS,
+              f"a map built beside one nobody installed lands there too "
+              f"(cell {picked[0]},{picked[1]})")
+
+        # What does stand clear is a map already installed, which is the only
+        # thing that can be in the same world at the same time.
+        cells = (Path(empty) / "mods" / "SomeOtherMap" / "common" / "media"
+                 / "maps" / "Some Other Map")
+        cells.mkdir(parents=True, exist_ok=True)
+        for cx in range(82, 86):
+            (cells / f"world_{cx}_0.lotheader").write_text("")
+        picked = choose_origin(beside, 3, 3)
+        check(picked[0] >= WORLD_ORIGIN_CELLS[0] + 3,
+              f"a map is built clear of one already installed "
+              f"(cell {picked[0]},{picked[1]})")
+    finally:
+        if was is None:
+            os.environ.pop("ZOMBOID_DIR", None)
+        else:
+            os.environ["ZOMBOID_DIR"] = was
+        shutil.rmtree(empty, ignore_errors=True)
     shutil.rmtree(beside, ignore_errors=True)
+
+
+def check_dwellings(check) -> None:
+    """A big building is homes, not one enormous house.
+
+    A floor count of two used to settle it whatever the footprint, so a
+    1200-tile terraced row came out as a single dwelling with 43 rooms, 24
+    bedrooms and one kitchen. Two storeys says nothing on its own - a terrace
+    is two and so is a bungalow with an attic - so the footprint decides.
+    """
+    import random as _random
+    from collections import Counter as _Counter
+
+    from knoxbuild.build import looks_like_apartment
+    from knoxbuild.layout import build_building
+    from knoxbuild.settings import Settings
+
+    settings = Settings()
+    big, small = 4 * settings.apartment_footprint, settings.apartment_footprint // 2
+
+    def share(tags, area):
+        return sum(looks_like_apartment(tags, area, _random.Random(k), settings)
+                   for k in range(200)) / 200.0
+
+    check(share({"building": "yes", "building:levels": "2"}, big) > 0.3,
+          "a big two-storey building can be flats")
+    check(share({"building": "yes", "building:levels": "2"}, small) == 0,
+          "a small one is still somebody's house")
+    check(share({"building": "yes", "building:levels": "1"}, big) == 0,
+          "and a single storey is a house whatever its footprint")
+    check(share({"building": "yes", "building:levels": "6"}, small) == 1,
+          "six storeys is flats however small the footprint")
+    check(share({"building": "house", "building:levels": "2"}, big) == 0,
+          "a mapper who wrote building=house is believed")
+
+    # And what it turns into has to read as homes: a kitchen and a bathroom
+    # each, not two dozen bedrooms sharing one.
+    kinds = _Counter()
+    for seed in range(12):
+        b = build_building(23, 19, levels=2, seed=seed, kind="apartment")
+        for storey in b.storeys:
+            for room in storey.rooms:
+                kinds[room.kind] += 1
+    beds = kinds["bedroom"] + kinds["kidsbedroom"]
+    check(kinds["kitchen"] >= 4 and kinds["bathroom"] >= 4
+          and beds <= 4 * kinds["kitchen"],
+          f"and it comes out as flats with their own rooms "
+          f"({kinds['kitchen'] / 12:.0f} kitchens, {kinds['bathroom'] / 12:.0f} "
+          f"bathrooms, {beds / 12:.0f} bedrooms per building)")
 
 
 def check_street_zombies(check) -> None:
@@ -472,6 +560,10 @@ def check_portable(check) -> None:
     (real / "media" / "texturepacks").mkdir(parents=True)
     check(knoxpaths.pz_media_dir(real) == real / "media",
           "while Windows and Linux still find <game>/media")
+    linux_nested = Path(tempfile.mkdtemp()) / "ProjectZomboid"
+    (linux_nested / "projectzomboid" / "media" / "texturepacks").mkdir(parents=True)
+    check(knoxpaths.pz_media_dir(linux_nested) == linux_nested / "projectzomboid" / "media",
+          "and Linux finds <game>/projectzomboid/media when nested")
     check(knoxpaths.pz_install_from(Path(tempfile.mkdtemp())) is None,
           "and a folder with no game in it is still refused")
 
@@ -545,6 +637,15 @@ def check_portable(check) -> None:
           and not updater._is_knoxmap({"tag_name": "v1.4.0", "draft": True}),
           "a released version of KnoxMap is, and a draft or a pre-release is not")
 
+    # 1.4.1 was tagged without the v, so release.yml - which listened for
+    # "v*" alone - never ran, and the release went out with no files on it.
+    # Both ends of that are worth holding down.
+    check(updater._is_knoxmap({"tag_name": "1.4.1"}),
+          "a tag with no v in front of it is still a KnoxMap release")
+    check(not updater._for_this_system({"tag_name": "v9.9", "assets": []})
+          and updater._for_this_system(dict(three, tag_name="v9.9")),
+          "and a release with nothing on it to download is not an update")
+
     # A release can be named on top of a version - "1.3.9 mc1" was the macOS
     # fix, "1.3.9 rnd" the pictures - and has to come out newer than the
     # version it sits on, or nobody is ever offered it.
@@ -562,6 +663,16 @@ def check_portable(check) -> None:
 
     # The launchers must keep LF, or /bin/sh chokes on the carriage returns.
     root = Path(__file__).resolve().parent.parent
+    flow = root / ".github" / "workflows" / "release.yml"
+    if flow.exists():
+        # Whichever way a release is made - pushing the tag or drafting the
+        # release on GitHub - the files have to get built, or the updater has
+        # nothing to offer.
+        text = flow.read_text(encoding="utf-8")
+        check('tags: ["v*", "[0-9]*"]' in text and "types: [published]" in text,
+              "release.yml builds for a tag either way, and for a release "
+              "drafted by hand")
+
     for name in ("setup.sh", "knoxmap.sh"):
         path = root / name
         if path.exists():
@@ -760,6 +871,206 @@ def check_rifle(check, out: str, mod_root: str) -> None:
     check(ok, f"the rifle ships with the map ({len(shipped)} Lua files)")
 
 
+def check_rpath(check) -> None:
+    """The compiler's own Qt outranks whatever LD_LIBRARY_PATH names.
+
+    patchelf writes DT_RUNPATH, which the loader searches *after*
+    LD_LIBRARY_PATH, so Steam's or Proton's Qt was found first and Qt aborted
+    on the spot. DT_RPATH is searched before it, and the change is one word:
+    the tag number, in place.
+    """
+    import struct
+
+    import knoxpaths
+
+    def elf(tag: int) -> bytes:
+        """A 64-bit ELF with one PT_DYNAMIC holding `tag` and DT_NULL."""
+        dyn_at = 128
+        head = bytearray(64)
+        head[0:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<HHI", head, 0x10, 2, 0x3E, 1)     # EXEC, x86-64
+        struct.pack_into("<Q", head, 0x20, 64)               # e_phoff
+        struct.pack_into("<HH", head, 0x34, 64, 56)          # e_ehsize, phentsize
+        struct.pack_into("<H", head, 0x38, 1)                # e_phnum
+        ph = bytearray(56)
+        struct.pack_into("<I", ph, 0, 2)                     # PT_DYNAMIC
+        struct.pack_into("<Q", ph, 8, dyn_at)                # p_offset
+        struct.pack_into("<Q", ph, 32, 32)                   # p_filesz
+        body = struct.pack("<qQ", tag, 0x40) + struct.pack("<qQ", 0, 0)
+        out = bytearray(dyn_at + 32)
+        out[0:64] = head
+        out[64:120] = ph
+        out[dyn_at:dyn_at + 32] = body
+        return bytes(out)
+
+    def tag_of(raw: bytes) -> int:
+        return struct.unpack_from("<q", raw, 128)[0]
+
+    work = Path(tempfile.mkdtemp(prefix="knoxmap-rpath-"))
+    runpath = work / "runpath.so"
+    runpath.write_bytes(elf(29))                             # DT_RUNPATH
+    size = runpath.stat().st_size
+    check(knoxpaths._force_rpath(runpath) and tag_of(runpath.read_bytes()) == 15,
+          "DT_RUNPATH becomes DT_RPATH, which the loader reads first")
+    check(runpath.stat().st_size == size,
+          "and the file is the same size, because only the tag changed")
+    check(not knoxpaths._force_rpath(runpath),
+          "one that already says DT_RPATH is left alone")
+
+    for name, raw in (("nonsense.so", b"not an ELF at all"),
+                      ("empty.so", b""),
+                      ("32bit.so", b"\x7fELF\x01\x01\x01" + bytes(200))):
+        path = work / name
+        path.write_bytes(raw)
+        before = path.read_bytes()
+        check(not knoxpaths._force_rpath(path) and path.read_bytes() == before,
+              f"and {name} is not touched")
+
+    # Loading the right Qt is only half of it: Qt looks for its plugins under
+    # the prefix it was compiled with, and on Ubuntu 24.04 that meant the
+    # bundled Qt 5.15.3 reading the system's plugin tree and pulling 5.15.13
+    # in behind it. qt.conf replaces the prefix.
+    bin_dir = work / "bin"
+    (bin_dir / "plugins" / "platforms").mkdir(parents=True)
+    binary = bin_dir / "PZWorldEd_cli"
+    binary.write_bytes(elf(29))
+    check(knoxpaths.write_qt_conf(binary)
+          and "Plugins=plugins" in (bin_dir / "qt.conf").read_text(encoding="utf-8"),
+          "a qt.conf beside the compiler points Qt at the bundled plugins")
+    check(not knoxpaths.write_qt_conf(binary),
+          "and one that already says so is left alone")
+    bare = work / "bare"
+    bare.mkdir()
+    check(not knoxpaths.write_qt_conf(bare / "PZWorldEd_cli")
+          and not (bare / "qt.conf").exists(),
+          "with no bundled plugins to point at, none is written")
+    shutil.rmtree(work, ignore_errors=True)
+
+
+def check_facing(check) -> None:
+    """Nothing is drawn against a wall it has no sprite for.
+
+    A piece with only north and west sprites, put against a south or east
+    wall, is drawn with its north sprite on the far edge of the tile: a
+    corkboard hangs a tile into the room, a rack faces its own back. The rule
+    was a list kept by hand, so a role added later was quietly wrong - 1076
+    pieces over 200 houses, mostly corkboards and bedside tables.
+    """
+    from knoxbuild import catalog as _C
+    from knoxbuild import layout as _L
+
+    no_se = {role for role, facings in _C.FURNITURE.items()
+             if set(facings) <= {"N", "W"}} - _L._EITHER_WAY
+    check(no_se <= set(_L.NORTH_WEST_ONLY),
+          f"every piece with no south or east sprite is kept off those walls "
+          f"({len(no_se)} of them)")
+
+    sizes = [(10, 9), (12, 10), (9, 11), (13, 10)]
+    wrong = shelves = pieces = 0
+    for i in range(48):
+        w, h = sizes[i % len(sizes)]
+        building = _L.build_building(w, h, levels=1 if i % 3 else 2, seed=i,
+                                     kind=None, commercial=False)
+        for storey in building.storeys:
+            for role, fx, fy, orient in storey.furniture:
+                if role != "switch":
+                    pieces += 1
+                if role == "shelf":
+                    shelves += 1
+                if role not in no_se or orient not in ("N", "W"):
+                    continue
+                idx = (storey.grid[fy][fx]
+                       if 0 <= fx < storey.width and 0 <= fy < storey.height else 0)
+                if not idx:
+                    continue
+                walls = {d for d, nx, ny in (("N", fx, fy - 1), ("S", fx, fy + 1),
+                                             ("W", fx - 1, fy), ("E", fx + 1, fy))
+                         if _L._room_at(storey, nx, ny) != idx}
+                if walls and not walls & {orient} and walls <= {"S", "E"}:
+                    wrong += 1
+    check(wrong == 0, f"and none of {pieces} pieces is facing the wrong way "
+                      f"({wrong})")
+    # One wooden shelf was on nearly every room's list and was the same sprite
+    # in every home, so a whole town was made of it.
+    check(shelves < pieces * 0.04,
+          f"no one piece of furniture is everywhere "
+          f"(the wooden shelf is {100.0 * shelves / max(1, pieces):.1f}%)")
+
+    # And what replaced it has to belong in the room. Varying the shelf per
+    # home put warehouse wire racking in people's bathrooms.
+    from collections import Counter as _Counter
+
+    indoors = {"livingroom", "bedroom", "kidsbedroom", "kitchen", "bathroom",
+               "dining", "hall"}
+    industrial = {"metal_rack", "crate", "shop_shelf", "shop_aisle"}
+    strays = _Counter()
+    for i in range(48):
+        w, h = sizes[i % len(sizes)]
+        building = _L.build_building(w, h, levels=1 if i % 3 else 2, seed=i,
+                                     kind=None, commercial=False)
+        for storey in building.storeys:
+            for role, fx, fy, _o in storey.furniture:
+                if role not in industrial:
+                    continue
+                idx = (storey.grid[fy][fx]
+                       if 0 <= fx < storey.width and 0 <= fy < storey.height else 0)
+                if idx and storey.rooms[idx - 1].kind in indoors:
+                    strays[(storey.rooms[idx - 1].kind, role)] += 1
+    check(not strays,
+          f"and a house's rooms have household shelving, not warehouse racking "
+          f"({dict(strays) if strays else 'none'})")
+
+    # A wall cabinet is an upper cupboard on the roof layer: it draws over a
+    # counter and belongs above one. Offered as a shelf, it stood on its own
+    # on any wall with nothing underneath.
+    loose = rooms_with = 0
+    for i in range(48):
+        w, h = sizes[i % len(sizes)]
+        building = _L.build_building(w, h, levels=1 if i % 3 else 2, seed=i,
+                                     kind=None, commercial=False)
+        for storey in building.storeys:
+            counters = {(x, y) for role, x, y, _o in storey.furniture
+                        if role.startswith("counter")}
+            for role, fx, fy, _o in storey.furniture:
+                if role != "wall_cabinet":
+                    continue
+                rooms_with += 1
+                if (fx, fy) not in counters:
+                    loose += 1
+    check(loose <= rooms_with * 0.02,
+          f"and a wall cabinet hangs over a counter, not on a bare wall "
+          f"({loose} of {rooms_with} do not)")
+
+    # Every kitchen in a town had the same sink. The extra sets came off the
+    # vanilla map, where each tile's facing was read from the wall it stands
+    # against; a facing copied down wrong would turn a sink to face the room.
+    kinds = _Counter()
+    facing_wrong = 0
+    for i in range(48):
+        w, h = sizes[i % len(sizes)]
+        building = _L.build_building(w, h, levels=1 if i % 3 else 2, seed=i,
+                                     kind=None, commercial=False)
+        for storey in building.storeys:
+            for role, fx, fy, orient in storey.furniture:
+                if "sink" not in role:
+                    continue
+                kinds[role] += 1
+                idx = (storey.grid[fy][fx]
+                       if 0 <= fx < storey.width and 0 <= fy < storey.height else 0)
+                if not idx:
+                    continue
+                walls = {d for d, nx, ny in (("N", fx, fy - 1), ("S", fx, fy + 1),
+                                             ("W", fx - 1, fy), ("E", fx + 1, fy))
+                         if _L._room_at(storey, nx, ny) != idx}
+                if walls and orient not in walls:
+                    facing_wrong += 1
+    check(len(kinds) >= 4,
+          f"a town has more than one kind of sink in it ({len(kinds)})")
+    check(facing_wrong == 0,
+          f"and every one has its back to a wall it has a sprite for "
+          f"({facing_wrong} do not)")
+
+
 def check_qt_env(check) -> None:
     """The map compiler is made to find its own Qt, and a Qt that got away
     with it is explained rather than reported as a crash.
@@ -780,8 +1091,16 @@ def check_qt_env(check) -> None:
     (binary.parent / "plugins" / "platforms").mkdir(parents=True)
     binary.write_text("", encoding="utf-8")
 
+    # One folder with a Qt of its own, as Steam and Proton put on the path,
+    # and one with something else in it.
+    theirs = Path(work) / "their-qt"
+    theirs.mkdir()
+    (theirs / "libQt5Core.so.5").write_bytes(b"not really Qt")
+    plain = Path(work) / "their-other-libs"
+    plain.mkdir()
+
     was = os.environ.get("LD_LIBRARY_PATH")
-    os.environ["LD_LIBRARY_PATH"] = "/usr/lib/x86_64-linux-gnu"
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([str(theirs), str(plain)])
     try:
         env = knoxpaths.tool_env(binary)
     finally:
@@ -792,8 +1111,10 @@ def check_qt_env(check) -> None:
     path = (env.get("LD_LIBRARY_PATH") or "").split(os.pathsep)
     check(windows or (path and path[0] == str(binary.parent / "lib")),
           "the compiler's own Qt goes ahead of the machine's on LD_LIBRARY_PATH")
-    check(windows or "/usr/lib/x86_64-linux-gnu" in path,
+    check(windows or str(plain) in path,
           "and what was already there is kept, not thrown away")
+    check(windows or str(theirs) not in path,
+          "except a folder carrying a Qt of its own, which is left off")
     check(windows or env.get("QT_QPA_PLATFORM_PLUGIN_PATH")
           == str(binary.parent / "plugins" / "platforms"),
           "and its own platform plugins are the ones it is pointed at")
@@ -1175,6 +1496,263 @@ def check_overture(check, work: str) -> None:
           "a map that used Overture credits it, and one that did not does not")
 
 
+def check_standing(check) -> None:
+    """Nothing is drawn hanging in the air.
+
+    A piece is drawn with its base part-way up its tile when it is meant to
+    sit on something. The box was the stacking one, drawn a quarter of a tile
+    up, and Knox County puts 336 of its 338 boxes on the one that sits on the
+    ground. The sinks were a list of the two that existed when it was written,
+    so the three added later hung.
+    """
+    from knoxbuild import catalog as C
+    from knoxbuild import layout as L
+
+    missed = [r for r in C.FURNITURE
+              if "sink" in r and C.FURNITURE_LAYERS.get(r, "Furniture") == "Furniture"
+              and not L._needs_surface(r)]
+    check(not missed, f"every sink knows it needs a worktop ({missed or 'all do'})")
+
+    # Every room name we write has to be one the game knows, or nothing
+    # spawns in it. "cells" was the only one that was not: Knox County has 540
+    # prisoncells and no cells at all.
+    from knoxbuild import layout as _L
+    names = set()
+    for spec in _L.SPECIAL_MIXES.values():
+        for part in spec:
+            names.update(part)
+    names.update(_L.COMMERCIAL, _L.COMMERCIAL_FILL, _L.RESIDENTIAL_FILL,
+                 _L.HOUSE_SLEEPING, _L.UPSTAIRS)
+    nostyle = sorted(n for n in names if n not in _L.ROOM_STYLE)
+    check(not nostyle, f"every room a building can hold has furniture for it "
+                       f"({'; '.join(nostyle) or 'all do'})")
+    # BuildingEd wants a colour for every room name and throws without one,
+    # which dropped the school and the police station out of a town silently.
+    nocolour = sorted(n for n in _L.ROOM_STYLE if n not in C.ROOM_COLORS)
+    check(not nocolour, f"and a colour, or the .tbx cannot be written "
+                        f"({'; '.join(nocolour) or 'all do'})")
+    school = set(_L.SPECIAL_MIXES["school"][0]) | set(_L.SPECIAL_MIXES["school"][1])
+    check({"diningroom", "kitchen"} <= school,
+          "a school has a canteen and a kitchen to serve it")
+    check("prisoncells" in set(_L.SPECIAL_MIXES["police"][0]) and "cells" not in names,
+          "a police station has prisoncells, the name the game knows")
+
+    box = C.FURNITURE["crate"]["W"]["0,0"]
+    check(box.endswith(("_016", "_017", "_018", "_019")),
+          f"a box on the floor is the one drawn on the floor ({box})")
+
+    # And a school is walked round, not through: only houses had circulation.
+    from knoxbuild.settings import Settings as _S
+    halls = 0
+    plan = L.build_building(55, 40, levels=1, seed=3, kind="school",
+                            commercial=True, settings=_S()).storeys[0]
+    halls = sum(1 for r in plan.rooms if (r.kind or "") in L.CIRCULATION)
+    check(halls >= 3, f"a school has corridors to reach its classrooms by "
+                      f"({halls} of {len(plan.rooms)} rooms)")
+
+
+def check_wall_styles(check) -> None:
+    """No kind of building is built of one material only.
+
+    Every church in a county was the same church: the special styles shipped
+    one entry each for church, barn and industrial, and police, library, fire
+    and barracks had none at all, so they fell through to the house styles and
+    a police station could come out clapboard. Houses took one style per
+    110-tile block, which built estates rather than streets.
+    """
+    import collections as _c
+    import random as _r
+
+    from knoxbuild import catalog as C
+    from knoxbuild.build import BORROWED_STYLE, pick_style, wall_variants
+    from knoxbuild.settings import Settings as _S
+
+    thin = []
+    for kind in sorted(set(C.SPECIAL_STYLES) | set(BORROWED_STYLE)):
+        got = len(wall_variants(BORROWED_STYLE.get(kind, kind)))
+        if got < 3:
+            thin.append(f"{kind}:{got}")
+    check(not thin, f"every kind of building has three walls to choose from "
+                    f"({'; '.join(thin) or 'all do'})")
+
+    # And inside as well: every variant of a kind used to share one interior
+    # wall, so a county of schools was the same colour indoors.
+    same = []
+    for kind in sorted(set(C.SPECIAL_STYLES) | set(BORROWED_STYLE)):
+        got = wall_variants(BORROWED_STYLE.get(kind, kind))
+        inside = {v["interior"]["tiles"]["West"] for v in got}
+        if len(inside) < 2:
+            same.append(kind)
+    check(not same, f"and more than one wall inside it "
+                    f"({'; '.join(same) or 'all do'})")
+
+    # And a street of houses is not one house repeated.
+    rng, settings = _r.Random(1), _S()
+    seen = _c.Counter()
+    for i in range(120):
+        style = pick_style(None, 100 + (i % 12) * 14, 100 + (i // 12) * 14,
+                           rng, settings, 0.6)
+        seen[style["name"]] += 1
+    check(len(seen) >= 4 and max(seen.values()) < 0.6 * sum(seen.values()),
+          f"and a block of houses is built of several ({len(seen)} over 120 "
+          f"buildings, commonest {max(seen.values())})")
+
+    # A police station is not built like a bungalow.
+    civic = {s["name"] for s in wall_variants("civic")}
+    house = {s["name"] for s in C.HOUSE_STYLES}
+    got = pick_style("police", 500, 500, rng, settings, 0.6)
+    check(got["name"] in civic and got["name"] not in house,
+          f"a police station is built like a public building ({got['name']})")
+
+
+def check_squares(check) -> None:
+    """A public square is paved, not left as grass.
+
+    Two ways a city square went missing. A pedestrian zone was read as a
+    service alley and painted three and a half metres wide, so Madrid's Puerta
+    del Sol - a mesh of pedestrian ways with no polygon anywhere - came out as
+    stripes on a lawn. And an arcade, tagged as a passage through a building,
+    was read as a tunnel and dropped, which took Plaza Mayor with it.
+    """
+    from generator.osm import classify
+    from generator.renderer import ROAD_WIDTHS_M
+
+    check(classify({"highway": "pedestrian"}, area=True) == "plaza"
+          and classify({"highway": "pedestrian", "area": "yes"}) == "plaza"
+          and classify({"place": "square"}) == "plaza",
+          "a pedestrian way that closes on itself is a square")
+    check(classify({"highway": "footway", "covered": "colonnade",
+                    "tunnel": "building_passage"}, area=True) == "plaza",
+          "and so is the colonnade round one, rather than a tunnel")
+    check(classify({"highway": "pedestrian"}) == "pedestrian"
+          and ROAD_WIDTHS_M["pedestrian"] > 2 * ROAD_WIDTHS_M["road_service"],
+          f"a pedestrian street is paved wide, not as a service lane "
+          f"({ROAD_WIDTHS_M['pedestrian']} m against "
+          f"{ROAD_WIDTHS_M['road_service']} m)")
+    check(classify({"highway": "service", "tunnel": "yes"}) is None
+          and classify({"highway": "primary", "tunnel": "building_passage"}) is None,
+          "and a road in a tunnel is still left off the surface")
+
+
+def check_house_plan(check) -> None:
+    """A house you walk round, not through.
+
+    Every room opening onto every room it touches is a warren: the commonest
+    door in a generated town was one bedroom into the next, and an upstairs
+    had no landing at all because only a lift or stair core was ever made a
+    hall. Rooms open onto circulation now, bar the pairs a real house has -
+    a bathroom off a bedroom, and the kitchen, dining and living rooms.
+    """
+    import collections as _c
+
+    from knoxbuild import layout as L
+    from knoxbuild.settings import Settings as _S
+
+    ok_pairs = [{"bedroom", "bathroom"}, {"kidsbedroom", "bathroom"},
+                {"kitchen", "dining"}, {"kitchen", "livingroom"},
+                {"dining", "livingroom"}]
+    doors = through = 0
+    floors = with_circulation = 0
+    floating = 0
+    for seed in range(60):
+        b = L.build_building(10 + seed % 14, 9 + (seed * 7) % 12,
+                             levels=1 + seed % 2, seed=seed, settings=_S())
+        for storey in b.storeys:
+            kinds = [r.kind or "?" for r in storey.rooms]
+            if "kitchen" not in kinds and "bedroom" not in kinds:
+                continue
+            floors += 1
+            with_circulation += any(k in L.CIRCULATION for k in kinds)
+            for x, y, d in storey.doors:
+                a = L._room_at(storey, x, y)
+                o = L._room_at(storey, *((x, y - 1) if d == "N" else (x - 1, y)))
+                if not a or not o or a == o:
+                    continue
+                ka, kb = kinds[a - 1], kinds[o - 1]
+                doors += 1
+                if ka in L.PRIVATE_ROOMS and kb in L.PRIVATE_ROOMS                         and {ka, kb} not in ok_pairs:
+                    through += 1
+            # And nothing standing on a piece too low to reach it: a lamp on a
+            # coffee table hangs a quarter of a tile above it.
+            under = {}
+            for role, x, y, orient in storey.furniture:
+                if L._is_wall_piece(role) or L._needs_surface(role):
+                    continue
+                for cell in L._cells_for(role, x, y, orient):
+                    under[cell] = role
+            for role, x, y, _o in storey.furniture:
+                if not L._needs_surface(role):
+                    continue
+                beneath = under.get((x, y))
+                if beneath is None or beneath in L.LOW_TABLES:
+                    floating += 1
+    share = 100.0 * through / max(doors, 1)
+    check(floors and with_circulation == floors,
+          f"every house floor has a hall, a landing or a living room "
+          f"({with_circulation} of {floors})")
+    check(share <= 20.0,
+          f"and rooms open onto one rather than onto each other "
+          f"({share:.0f}% of doors join two private rooms, was 56%)")
+    check(not floating,
+          f"nothing stands on a piece too low to hold it ({floating})")
+
+
+def check_porch_lights(check, out: str) -> None:
+    """A light by the front door of nearly every house.
+
+    Knox County has one outside 92% of its houses and generated ones had 1%,
+    which is most of why a street of them read as unfinished from outside.
+    """
+    import csv as _csv
+
+    from knoxbuild.yards import PORCH_LIGHTS, _SIDE
+
+    name = os.path.basename(out.rstrip(os.sep))
+    bdir = os.path.join(out, "buildings")
+    rows = list(_csv.DictReader(open(os.path.join(out, f"{name}_placements.csv"),
+                                     encoding="utf-8")))
+    houses = sum(1 for r in rows if r["kind"] == "house")
+
+    lit = 0
+    used = set()
+    for fname in sorted(f for f in os.listdir(bdir) if "_lights_" in f):
+        text = open(os.path.join(bdir, fname), encoding="utf-8").read()
+        block = re.search(r"<user_tiles>(.*?)</user_tiles>", text, re.S)
+        order = re.findall(r'<tile tile="([^"]+)"/>', block.group(1)) if block else []
+        for grid in re.findall(r'<tiles layer="[^"]*">(.*?)</tiles>', text, re.S):
+            for value in grid.split(","):
+                value = value.strip()
+                if value and value != "0":
+                    lit += 1
+                    if int(value) - 1 < len(order):
+                        used.add(order[int(value) - 1])
+    check(houses and lit >= houses * 0.8,
+          f"a light by the front door of nearly every house ({lit} on {houses})")
+
+    # The sprite carries the direction, so the table is the thing that can go
+    # wrong: a side missing, or one tile answering two of them.
+    from collections import Counter as _Counter
+    seen = _Counter()
+    shaped = all(set(style) == set(_SIDE.values()) for style in PORCH_LIGHTS)
+    for style in PORCH_LIGHTS:
+        seen.update(style.values())
+    known = {t for style in PORCH_LIGHTS for t in style.values()}
+    check(shaped and max(seen.values()) == 1 and used <= known,
+          f"and each one has a sprite for the wall it hangs on "
+          f"({len(PORCH_LIGHTS)} styles, {len(used)} used)")
+
+    # The light shares its square with the house wall, and WorldEd lays a
+    # cell's lots down in the order the project lists them. Sorted by position
+    # the light went down first and the wall covered it: in the game there was
+    # nothing on the wall at all.
+    from knoxbuild.world import Placement, render_pzw
+    order = re.findall(r'map="buildings/(\w+)\.tbx"', render_pzw(
+        1, 1, "m.bmp", [Placement("buildings/lamp.tbx", 40, 10, 2, 2, on_top=True),
+                        Placement("buildings/house.tbx", 8, 40, 12, 10)]))
+    check(order == ["house", "lamp"],
+          f"and is laid down after the wall it hangs on, not before it ({order})")
+
+
 def check_repair(check, out: str) -> None:
     """A project broken at its edges, as older versions and hand edits leave
     them, is repaired before compiling instead of stopping it."""
@@ -1253,6 +1831,206 @@ def check_memory_guard(check) -> None:
               "and so is one too big for the memory that is free")
     finally:
         knoxlog.memory_status = real
+
+
+def check_overpass_retry(check) -> None:
+    """A busy Overpass server does not lose the map.
+
+    The public instances are shared and go busy together. A tile that nothing
+    answered used to fail the whole download: every tile that had arrived was
+    thrown away uncached, so a town that fetched forty and missed one started
+    again from nothing. Nothing here touches the network.
+    """
+    import requests
+
+    from generator import osm as _osm
+
+    was_split, was_ask, was_pause = (_osm._fetch_splitting, _osm._ask,
+                                     _osm.RETRY_PAUSE_S)
+    try:
+        _osm.RETRY_PAUSE_S = 0
+        seen: dict = {}
+        ids: dict = {}
+
+        def once_then_works(south, west, north, east, timeout, depth=0, first=0):
+            key = (round(south, 4), round(west, 4))
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] == 1:
+                raise _osm.OverpassError("busy", timed_out=True)
+            # One feature per tile, each with an id of its own: the tiles are
+            # merged on (kind, id), so a shared id would hide a lost tile.
+            return [_osm.OSMFeature(osm_id=ids.setdefault(key, len(ids) + 1),
+                                    kind="way", tags={},
+                                    geometry=[(west, south)])]
+
+        _osm._fetch_splitting = once_then_works
+        got = _osm.fetch_features_tiled(50.0, 5.0, 50.2, 5.3, max_tile_km2=30.0)
+        check(len(got) == len(seen) and len(seen) > 1,
+              f"a tile that fails once is asked for again, and the map still "
+              f"arrives ({len(seen)} tiles)")
+
+        def never_works(south, west, north, east, timeout, depth=0, first=0):
+            raise _osm.OverpassError("every Overpass endpoint failed — busy",
+                                     timed_out=True)
+
+        _osm._fetch_splitting = never_works
+        try:
+            _osm.fetch_features_tiled(50.0, 5.0, 50.2, 5.3, max_tile_km2=30.0)
+            said = ""
+        except _osm.OverpassError as exc:
+            said = str(exc)
+        check("tiles would not download" in said and "smaller area" in said,
+              "and when they all fail it says how many and what to do")
+
+        # A tile nothing answers is quartered like a refused one, but the
+        # splitting has to stop: on a dropped connection every request times
+        # out, and each one waits out the clock before it says so.
+        _osm._fetch_splitting = was_split
+        tries = []
+
+        def dead(endpoint, query, timeout):
+            tries.append(endpoint)
+            raise requests.Timeout("no answer")
+
+        _osm._ask = dead
+        side = (30.0 ** 0.5) / 111.32
+        for area, ceiling in ((side, 3), (side / 6, 2)):
+            tries.clear()
+            try:
+                _osm._fetch_splitting(50.0, 5.0, 50.0 + area, 5.0 + area, 30)
+            except _osm.OverpassError:
+                pass
+            check(len(tries) <= ceiling * len(_osm.OVERPASS_ENDPOINTS),
+                  f"a tile nobody answers gives up after {len(tries)} requests")
+    finally:
+        _osm._fetch_splitting, _osm._ask = was_split, was_ask
+        _osm.RETRY_PAUSE_S = was_pause
+
+
+def check_flat_selection(check) -> None:
+    """An outline with no area is refused, not built as an empty map.
+
+    A lasso drawn as one stroke, or a traced outline whose points land on each
+    other, gets through as a valid polygon that encloses nothing. The renderer
+    clips the map to it, which turns everything outside - all of it - back
+    into grass, and the generation finishes and hands over a meadow.
+    """
+    import app as knoxapp
+
+    w, s, e, n = 19.20, 42.40, 19.32, 42.48
+
+    def ask(ring):
+        shape, problem = knoxapp._clean_shape(
+            {"type": "Polygon", "coordinates": [ring]})
+        return shape, problem
+
+    shape, problem = ask([[w, s], [e, s], [e, n], [w, n], [w, s]])
+    check(shape is not None and not problem,
+          "an outline drawn round a town is taken")
+
+    # Small, but a real selection: roughly 220 m across. Nothing here may
+    # refuse a genuinely small map.
+    shape, problem = ask([[w, s], [w + 0.002, s], [w + 0.002, s + 0.002],
+                          [w, s + 0.002], [w, s]])
+    check(shape is not None and not problem,
+          "and so is a small one, a couple of hundred metres across")
+
+    for label, ring in (
+        ("one stroke", [[w, s], [(w + e) / 2, (s + n) / 2], [e, n], [w, s]]),
+        ("all one point", [[w, s]] * 4),
+    ):
+        shape, problem = ask(ring)
+        check(shape is None and problem and "no area" in problem,
+              f"an outline that is {label} is refused with a reason, not "
+              f"generated as empty ground")
+
+
+def check_overpass_blank(check) -> None:
+    """A server that answers with nothing does not empty the map.
+
+    Two ways a download used to succeed and bring back no town. Overpass
+    reports a query it could not finish as HTTP 200 with the reason in
+    "remark" and whatever it had managed in "elements"; and one of the public
+    instances answers every query at all with 200 and an empty list. Either
+    read as a tile of open farmland, so a city came out a meadow with its
+    river still in it - the river was in the tiles that did arrive. Nothing
+    here touches the network.
+    """
+    from generator import osm as _osm
+
+    class Reply:
+        def __init__(self, payload, status=200):
+            self.status_code = status
+            self._payload = payload
+            self.text = json.dumps(payload)
+
+        def json(self):
+            return self._payload
+
+    ONE = {"elements": [{"type": "node", "id": 1, "lat": 50.0, "lon": 5.0,
+                         "tags": {"natural": "tree"}}]}
+    EMPTY: dict = {"elements": []}
+
+    was_post, was_sleep = _osm.requests.post, _osm.time.sleep
+    try:
+        _osm.time.sleep = lambda _s: None
+        replies: dict = {}
+        asked: list = []
+
+        def post(endpoint, data=None, headers=None, timeout=None):
+            asked.append(endpoint.split("/")[2])
+            return replies.get(asked[-1], Reply(EMPTY))
+
+        _osm.requests.post = post
+        first_host = _osm.OVERPASS_ENDPOINTS[0].split("/")[2]
+
+        # A part-finished query is a failure, not an empty tile.
+        replies = {first_host: Reply({**EMPTY, "remark":
+                   'runtime error: Query timed out in "query" after 90 s.'})}
+        try:
+            _osm._ask(_osm.OVERPASS_ENDPOINTS[0], "", 60)
+            said, big = "", False
+        except _osm.OverpassError as exc:
+            said, big = str(exc), exc.too_big
+        check("timed out" in said and big,
+              "a 200 that says the query timed out counts as too big, not as "
+              "an empty tile")
+
+        # The instance whose turn it is answers with nothing; another has the
+        # data. The tile is the data.
+        last_host = _osm.OVERPASS_ENDPOINTS[-1].split("/")[2]
+        replies = {first_host: Reply(ONE)}
+        asked.clear()
+        got = _osm.fetch_features(50.0, 5.0, 50.1, 5.1, timeout=10,
+                                  first=len(_osm.OVERPASS_ENDPOINTS) - 1)
+        check(len(got) == 1 and asked[0] == last_host,
+              f"a blank answer from {last_host} is not the tile; the next "
+              f"instance is asked and its {len(got)} feature kept")
+
+        # ...but real open country is empty, and has to stay downloadable.
+        replies = {}
+        got = _osm.fetch_features(50.0, 5.0, 50.1, 5.1, timeout=10)
+        check(got == [],
+              "a tile every instance agrees is empty is still an empty tile")
+
+        # One instance saying nothing while the rest never answer is not
+        # agreement. The tile goes back round the retry rather than into the
+        # map as a field.
+        replies = {h.split("/")[2]: Reply({}, status=504)
+                   for h in _osm.OVERPASS_ENDPOINTS[1:]}
+        try:
+            got = _osm.fetch_features(50.0, 5.0, 50.1, 5.1, timeout=10)
+            said = f"returned {len(got)} features"
+        except _osm.OverpassError:
+            said = "raised"
+        check(said == "raised",
+              "one blank answer and no other answer at all is a failed tile, "
+              f"not an empty one ({said})")
+
+        check("openstreetmap.fr" not in " ".join(_osm.OVERPASS_ENDPOINTS),
+              "the endpoint that 403s every request is not asked")
+    finally:
+        _osm.requests.post, _osm.time.sleep = was_post, was_sleep
 
 
 def check_no_size_wall(check, work: str) -> None:
@@ -1590,9 +2368,16 @@ def main(argv: list[str]) -> int:
         check_lots_apart(check, out)
         check_procedural(check, work)
         check_qt_env(check)
+        check_rpath(check)
+        check_facing(check)
         check_compile_failures(check, work)
         check_wall_corners(check)
         check_overture(check, work)
+        check_standing(check)
+        check_wall_styles(check)
+        check_squares(check)
+        check_house_plan(check)
+        check_porch_lights(check, out)
         check_repair(check, out)
         from knoxbuild.world import Placement, Zone, render_pzw
         edge = render_pzw(2, 2, "m.bmp", [Placement("a.tbx", 10, 599, 3, 3),
@@ -1618,6 +2403,7 @@ def main(argv: list[str]) -> int:
         check(len(school) >= 1, "the school has classrooms")
         check_1_3_6(check, out, tbx, pzw_text, log.getvalue())
         check_street_zombies(check)
+        check_dwellings(check)
         check_stop(check)
         check_portable(check)
         texts = [open(p, encoding="utf-8").read() for p in tbx]
@@ -1632,7 +2418,12 @@ def main(argv: list[str]) -> int:
             west = re.search(r'enum="West" tile="(\w+)"', blocks[ext - 1])
             gap = re.search(r'enum="CapGapE3" tile="(\w+)"', blocks[cap - 1])
             return bool(west and gap and west.group(1) == gap.group(1))
-        houses_tbx = [t for p, t in zip(tbx, texts) if not any(k in p for k in ("_fences_", "_structures_", "_pumps_", "_props_"))]
+        # The buildings, by their numbered names. Everything else in the
+        # folder - fences, structures, pumps, props, porch lights - is loose
+        # tiles with no rooms and none of a building's tile entries, and the
+        # list of those to leave out kept going stale as kinds were added.
+        houses_tbx = [t for p, t in zip(tbx, texts)
+                      if re.search(r"_\d{4}(_\d{2})?\.tbx$", os.path.basename(p))]
         check(all(gaps_match(t) for t in houses_tbx), "flat roofs wall in the top floor with its own material")
         check(any("_fences_" in p for p in tbx), "back yards are fenced")
         yard = Image.open(os.path.join(out, "selftest.bmp")).convert("RGB")
@@ -1824,6 +2615,9 @@ def main(argv: list[str]) -> int:
         check_straight_roads(check)
         check_mapstate(check, out)
         check_no_size_wall(check, work)
+        check_overpass_retry(check)
+        check_overpass_blank(check)
+        check_flat_selection(check)
         check_memory_guard(check)
         check_box_any(check)
 
@@ -1869,6 +2663,49 @@ def main(argv: list[str]) -> int:
         with contextlib.redirect_stdout(io.StringIO()):
             mod_root, cells, extras = package(out, "Selftest: Town", "selftest", mods_dir=mods)
         check(os.path.exists(os.path.join(mod_root, "ATTRIBUTION.txt")), "ATTRIBUTION.txt in the mod")
+        # A server needs three things the mod folder cannot tell it: the mod
+        # id, the map folder ahead of the vanilla one, and a spawn region
+        # naming this map's spawnpoints. And the warning that matters most -
+        # a world keeps the cells it has already made, so a map added to one
+        # that exists fails in ways nobody can trace back.
+        from make_map_mod import folder_name, write_server_setup
+        map_folder = folder_name("Selftest: Town", "selftest")
+        setup = os.path.join(mod_root, "SERVER SETUP.txt")
+        regions = os.path.join(mod_root, "server",
+                               f"{map_folder}_spawnregions.lua")
+        said = open(setup, encoding="utf-8").read() if os.path.exists(setup) else ""
+        lua = open(regions, encoding="utf-8").read() if os.path.exists(regions) else ""
+        check(f"Mods=selftest" in said and f"Map={map_folder};Muldraugh, KY" in said,
+              "the server's Mods= and Map= lines are written out with real names")
+        check("BEFORE anyone joins" in said and "new world" in said,
+              "and it says to add the map before the world exists")
+        check("every player" in said and "Workshop" in said,
+              "and that every player needs the mod too, it not being on the "
+              "Workshop")
+        erika = write_server_setup(os.path.join(work, "erika-notes"), "m",
+                                   "M", "M", needs_erika=True)
+        with_erika = open(os.path.join(work, "erika-notes", "SERVER SETUP.txt"),
+                          encoding="utf-8").read()
+        check("Erikas_Tiles" in with_erika and "WorkshopItems=" in with_erika
+              and "Erikas_Tiles" not in said,
+              f"a map built with Erika's Tiles says the server needs them, and "
+              f"one without does not ({erika})")
+        check("function SpawnRegions()" in lua
+              and f'media/maps/{map_folder}/spawnpoints.lua' in lua
+              and "Muldraugh, KY" in lua,
+              "a spawn region file is written, this map's and the vanilla one")
+        try:
+            import lupa
+            lupa.LuaRuntime().compile(lua)
+            check(True, "and it is Lua the game can read")
+        except ImportError:
+            pass
+        except Exception as exc:    # noqa: BLE001
+            check(False, f"and it is Lua the game can read ({exc})")
+        play = open(os.path.join(mod_root, "HOW TO PLAY.txt"), encoding="utf-8").read()
+        check("before you start the world" in play.lower()
+              and "SERVER SETUP.txt" in play,
+              "and a single player is told the same, and where the server notes are")
         info = open(os.path.join(mod_root, "mod.info"), encoding="utf-8").read()
         check("OpenStreetMap" in info, "OpenStreetMap credit in the mod description")
         check("require=" not in info, "a map without mod tiles requires no mods")
@@ -1908,6 +2745,48 @@ def main(argv: list[str]) -> int:
             return True
 
         check(buffer_safe(paper), "every outline on the paper map is inside its cell's buffer")
+
+        # Rounding to whole tiles is what makes an outline the game cannot
+        # draw. Reported from a Madrid map: 259 invalid and 39 zero-area
+        # polygons, one of them [(244, 162), (244, 153), (244, 162)].
+        from shapely.geometry import Polygon as _Poly
+
+        from knoxbuild.worldmap_bin import read_bin as _read, write_bin as _write
+        shapes = [("thin", [(244.2, 162.4), (244.4, 153.1), (244.1, 162.2)]),
+                  ("collapse", [(50.1, 50.1), (50.4, 50.2), (50.2, 50.4), (50.3, 50.1)]),
+                  ("bowtie", [(100, 100), (120, 120), (120, 100), (100, 120)]),
+                  ("wide", [(200, 40), (900, 44), (895, 300), (205, 296)]),
+                  ("ok", [(10, 10), (30, 10), (30, 30), (10, 30)])]
+        lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<world version="1.0">',
+                 ' <cell x="0" y="0">']
+        for label, ring in shapes:
+            pts = "".join(f'<point x="{px}" y="{py}"/>' for px, py in ring)
+            lines += ['  <feature>', '   <geometry type="Polygon">',
+                      f'    <coordinates>{pts}</coordinates>', '   </geometry>',
+                      '   <properties>'
+                      f'<property name="building" value="{label}"/></properties>',
+                      '  </feature>']
+        lines += [' </cell>', '</world>']
+        nasty = os.path.join(work, "nasty.xml")
+        with open(nasty, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        _write(nasty, nasty + ".bin")
+        drawn = _read(nasty + ".bin")
+        broken = 0
+        for feats in drawn.values():
+            for _t, rings, _props in feats:
+                if any(len(set(map(tuple, r))) < 3 for r in rings):
+                    broken += 1
+                    continue
+                shape = _Poly(rings[0], rings[1:])
+                if not shape.is_valid or shape.area <= 0:
+                    broken += 1
+        labels = {v for feats in drawn.values() for _t, _r, props in feats
+                  for v in props.values()}
+        check(broken == 0 and {"ok", "wide", "bowtie"} <= labels
+              and "thin" not in labels and "collapse" not in labels,
+              f"a collapsed or crossed outline never reaches the paper map "
+              f"({broken} bad, kept {sorted(labels)})")
         # A cell packed with more outlines than the game can index (it holds
         # each cell's points in one buffer, addressed by a 16-bit number).
         from knoxbuild.worldmap_bin import CELL_POINT_BUDGET, write_bin

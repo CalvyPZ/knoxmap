@@ -254,10 +254,13 @@ FURNITURE = {'bed': {'W': {'0,0': 'furniture_bedding_01_002', '1,0': 'furniture_
               'N': {'0,0': 'furniture_storage_01_002', '1,0': 'furniture_storage_01_003'},
               'E': {'0,0': 'furniture_storage_01_005', '0,1': 'furniture_storage_01_004'},
               'S': {'0,0': 'furniture_storage_01_006', '1,0': 'furniture_storage_01_007'}},
- 'crate': {'W': {'0,0': 'furniture_storage_02_024'},
-           'N': {'0,0': 'furniture_storage_02_025'},
-           'E': {'0,0': 'furniture_storage_02_026'},
-           'S': {'0,0': 'furniture_storage_02_027'}},
+ # 024-027 are the same boxes drawn raised, for stacking on top of
+ # another; on the floor they hover a quarter of a tile above it. Knox County
+ # puts 336 of its 338 boxes on 016-019, which is this box on the ground.
+ 'crate': {'W': {'0,0': 'furniture_storage_02_016'},
+           'N': {'0,0': 'furniture_storage_02_017'},
+           'E': {'0,0': 'furniture_storage_02_018'},
+           'S': {'0,0': 'furniture_storage_02_019'}},
  'dresser': {'W': {'0,0': 'furniture_storage_01_008'},
              'N': {'0,0': 'furniture_storage_01_009'},
              'E': {'0,0': 'furniture_storage_01_010'},
@@ -286,6 +289,25 @@ FURNITURE = {'bed': {'W': {'0,0': 'furniture_bedding_01_002', '1,0': 'furniture_
           'N': {'0,0': 'fixtures_sinks_01_002'},
           'E': {'0,0': 'fixtures_sinks_01_003'},
           'S': {'0,0': 'fixtures_sinks_01_000'}},
+ # The cream basin, and two more kitchen sinks. The facing of each tile was
+ # read off the vanilla map rather than guessed: for every sink standing
+ # against exactly one wall of a room, which wall that was. The two sets
+ # already here came out of that check exactly as they are written above,
+ # which is what makes the rest of it trustworthy. Sets 12..15 and 28..31 are
+ # left alone: they only ever answer N and W, so they are pedestal basins
+ # with two sprites, not four.
+ 'sink_cream': {'W': {'0,0': 'fixtures_sinks_01_021'},
+                'N': {'0,0': 'fixtures_sinks_01_022'},
+                'E': {'0,0': 'fixtures_sinks_01_023'},
+                'S': {'0,0': 'fixtures_sinks_01_020'}},
+ 'kitchen_sink_steel': {'W': {'0,0': 'fixtures_sinks_01_004'},
+                        'N': {'0,0': 'fixtures_sinks_01_005'},
+                        'E': {'0,0': 'fixtures_sinks_01_006'},
+                        'S': {'0,0': 'fixtures_sinks_01_007'}},
+ 'kitchen_sink_dark': {'W': {'0,0': 'fixtures_sinks_01_016'},
+                       'N': {'0,0': 'fixtures_sinks_01_017'},
+                       'E': {'0,0': 'fixtures_sinks_01_018'},
+                       'S': {'0,0': 'fixtures_sinks_01_019'}},
  'counter': {'W': {'0,0': 'fixtures_counters_01_003'},
              'N': {'0,0': 'fixtures_counters_01_005'},
              'E': {'0,0': 'fixtures_counters_01_007'},
@@ -1474,6 +1496,8 @@ FURNITURE_LAYERS = {'armchair': 'Furniture',
  'griddle': 'Furniture',
  'hot_counter': 'Furniture',
  'kitchen_sink': 'Furniture',
+ 'kitchen_sink_steel': 'Furniture',
+ 'kitchen_sink_dark': 'Furniture',
  'lamp': 'Furniture',
  'mannequin': 'Furniture',
  'mannequin_dark': 'Furniture',
@@ -1521,6 +1545,7 @@ FURNITURE_LAYERS = {'armchair': 'Furniture',
  'shower': 'Furniture',
  'sidetable': 'Furniture',
  'sink': 'Furniture',
+ 'sink_cream': 'Furniture',
  'sofa': 'Furniture',
  'sofa_1': 'Furniture',
  'sofa_10': 'Furniture',
@@ -7120,7 +7145,17 @@ ROOM_COLORS = {'livingroom': '233 112 19',
  'policegunstorage': '10 198 66',
  'policearchive': '138 108 71',
  'interrogationroom': '218 41 17',
- 'cells': '141 215 71',
+ # BuildingEd wants a colour for every room name, and a missing one throws
+ # while the .tbx is written - which quietly dropped the school and the
+ # police station from a town rather than failing loudly.
+ 'prisoncells': '141 215 71',
+ 'diningroom': '150 232 138',
+ 'schoollab': '96 206 196',
+ 'schoolstorage': '214 206 80',
+ 'sportstorage': '196 176 60',
+ 'janitor': '120 150 110',
+ 'security': '70 130 180',
+ 'officestorage': '204 186 90',
  'firegarage': '102 145 188',
  'firestorage': '21 177 44'}
 

@@ -24,8 +24,21 @@ import knoxstop
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.openstreetmap.fr/api/interpreter",
+    # A third, because the other two go busy together: when one instance
+    # is queueing the people it turned away are queueing on the next.
+    # It is last because it is the one that answers an ordinary query with an
+    # empty result - see EMPTY_NEEDS_SECOND below.
+    "https://overpass.osm.ch/api/interpreter",
 ]
+# overpass.openstreetmap.fr answers every query with 403 "This service is only
+# available to white-listed usages". It was tried once per tile, and on the
+# tiles whose turn it was it pushed the work onto whatever came next.
+
+# Whether an empty answer has to be confirmed by another instance before the
+# tile is taken as empty ground (fetch_features), and how many have to agree.
+# The flag is off only for tests, which would otherwise ask the real servers.
+EMPTY_NEEDS_SECOND = True
+BLANKS_TO_BELIEVE = 2
 
 # OSM's usage policy requires a real identifying User-Agent; the mirrors return
 # 403 for the default "python-requests/x.y" string.
@@ -182,9 +195,12 @@ def _build_query(south: float, west: float, north: float, east: float,
 class OverpassError(RuntimeError):
     """A failed query, with whether a smaller bbox would plausibly succeed."""
 
-    def __init__(self, message: str, too_big: bool = False):
+    def __init__(self, message: str, too_big: bool = False,
+                 timed_out: bool = False):
         super().__init__(message)
         self.too_big = too_big
+        # Nothing answered at all, as opposed to answering with a refusal.
+        self.timed_out = timed_out
 
 
 # Overpass says "query timed out" and "out of memory" with HTTP 400, the same
@@ -226,7 +242,17 @@ def _ask(endpoint: str, query: str, timeout: int) -> list[OSMFeature]:
     r = requests.post(endpoint, data={"data": query}, headers=HEADERS,
                       timeout=timeout + 10)
     if r.status_code == 200:
-        return _parse(r.json())
+        payload = r.json()
+        # A query that runs out of time or memory part way through does not
+        # fail: Overpass sends HTTP 200 with whatever it had gathered and puts
+        # the reason in "remark". Reading only the status took that for a
+        # finished tile, so a town downloaded "successfully" with half its
+        # streets missing and nothing anywhere said so.
+        remark = str(payload.get("remark") or "")
+        if any(s in remark.lower() for s in _TOO_BIG):
+            raise OverpassError(f"partial answer — {' '.join(remark.split())}",
+                                too_big=True)
+        return _parse(payload)
     # Classify on the whole body, report a trimmed version of it. Doing both
     # from the trimmed text is what stopped over-large areas re-splitting: the
     # markers sit well past the doctype, so nothing ever looked too big.
@@ -254,21 +280,43 @@ def fetch_features(south: float, west: float, north: float, east: float,
     query = _build_query(south, west, north, east, timeout=timeout)
     errors: list[str] = []
     too_big = False
+    timed_out = False
+    blank = 0
     order = OVERPASS_ENDPOINTS[first % len(OVERPASS_ENDPOINTS):]         + OVERPASS_ENDPOINTS[:first % len(OVERPASS_ENDPOINTS)]
     for endpoint in order:
         host = endpoint.split("/")[2]
         try:
-            return _ask(endpoint, query, timeout)
+            feats = _ask(endpoint, query, timeout)
         except OverpassError as exc:
             errors.append(f"{host}: {exc}")
             too_big = too_big or exc.too_big
         except requests.Timeout:
             errors.append(f"{host}: no answer within {timeout + 10}s")
+            timed_out = True
         except (requests.RequestException, ValueError) as exc:
             errors.append(f"{host}: {exc}")
+        else:
+            if feats or not EMPTY_NEEDS_SECOND:
+                return feats
+            # An instance that answers 200 with nothing in it looks exactly
+            # like open farmland, and the tiles it was handed went into the map
+            # as empty ground. A city came out a meadow with its river still
+            # in it, because the tiles that did download held the river.
+            # Nothing is only believed when a second instance agrees.
+            blank += 1
+            errors.append(f"{host}: answered with nothing")
         time.sleep(1)
+    # Two instances have to say the tile is empty before it is. One saying so
+    # while the others never answered at all is not agreement, it is the one
+    # broken instance again - and taking it at its word is what quietly
+    # emptied the map in the first place. Raising sends the tile back round
+    # fetch_features_tiled's retry, and if it really will not download the
+    # download says so instead of handing back a meadow.
+    if blank >= BLANKS_TO_BELIEVE:
+        return []
     raise OverpassError("every Overpass endpoint failed — "
-                        + "; ".join(errors), too_big=too_big)
+                        + "; ".join(errors), too_big=too_big,
+                        timed_out=timed_out)
 
 
 def _area_km2(south: float, west: float, north: float, east: float) -> float:
@@ -322,29 +370,63 @@ def fetch_features_tiled(south: float, west: float, north: float, east: float,
     # There are three independent servers; a tile is handed to each in turn and
     # they work at the same time, so the download takes about as long as the
     # slowest tile rather than the sum of all of them.
-    done = 0
+    done = [0]
     lock = threading.Lock()
 
-    def run(args) -> list[OSMFeature]:
-        nonlocal done
+    def run(args):
         index, (s0, w0, n0, e0) = args
         # Between tiles is the one place a download can be dropped without
         # leaving a half-written cache behind; the tiles already in flight
         # finish and are thrown away with the rest.
         knoxstop.check(should_stop, "the download")
         try:
-            return _fetch_splitting(s0, w0, n0, e0, timeout, first=index)
+            return index, _fetch_splitting(s0, w0, n0, e0, timeout,
+                                           first=index), None
+        except OverpassError as exc:
+            return index, None, exc
         finally:
             with lock:
-                done += 1
+                done[0] += 1
                 if progress:
-                    progress(done, total)
+                    progress(min(done[0], total), total)
 
+    # One tile failing used to lose the map: the whole download was thrown
+    # away and nothing was cached, so a town that had fetched forty tiles and
+    # missed one started again from nothing. The tiles that arrived are kept
+    # and only the ones that did not are asked for again - a public instance
+    # that was busy a moment ago usually is not a minute later.
     workers = min(len(OVERPASS_ENDPOINTS), total)
-    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        for feats in pool.map(run, enumerate(tiles)):
-            for feat in feats:
-                merged[(feat.kind, feat.osm_id)] = feat
+    left = list(enumerate(tiles))
+    problems: dict[int, OverpassError] = {}
+    for attempt in range(TILE_ATTEMPTS):
+        if attempt:
+            for _ in range(RETRY_PAUSE_S):
+                knoxstop.check(should_stop, "the download")
+                time.sleep(1.0)
+        done[0] = total - len(left)
+        problems = {}
+        again = []
+        with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for index, feats, exc in pool.map(run, left):
+                if exc is not None:
+                    problems[index] = exc
+                    again.append((index, tiles[index]))
+                    continue
+                for feat in feats:
+                    merged[(feat.kind, feat.osm_id)] = feat
+        left = again
+        if not left:
+            break
+
+    if left:
+        worst = problems[left[0][0]]
+        raise OverpassError(
+            f"{len(left)} of {total} map tiles would not download. The public "
+            f"Overpass servers are shared and go busy; waiting a few minutes "
+            f"and generating again usually works, and a smaller area always "
+            f"does. {worst}",
+            too_big=any(e.too_big for e in problems.values()),
+            timed_out=all(e.timed_out for e in problems.values()))
 
     return list(merged.values())
 
@@ -352,6 +434,16 @@ def fetch_features_tiled(south: float, west: float, north: float, east: float,
 # Below this, a tile is small enough that a refusal is the server's problem
 # rather than the area's, and splitting further only multiplies the requests.
 MIN_SPLIT_KM2 = 0.5
+# A tile nothing answered in time is usually a tile too heavy to answer, so it
+# is quartered like a refused one - but only while it is big enough for that to
+# be the reason, and only one level down. Past that it is the network rather
+# than the area, and splitting only takes four times as long to say so.
+TIMEOUT_SPLIT_KM2 = 4.0
+TIMEOUT_SPLIT_DEPTH = 1
+# How many passes over the tiles a map gets, and how long to leave the servers
+# alone between them.
+TILE_ATTEMPTS = 2
+RETRY_PAUSE_S = 20
 
 
 def _fetch_splitting(south: float, west: float, north: float, east: float,
@@ -369,7 +461,10 @@ def _fetch_splitting(south: float, west: float, north: float, east: float,
         return fetch_features(south, west, north, east, timeout=timeout,
                               first=first)
     except OverpassError as exc:
-        if not exc.too_big or depth >= 3                 or _area_km2(south, west, north, east) <= MIN_SPLIT_KM2:
+        area = _area_km2(south, west, north, east)
+        heavy = exc.too_big or (exc.timed_out and depth < TIMEOUT_SPLIT_DEPTH
+                                and area > TIMEOUT_SPLIT_KM2)
+        if not heavy or depth >= 3 or area <= MIN_SPLIT_KM2:
             raise
     mid_lat = (south + north) / 2
     mid_lon = (west + east) / 2
@@ -555,11 +650,22 @@ def is_airport_area(tags: dict) -> bool:
     return tags.get("aeroway") in AIRPORT_AREAS
 
 
-def classify(tags: dict) -> str | None:
-    """Map OSM tags to a PZ feature category string. None = ignore."""
+def classify(tags: dict, area: bool = False) -> str | None:
+    """Map OSM tags to a PZ feature category string. None = ignore.
+
+    `area` says the feature is a closed way or a relation - something with an
+    inside - which changes two answers. An arcade is not a tunnel, and a
+    pedestrian way that closes on itself is a square rather than a street.
+    """
     if "building" in tags:
         return "building"
-    if (tags.get("tunnel") in TUNNEL_VALUES or tags.get("location") == "underground"
+    # A building passage is a way through a building at ground level, not
+    # under it - a colonnade or an archway. Read as a tunnel it took Madrid's
+    # Plaza Mayor, 11,437 m2 of it, off the map altogether and left grass.
+    underground = tags.get("tunnel") in TUNNEL_VALUES
+    if area and tags.get("tunnel") == "building_passage":
+        underground = False
+    if (underground or tags.get("location") == "underground"
             or tags.get("parking") == "underground"):
         return None
 
@@ -575,8 +681,16 @@ def classify(tags: dict) -> str | None:
         return "parking"
     if amenity == "bus_station":
         return "parking"
+    # A pedestrian street is drawn as a line and a pedestrian square as a fill.
+    # Which it is, is whether the way closes on itself: area=yes says so when
+    # the mapper remembered it, and the shape says so either way. The same for
+    # the colonnade round a square, which is a footway that comes back to
+    # where it started.
     if tags.get("place") == "square" or "area:highway" in tags or (
-            tags.get("highway") == "pedestrian" and tags.get("area") == "yes"):
+            tags.get("highway") == "pedestrian"
+            and (area or tags.get("area") == "yes")) or (
+            area and tags.get("highway") == "footway"
+            and tags.get("covered") in ("colonnade", "arcade", "yes")):
         return "plaza"
 
     h = tags.get("highway")
@@ -588,9 +702,15 @@ def classify(tags: dict) -> str | None:
             return "road_medium"
         if h in {"residential", "unclassified", "living_street"}:
             return "road_minor"
+        # A pedestrian zone is a square people stand in, not a lane. Lumped
+        # in with service alleys it was painted three and a half metres wide,
+        # so Madrid's Puerta del Sol - mapped as a mesh of pedestrian ways and
+        # no polygon at all - came out as a few paved stripes on grass.
+        if h == "pedestrian":
+            return "pedestrian"
         # Alleys, driveways and back lanes. Lumping these in with residential
         # streets paved every yard and car park aisle at full street width.
-        if h in {"service", "pedestrian"}:
+        if h == "service":
             return "road_service"
         # A farm track is a road, not a footpath. A paved one is a narrow
         # street; anything else is laid with the track tiles, unless the

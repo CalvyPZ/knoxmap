@@ -26,7 +26,8 @@ import math
 
 import numpy as np
 
-ROAD_CATEGORIES = {"road_major", "road_medium", "road_minor", "road_service"}
+ROAD_CATEGORIES = {"road_major", "road_medium", "road_minor", "road_service",
+                   "pedestrian"}
 # Wiggles smaller than this, in tiles, are smoothed away first.
 SIMPLIFY_TILES = 3.0
 # How strongly a point holds to where it really is, against how strongly each

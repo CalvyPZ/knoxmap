@@ -1,6 +1,7 @@
 name: release
 
-# Push a tag like v1.5 and this publishes one program file per system.
+# Push a tag like v1.5, or publish a release by hand on GitHub, and this
+# publishes one program file per system.
 # Windows gets KnoxMap-v1.5-windows.exe, Linux gets an AppImage, macOS gets
 # a dmg. Python and the libraries are already inside. Maps, logs and the
 # first-run downloads (map tools, tiles from the player's own game) appear
@@ -8,31 +9,74 @@ name: release
 #
 # A fix that only matters on one system is released for that system alone:
 # tag it v1.5-mc1 and only the macOS file is built and published.
+#
+# A release with no files on it is invisible to the updater, so a tag
+# pushed without the v, or a release drafted on GitHub, still ends here:
+#
+#   - pushing a tag, with the v or without it
+#   - publishing a release on GitHub
+#
+# A release this workflow creates itself starts no second run: events made
+# with GITHUB_TOKEN never trigger workflows.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "[0-9]*"]
+  release:
+    types: [published]
 
 jobs:
+  # The map compiler is published from this repository too, under tags like
+  # worlded-cli-linux-20260909f, and those are not KnoxMap. This is the rule
+  # updater.VERSION_TAG applies at the other end: a tag is a release of
+  # KnoxMap when it is a version, optionally with a name after it.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      ours: ${{ steps.tag.outputs.ours }}
+    steps:
+      - id: tag
+        env:
+          TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          set -eu
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if printf '%s' "$TAG" | grep -Eq '^v?[0-9]+(\.[0-9]+){0,3}(-[a-z]+[0-9]*)?$'; then
+            echo "ours=yes" >> "$GITHUB_OUTPUT"
+            echo "$TAG is a KnoxMap release"
+          else
+            echo "ours=no" >> "$GITHUB_OUTPUT"
+            echo "$TAG is not a KnoxMap version; nothing to release"
+          fi
+
   checks:
+    needs: gate
+    if: needs.gate.outputs.ours == 'yes'
     uses: ./.github/workflows/checks.yml
 
   which:
+    needs: gate
+    if: needs.gate.outputs.ours == 'yes'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       systems: ${{ steps.set.outputs.systems }}
+      version: ${{ steps.set.outputs.version }}
     steps:
       - id: set
+        env:
+          TAG: ${{ needs.gate.outputs.tag }}
         run: |
           set -eu
-          v="${GITHUB_REF_NAME}"
-          case "${v##*-}" in
+          version="${TAG#v}"
+          case "${TAG##*-}" in
             mac*|mc*)     systems=macos ;;
             win*|w[0-9]*) systems=windows ;;
             lin*|l[0-9]*) systems=linux ;;
             *)            systems="windows linux macos" ;;
           esac
           echo "systems=$systems" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           json='{"include":['
           sep=""
           for system in $systems; do
@@ -46,16 +90,18 @@ jobs:
           done
           json="$json]}"
           echo "matrix=$json" >> "$GITHUB_OUTPUT"
-          echo "$v is for: $systems"
+          echo "$TAG is KnoxMap $version for: $systems"
 
   package:
-    needs: [checks, which]
+    needs: [gate, checks, which]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.which.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
 
       - uses: actions/setup-python@v5
         with:
@@ -96,6 +142,8 @@ jobs:
 
       - name: Name the download
         shell: bash
+        env:
+          VERSION: ${{ needs.which.outputs.version }}
         run: |
           set -eu
           shopt -s nullglob
@@ -104,7 +152,7 @@ jobs:
             rm -rf releases/dist
             mv desktop/out releases/dist
           fi
-          v="${GITHUB_REF_NAME}"
+          v="v$VERSION"
           case "${{ matrix.system }}" in
             windows) ext=exe ;;
             linux)   ext=AppImage ;;
@@ -123,16 +171,23 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: knoxmap-${{ matrix.system }}
-          path: releases/KnoxMap-${{ github.ref_name }}-${{ matrix.system }}.*
+          path: releases/KnoxMap-v${{ needs.which.outputs.version }}-${{ matrix.system }}.*
           if-no-files-found: error
 
   release:
-    needs: [which, package]
+    needs: [gate, which, package]
+    if: needs.gate.outputs.ours == 'yes'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.which.outputs.version }}
+      SYSTEMS: ${{ needs.which.outputs.systems }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -140,13 +195,25 @@ jobs:
           merge-multiple: true
           path: releases
 
-      - name: Notes from docs/CHANGELOG.md
-        env:
-          SYSTEMS: ${{ needs.which.outputs.systems }}
+      - name: The changelog is on this version
         run: |
           set -eu
-          version="${GITHUB_REF_NAME#v}"
-          version="$(printf '%s' "$version" | sed 's/-\([a-z]\)/ \1/')"
+          # knoxlog.version() reports the first "## " heading in the changelog.
+          # Ship a version the changelog has never heard of and the copy that
+          # installs it keeps calling itself the older one.
+          want="$(printf '%s' "$VERSION" | sed 's/-\([a-z]\)/ \1/')"
+          top="$(awk '/^## /{sub(/^## +/, ""); sub(/ +$/, ""); print; exit}' docs/CHANGELOG.md)"
+          if [ "$top" != "$want" ]; then
+            echo "docs/CHANGELOG.md starts at '$top', but this tag is '$want'."
+            echo "Put a '## $want' section at the top of docs/CHANGELOG.md and tag again."
+            exit 1
+          fi
+
+      - name: Notes from docs/CHANGELOG.md
+        run: |
+          set -eu
+          v="v$VERSION"
+          version="$(printf '%s' "$VERSION" | sed 's/-\([a-z]\)/ \1/')"
           awk -v v="$version" '
             /^## / { on = (index($0, "## " v " ") == 1 || $0 == "## " v) ; next }
             on' docs/CHANGELOG.md > notes.md
@@ -165,9 +232,9 @@ jobs:
             printf '| System | Download |\n|---|---|\n'
             for system in $SYSTEMS; do
               case "$system" in
-                windows) printf '| Windows 10/11 | `KnoxMap-%s-windows.exe` |\n' "$GITHUB_REF_NAME" ;;
-                linux)   printf '| Linux | `KnoxMap-%s-linux.AppImage` |\n' "$GITHUB_REF_NAME" ;;
-                macos)   printf '| macOS | `KnoxMap-%s-macos.dmg` |\n' "$GITHUB_REF_NAME" ;;
+                windows) printf '| Windows 10/11 | `KnoxMap-%s-windows.exe` |\n' "$v" ;;
+                linux)   printf '| Linux | `KnoxMap-%s-linux.AppImage` |\n' "$v" ;;
+                macos)   printf '| macOS | `KnoxMap-%s-macos.dmg` |\n' "$v" ;;
               esac
             done
             printf '\nOn Linux, `chmod +x` the AppImage if the file manager does not offer to run it.\n'
@@ -178,10 +245,9 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-          SYSTEMS: ${{ needs.which.outputs.systems }}
         run: |
           set -eu
-          v="${GITHUB_REF_NAME}"
+          v="v$VERSION"
           files=""
           for system in $SYSTEMS; do
             case "$system" in
@@ -194,5 +260,20 @@ jobs:
             *' '*) latest=--latest ;;
             *)     latest=--latest=false ;;
           esac
-          title="KnoxMap $(printf '%s' "${v#v}" | sed 's/-\([a-z]\)/ \1/')"
-          gh release create "$v" $files --title "$title" --notes-file notes.md "$latest"
+          title="KnoxMap $(printf '%s' "$VERSION" | sed 's/-\([a-z]\)/ \1/')"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Published by hand: the release page is already there and the
+            # files are not, which is exactly what the updater cannot see.
+            # Notes somebody wrote themselves are left alone; an empty one
+            # gets the changelog.
+            gh release upload "$TAG" $files --clobber
+            body="$(gh release view "$TAG" --json body -q .body)"
+            if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+              gh release edit "$TAG" --title "$title" --notes-file notes.md
+            fi
+            gh release edit "$TAG" "$latest"
+          else
+            gh release create "$TAG" $files --title "$title" --notes-file notes.md "$latest"
+          fi
+          echo "on the release now:"
+          gh release view "$TAG" --json assets -q '.assets[].name'

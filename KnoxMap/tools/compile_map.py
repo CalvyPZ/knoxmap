@@ -69,6 +69,202 @@ def _end_batch(proc) -> None:
             continue
 
 
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    class _STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.c_void_p),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE),
+        ]
+
+    class _PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD),
+        ]
+
+    class _HiddenDesktopProcess:
+        """Runs PZWorldEd on an isolated Windows desktop.
+
+        Qt GUI windows and secondary dialogs (e.g. 'Generate Lots' popups)
+        belong to this hidden desktop and are physically impossible for DWM
+        to composite onto the user's display, guaranteeing 0 ms visibility
+        and zero flashes without any polling overhead.
+        
+        A background thread proxies error popups (or long-hanging dialogs)
+        to the user's default desktop so they can be dismissed.
+        """
+        def __init__(self, cmd, stdout_f, stderr_f, env=None):
+            self.cmd = cmd
+            self._desk_name = "KnoxHiddenDesktop"
+            self._hdesk = ctypes.windll.user32.CreateDesktopW(self._desk_name, None, None, 0, 0x01FF, None)
+
+            h_out = msvcrt.get_osfhandle(stdout_f.fileno())
+            h_err = msvcrt.get_osfhandle(stderr_f.fileno())
+            ctypes.windll.kernel32.SetHandleInformation(h_out, 1, 1)
+            ctypes.windll.kernel32.SetHandleInformation(h_err, 1, 1)
+
+            si = _STARTUPINFOW()
+            si.cb = ctypes.sizeof(_STARTUPINFOW)
+            si.lpDesktop = self._desk_name
+            si.dwFlags = 0x00000100 | 0x00000001  # STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW
+            si.wShowWindow = 0  # SW_HIDE
+            si.hStdInput = ctypes.windll.kernel32.GetStdHandle(-10)
+            si.hStdOutput = h_out
+            si.hStdError = h_err
+
+            pi = _PROCESS_INFORMATION()
+            flags = 0
+            env_buf = None
+            if env:
+                flags |= 0x00000400  # CREATE_UNICODE_ENVIRONMENT
+                env_str = "".join(f"{k}={v}\0" for k, v in sorted(env.items())) + "\0"
+                env_buf = ctypes.create_unicode_buffer(env_str)
+
+            cmd_line = subprocess.list2cmdline([str(c) for c in cmd]) if isinstance(cmd, (list, tuple)) else str(cmd)
+            ok = ctypes.windll.kernel32.CreateProcessW(
+                None, cmd_line, None, None, True, flags, env_buf, None,
+                ctypes.byref(si), ctypes.byref(pi)
+            )
+            if not ok:
+                err = ctypes.GetLastError()
+                raise OSError(f"CreateProcessW failed: {err}")
+
+            self._hProcess = pi.hProcess
+            self._hThread = pi.hThread
+            self.pid = pi.dwProcessId
+            self.returncode = None
+            
+            # Start error popup proxy thread
+            self._monitor_thread = __import__("threading").Thread(target=self._monitor_popups, daemon=True)
+            self._monitor_thread.start()
+
+        def _monitor_popups(self):
+            seen_times = {}
+            proxied = set()
+            
+            EnumDesktopWindows = ctypes.windll.user32.EnumDesktopWindows
+            EnumDesktopWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            
+            def enum_proc(hwnd, lParam):
+                if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                    return True
+                if hwnd in proxied:
+                    return True
+                    
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value
+                
+                now = time.time()
+                if hwnd not in seen_times:
+                    seen_times[hwnd] = now
+                    
+                elapsed = now - seen_times[hwnd]
+                title_lower = title.lower()
+                
+                is_error = "error" in title_lower or "warning" in title_lower or "exception" in title_lower
+                is_timeout = elapsed > 60.0
+                
+                if is_error or is_timeout:
+                    proxied.add(hwnd)
+                    msg = (f"PZWorldEd popup detected.\n\n"
+                           f"Title: {title}\n"
+                           f"Reason: {'Error keyword in title' if is_error else 'Open for > 1 minute'}\n\n"
+                           f"Click OK to dismiss it and continue.")
+                    # Show on default desktop
+                    ctypes.windll.user32.MessageBoxW(0, msg, "PZWorldEd error plausible", 0)
+                    # Close the hidden window
+                    ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0) # WM_CLOSE
+                    
+                return True
+                
+            c_enum_proc = EnumDesktopWindowsProc(enum_proc)
+            
+            while self._hdesk is not None and self.returncode is None:
+                # EnumDesktopWindows blocks until all windows are enumerated
+                try:
+                    EnumDesktopWindows(self._hdesk, c_enum_proc, 0)
+                except Exception:
+                    pass
+                time.sleep(1.0)
+
+        def poll(self):
+            if self.returncode is not None:
+                return self.returncode
+            code = wintypes.DWORD()
+            if ctypes.windll.kernel32.GetExitCodeProcess(self._hProcess, ctypes.byref(code)):
+                if code.value == 259:  # STILL_ACTIVE
+                    return None
+                self.returncode = code.value
+                self._cleanup()
+                return self.returncode
+            return None
+
+        def wait(self, timeout=None):
+            if self.returncode is not None:
+                return self.returncode
+            ms = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+            res = ctypes.windll.kernel32.WaitForSingleObject(self._hProcess, ms)
+            if res == 0:  # WAIT_OBJECT_0
+                return self.poll()
+            elif res == 0x00000102:  # WAIT_TIMEOUT
+                raise subprocess.TimeoutExpired(self.cmd, timeout)
+            return self.poll()
+
+        def terminate(self):
+            if self._hProcess:
+                ctypes.windll.kernel32.TerminateProcess(self._hProcess, 1)
+
+        def kill(self):
+            self.terminate()
+
+        def _cleanup(self):
+            if self._hThread:
+                try:
+                    ctypes.windll.kernel32.CloseHandle(self._hThread)
+                except Exception:
+                    pass
+                self._hThread = None
+            if self._hProcess:
+                try:
+                    ctypes.windll.kernel32.CloseHandle(self._hProcess)
+                except Exception:
+                    pass
+                self._hProcess = None
+            if self._hdesk:
+                try:
+                    ctypes.windll.user32.CloseDesktop(self._hdesk)
+                except Exception:
+                    pass
+                self._hdesk = None
+
+        def __del__(self):
+            self._cleanup()
+
+
 def _run_batch(cmd, should_stop, started: float):
     """Run one WorldEd batch, watching for a stop while it works.
 
@@ -89,9 +285,15 @@ def _run_batch(cmd, should_stop, started: float):
         return tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
 
     with scratch() as out_f, scratch() as err_f:
-        proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f,
-                                env=knoxpaths.tool_env(),
-                                **({"start_new_session": True} if _OWN_GROUP else {}))
+        if sys.platform == "win32":
+            proc = _HiddenDesktopProcess(cmd, out_f, err_f, env=knoxpaths.tool_env())
+        else:
+            kwargs = {}
+            if _OWN_GROUP:
+                kwargs["start_new_session"] = True
+            proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f,
+                                    env=knoxpaths.tool_env(),
+                                    **kwargs)
 
         def said() -> tuple[str, str]:
             """Whatever WorldEd wrote, however it ended."""
