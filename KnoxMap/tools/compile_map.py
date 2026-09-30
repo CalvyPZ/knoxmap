@@ -347,6 +347,58 @@ def _tool_path(path: Path) -> str:
     return knoxpaths.tool_path(path)
 
 
+# Cells worth compiling, written beside the project when the buildings are
+# generated. Later batches add empty cells that only point at a converted
+# map; those must not widen the next compile to the whole rectangle.
+COMPILE_CELLS = "compile_cells.json"
+
+
+def compile_cells(project: Path, pzw: Path) -> set[tuple[int, int]]:
+    """The cells this compile should cover, not the empty map pointers."""
+    path = project / COMPILE_CELLS
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            found = set()
+            for pair in data.get("cells") or []:
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                    found.add((int(pair[0]), int(pair[1])))
+            if found:
+                return found
+        except (OSError, ValueError, TypeError):
+            pass
+    found = project_cells(pzw)
+    if found:
+        try:
+            path.write_text(json.dumps({"cells": [list(cell) for cell in sorted(found)]}),
+                            encoding="utf-8")
+        except OSError:
+            pass
+    return found
+
+
+def batch_side(requested: int = 4) -> int:
+    """How many source cells on a side one WorldEd process should take.
+
+    Starting the editor is most of a small batch: it reloads Qt and the
+    tilesets before it compiles anything. A wider batch is fewer startups.
+    The map cache grows with the cells that process holds, and one process
+    given a whole town climbed past 13 GB, so eight on a side is the top.
+    """
+    requested = max(1, min(8, int(requested)))
+    status = knoxlog.memory_status()
+    if not status:
+        return requested
+    usable = min(int(status[1]), int(status[2]))
+    per = 150 * 1024 * 1024
+    reserve = 6 * 1024 * 1024 * 1024
+    side = requested
+    for wider in (6, 8):
+        if usable - reserve >= wider * wider * per:
+            side = max(side, wider)
+    return side
+
+
 def assign_converted_maps(pzw: Path) -> int:
     """Point every cell that has a converted .tmx at it. Returns how many.
 
@@ -356,6 +408,11 @@ def assign_converted_maps(pzw: Path) -> int:
     and converted the whole town again before compiling its own few cells.
     Writing the assignments back after a batch lets the rest skip straight to
     compiling.
+
+    Cells the game can fill in are left out of the project. WorldEd still has
+    them, with an empty map, and it skips conversion only when every cell has
+    one. One omitted cell made every later batch convert the whole town again.
+    Once a converted map is on disk, that cell is recorded too.
     """
     text = pzw.read_text(encoding="utf-8", errors="replace")
     origin = re.search(r'<worldOrigin origin="(-?\d+),(-?\d+)"', text)
@@ -381,9 +438,62 @@ def assign_converted_maps(pzw: Path) -> int:
         return f'<cell x="{x}" y="{y}" map="{_tool_path(path)}"'
 
     new = re.sub(r'<cell x="(\d+)" y="(\d+)" map=""', fill, text)
+    size = re.search(r'<world version="[^"]*" width="(\d+)" height="(\d+)"', new)
+    stubs = []
+    if size and folder.is_dir():
+        width, height = int(size.group(1)), int(size.group(2))
+        present = {(int(x), int(y))
+                   for x, y in re.findall(r'<cell x="(-?\d+)" y="(-?\d+)"', new)}
+        for cy in range(height):
+            for cx in range(width):
+                if (cx, cy) in present:
+                    continue
+                path = folder / f"{base}_{ox + cx}_{oy + cy}.tmx"
+                if not path.exists():
+                    continue
+                stubs.append(
+                    f' <cell x="{cx}" y="{cy}" map="{_tool_path(path)}"/>')
+        if stubs:
+            new = new.replace("</world>", "\n".join(stubs) + "\n</world>", 1)
+            count += len(stubs)
+            knoxlog.log.info(
+                "compile %s: recorded %d converted cells so later batches "
+                "skip BMP to TMX", pzw.parent.name, len(stubs))
     if count:
         pzw.write_text(new, encoding="utf-8")
     return count
+
+
+def _batch_written(project: Path, pzw: Path, bx: int, by: int,
+                   x1: int, y1: int) -> bool:
+    """Whether this batch's 256-tile lot cells are already on disk.
+
+    A stopped compile used to start WorldEd again for every finished batch
+    just to be told to skip it. Shared edges belong to two batches, so a
+    batch is done only when every cell of its own rectangle is there.
+    """
+    try:
+        text = pzw.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    origin = re.search(r'<worldOrigin origin="(-?\d+),(-?\d+)"', text)
+    if not origin:
+        return False
+    lots = project / "lots"
+    if not lots.is_dir():
+        return False
+    ox, oy = int(origin.group(1)), int(origin.group(2))
+
+    def span(origin_cell: int, c0: int, c1: int) -> range:
+        tile0 = (origin_cell + c0) * 300
+        tile1 = (origin_cell + c1 + 1) * 300
+        return range(tile0 // 256, (tile1 - 1) // 256 + 1)
+
+    for ix in span(ox, bx, x1):
+        for iy in span(oy, by, y1):
+            if not (lots / f"{ix}_{iy}.lotheader").is_file():
+                return False
+    return True
 
 
 def clear_stale(project: Path) -> None:
@@ -618,7 +728,7 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
         if not w or not h:
             raise ValueError(f"Could not read the world size from {pzw.name}")
 
-        listed = project_cells(pzw)
+        listed = compile_cells(project, pzw)
 
         if only_cells:
             batches = [tuple(int(v) for v in cells[:4]) for cells in only_cells]
@@ -643,6 +753,18 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
                 raise RuntimeError(f"compile {project.name}: batch {i} followed {previous} "
                                    f"- the batches are not being done in order")
             previous = i
+            if only_cells is None and _batch_written(project, pzw, bx, by, x1, y1):
+                knoxlog.log.info("compile %s [%s]: batch %d/%d cells %d,%d..%d,%d "
+                                 "already written, skipping", project.name, run,
+                                 i, len(batches), bx, by, x1, y1)
+                assign_converted_maps(pzw)
+                cells = len(list(lots.glob("*.lotheader")))
+                if on_progress:
+                    on_progress(i, len(batches), cells)
+                else:
+                    print(f"  batch {i}/{len(batches)} cells {bx},{by}..{x1},{y1} "
+                          f"already written  ({time.time() - started:.0f}s)", flush=True)
+                continue
             cmd = knoxpaths.command_for(exe_path) + [
                 f"--generate-map={knoxpaths.tool_path(pzw)}",
                 f"--cells={bx},{by},{x1},{y1}"]

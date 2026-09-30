@@ -41,7 +41,7 @@ from .context import Context, style_fits
 from .population import build_spawn_map, official_population, save_footprints
 from .settings import PRESETS, Settings
 from .tbx import render_tbx
-from .world import Placement, render_pzw
+from .world import Placement, project_cells, render_pzw
 from . import worldmap
 
 # OSM building tags that should get a commercial room mix rather than a house.
@@ -278,12 +278,9 @@ STYLE_AS = {"military": "industrial", "fire": "industrial",
 def looks_like_apartment(tags: dict, area_tiles: int, rng,
                          settings: Settings) -> bool:
     """Whether an untagged building should be treated as a block of flats."""
-    # A mapper who recorded a height or a floor count has told us what this
-    # is, whatever its footprint: three storeys up is a block of flats and one
-    # storey is not, and neither needs guessing at.
-    # Two storeys says nothing on its own: a terrace is two and so is a
-    # bungalow with an attic. Only three or more forces flats, and only one
-    # forces a house. Everything else falls through to the footprint.
+    # Three storeys up is a block of flats and one storey is not. Two says
+    # nothing on its own: a terrace is two and so is a bungalow with an attic,
+    # so the footprint decides.
     measured = levels_from_tags(tags, settings)
     if measured is not None and measured >= 3:
         return True
@@ -2638,6 +2635,11 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
                            f"{map_name}.bmp", placements, map_name,
                            project_dir=out_dir, zones=zones,
                            build_cells=build_cells))
+    # Cells the game can fill itself are left out of the project. Compile
+    # writes those back as empty map pointers so it can skip converting the
+    # bitmap on every batch; this list is the cells that still need lots.
+    with open(os.path.join(out_dir, "compile_cells.json"), "w", encoding="utf-8") as f:
+        json.dump({"cells": [list(cell) for cell in sorted(project_cells(pzw_path))]}, f)
 
     csv_path = os.path.join(out_dir, f"{map_name}_placements.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:

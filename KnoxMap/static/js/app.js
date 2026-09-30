@@ -4053,7 +4053,24 @@ async function runExport() {
       const ok = await publishWorldEd(output);
       if (!ok) return;
     }
-    if (sel.install) await runInstall(modsDir);
+    if (sel.install) {
+      // Compile writes the cells the game loads. Saving the project does not,
+      // so Install with Compile turned off only runs when those cells already
+      // exist from an earlier compile.
+      let compiled = sel.compile;
+      if (!compiled) {
+        try {
+          const ready = await (await fetch(
+            `/api/lots?map=${encodeURIComponent(currentMap)}`)).json();
+          compiled = !!ready.compiled;
+        } catch (_) { compiled = false; }
+      }
+      if (compiled) await runInstall(modsDir);
+      else note('installNote',
+                (sel.editable ? 'Project saved. ' : '')
+                + 'Install needs Compile map — the game reads the compiled cells.',
+                'warn');
+    }
   } finally {
     exportBusy = false;
     syncExportButton();

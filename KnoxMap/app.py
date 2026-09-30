@@ -3414,36 +3414,92 @@ def _export_target(map_dir: Path, dest: str) -> Path | None:
     return target
 
 
+def _ignore_export(_directory, names):
+    """Lock files and half-written pieces are not part of a saved map."""
+    return [name for name in names
+            if name == ".compiling" or name.endswith(".bak") or name.endswith(".part")]
+
+
+def _piece_projects(map_dir: Path) -> list[Path]:
+    """Where the .pzw, buildings and lots actually are.
+
+    A generated map is a pack. The folder the window knows is the parent,
+    and each piece (even a map of one piece) is a sibling directory that
+    holds the WorldEd project.
+    """
+    return _pack_mod_dirs(map_dir) or [map_dir]
+
+
+def _projects_where(pieces: list[Path]) -> str:
+    if len(pieces) == 1:
+        return str(pieces[0])
+    return "; ".join(str(piece) for piece in pieces)
+
+
+def _missing_projects(pieces: list[Path]) -> list[Path]:
+    return [piece for piece in pieces if not (piece / f"{piece.name}.pzw").is_file()]
+
+
+def _copy_pack_notes(map_dir: Path, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in ("pack.json", f"{map_dir.name}_info.json", "README.txt", "settings.json"):
+        src = map_dir / name
+        if src.is_file():
+            shutil.copy2(src, dest / name)
+
+
+def _copy_editable_project(piece: Path, dest: Path) -> None:
+    from tools.make_map_mod import _copy_editable
+
+    holder = Path(tempfile.mkdtemp(prefix="knox-worlded-"))
+    try:
+        _copy_editable(str(piece), str(holder))
+        src = holder / "editable"
+        if not src.is_dir() or not any(src.iterdir()):
+            raise FileNotFoundError(f"{piece.name} has no WorldEd project to copy.")
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+
+
 def _deliver_compiled(map_dir: Path, dest: str) -> str:
-    """Copy the compiled project to the chosen output folder."""
+    """Copy the compiled pieces to the chosen output folder.
+
+    The lots are written into each piece, not into the pack parent. Copying
+    the parent alone saved a folder with no map in it.
+    """
+    pieces = _piece_projects(map_dir)
     target = _export_target(map_dir, dest)
     if target is None:
-        return str(map_dir)
+        return _projects_where(pieces)
     if target.exists():
         shutil.rmtree(target)
-    shutil.copytree(map_dir, target)
+    if len(pieces) == 1:
+        shutil.copytree(pieces[0], target, ignore=_ignore_export)
+    else:
+        _copy_pack_notes(map_dir, target)
+        for piece in pieces:
+            shutil.copytree(piece, target / piece.name, ignore=_ignore_export)
     log.info("compile output %s -> %s", map_dir, target)
     return str(target)
 
 
 def _deliver_worlded(map_dir: Path, dest: str) -> str:
     """Copy the WorldEd project (not the installed mod) to the chosen folder."""
+    pieces = _piece_projects(map_dir)
     target = _export_target(map_dir, dest)
     if target is None:
-        return str(map_dir)
-    from tools.make_map_mod import _copy_editable
-
-    holder = Path(tempfile.mkdtemp(prefix="knox-worlded-"))
-    try:
-        _copy_editable(str(map_dir), str(holder))
-        src = holder / "editable"
-        if not src.is_dir():
-            raise FileNotFoundError("The WorldEd project has no files to copy.")
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(src, target)
-    finally:
-        shutil.rmtree(holder, ignore_errors=True)
+        return _projects_where(pieces)
+    if target.exists():
+        shutil.rmtree(target)
+    if len(pieces) == 1:
+        _copy_editable_project(pieces[0], target)
+    else:
+        _copy_pack_notes(map_dir, target)
+        for piece in pieces:
+            _copy_editable_project(piece, target / piece.name)
     log.info("worlded project %s -> %s", map_dir, target)
     return str(target)
 
@@ -3461,8 +3517,8 @@ def api_worlded():
     map_dir = _map_dir(data.get("mapName", ""))
     if map_dir is None:
         return jsonify({"error": "Unknown map."}), 404
-    pzw = map_dir / f"{map_dir.name}.pzw"
-    if not pzw.exists():
+    pieces = _piece_projects(map_dir)
+    if _missing_projects(pieces):
         return jsonify({"error": "No .pzw yet — generate the buildings first."}), 400
     output = data.get("output") if isinstance(data.get("output"), str) else ""
     if output.strip():
@@ -3476,8 +3532,12 @@ def api_worlded():
     if exe is None:
         return jsonify({"error": "PZWorldEd not found. Set the PZWORLDED "
                                  "environment variable to its full path."}), 400
-    subprocess.Popen(knoxpaths.command_for(exe) + [str(pzw)])
-    return jsonify({"launched": str(pzw)})
+    launched = []
+    for piece in pieces:
+        pzw = piece / f"{piece.name}.pzw"
+        subprocess.Popen(knoxpaths.command_for(exe) + [str(pzw)])
+        launched.append(str(pzw))
+    return jsonify({"launched": launched[0]})
 
 
 SETTINGS_FILE = "settings.json"
@@ -4052,8 +4112,9 @@ def api_compile():
                 _COMPILE[name] = {"state": "running", "error": None,
                                   "batch": done, "batches": total}
 
-        log.info("compile %s: started (%d piece%s)", name, len(targets),
-                 "" if len(targets) == 1 else "s")
+        side = compiler.batch_side(COMPILE_BATCH)
+        log.info("compile %s: started (%d piece%s, batches of %d)", name,
+                 len(targets), "" if len(targets) == 1 else "s", side)
         t0 = time.time()
         try:
             produced = 0
@@ -4062,7 +4123,7 @@ def api_compile():
                         if only_failed else None)
                 if only_failed and not only:
                     continue
-                produced += compiler.compile_map(str(piece), batch=COMPILE_BATCH,
+                produced += compiler.compile_map(str(piece), batch=side,
                                                 exe=str(exe), on_progress=note,
                                                 should_stop=_stopper(name),
                                                 only_cells=only)
@@ -4081,7 +4142,7 @@ def api_compile():
             for piece in targets:
                 left.extend(compiler.failed_cells(str(piece)))
             try:
-                placed = _deliver_compiled(map_dir, output) if output.strip() else str(map_dir)
+                placed = _deliver_compiled(map_dir, output)
             except Exception as exc:
                 eid = knoxlog.record(exc, f"compile {name}: could not copy output")
                 with _PROGRESS_LOCK:
