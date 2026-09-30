@@ -102,6 +102,10 @@ OVERPASS_FILTERS: Sequence[str] = (
     'nwr["man_made"="obelisk"]',
     'node["tourism"="artwork"]',
     'nwr["amenity"="fountain"]',
+    # Towers: a water tower, a lighthouse, a windmill or a clock tower is a
+    # landmark somebody navigates by, not a house. Without this they arrive
+    # only when the mapper also tagged building=*, and then as a bungalow.
+    'nwr["man_made"~"^(water_tower|lighthouse|windmill|tower)$"]',
     # buildings
     'way["building"]',
     'relation["building"]',

@@ -22,8 +22,29 @@ from knoxbuild.layout import STAIR_RUN, build_building, roof_rects  # noqa: E402
 FILL = {
     "livingroom": (196, 92, 92), "kitchen": (92, 140, 196),
     "bedroom": (150, 120, 190), "bathroom": (96, 176, 168),
-    "dining": (196, 152, 84), "hall": (150, 150, 150),
+    "dining": (196, 152, 84), "diningroom": (196, 152, 84),
+    "hall": (150, 150, 150), "lobby": (178, 178, 178),
     "storage": (130, 130, 100), "office": (110, 160, 110),
+    # The rooms only landmarks have. Without these a chapel, a cell and a
+    # corridor were all the same grey and a sheet showed nothing.
+    "church": (206, 180, 96), "library": (150, 110, 70),
+    "classroom": (120, 170, 210), "gym": (90, 150, 130),
+    "lockerroom": (70, 130, 170), "sportstorage": (110, 130, 90),
+    "cafe": (200, 130, 90), "restaurant": (200, 130, 90),
+    "clinic": (220, 120, 120), "medical": (220, 120, 120),
+    "generalstore": (170, 140, 190), "warehouse": (120, 120, 96),
+    "prisoncells": (90, 90, 110), "armory": (170, 80, 80),
+    "policeoffice": (110, 150, 180), "interrogationroom": (140, 100, 140),
+}
+
+# What the legend shows, in this order. A sheet only names the rooms the
+# building it drew actually has, or a castle carried a legend of cells.
+LEGEND_NAMES = {
+    "livingroom": "living", "bathroom": "bath", "diningroom": "dining",
+    "lockerroom": "changing", "sportstorage": "kit store",
+    "generalstore": "shop", "prisoncells": "cells",
+    "policeoffice": "police office", "interrogationroom": "interrogation",
+    "classroom": "classroom", "church": "chapel",
 }
 S = 16
 PAD = 26
@@ -139,11 +160,15 @@ def main(argv):
         sheet.paste(p, (x, 0))
         x += p.width
     d = ImageDraw.Draw(sheet)
-    legend = [("living", FILL["livingroom"]), ("kitchen", FILL["kitchen"]),
-              ("bedroom", FILL["bedroom"]), ("bath", FILL["bathroom"]),
-              ("dining", FILL["dining"]), ("hall", FILL["hall"]),
-              ("door", (255, 215, 50)), ("window", (110, 215, 255)),
-              ("wall between flats", (255, 150, 40))]
+    # Only the rooms this building has, so the strip describes the sheet.
+    seen: list[str] = []
+    for storey in b.storeys:
+        for room in storey.rooms:
+            if room.kind in FILL and room.kind not in seen:
+                seen.append(room.kind)
+    legend = [(LEGEND_NAMES.get(k, k), FILL[k]) for k in seen]
+    legend += [("door", (255, 215, 50)), ("window", (110, 215, 255)),
+               ("wall between flats", (255, 150, 40))]
     lx = 10
     for label, colour in legend:
         d.rectangle([lx, height - 24, lx + 12, height - 12], fill=colour)

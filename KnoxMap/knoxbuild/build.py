@@ -115,8 +115,15 @@ SPECIAL_BY_VALUE = {
     "restaurant": "restaurant", "fast_food": "restaurant", "cafe": "restaurant",
     "bar": "restaurant", "pub": "restaurant", "food_court": "restaurant",
     "retail": "shop", "commercial": "shop", "supermarket": "shop",
-    "convenience": "shop", "mall": "shop", "kiosk": "shop",
-    "department_store": "shop", "shop": "shop", "marketplace": "shop",
+    "convenience": "shop", "kiosk": "shop",
+    "shop": "shop", "marketplace": "shop",
+    # A shopping centre is not a big corner shop. As "shop" it took the shop
+    # recipe - one sales floor the width of the front, stockrooms behind -
+    # and a 92x72 one came out as a single room of 5,670 tiles with an
+    # office block on top. Knox County's mall is a concourse with units off
+    # it: Muldraugh 54_22 is 33.6% hall by floor, and the rest clothes,
+    # department, furniture, gift, toy and book stores of 150 to 400 tiles.
+    "mall": "mall", "department_store": "mall",
     "industrial": "industrial", "warehouse": "industrial",
     "factory": "industrial", "works": "industrial", "manufacture": "industrial",
     "barn": "barn", "farm": "barn", "farm_auxiliary": "barn",
@@ -138,6 +145,15 @@ SPECIAL_BY_VALUE = {
     # Bases: barracks, armouries, the offices and stores of a military site.
     "military": "military", "barracks": "military", "bunker": "military",
     "armory": "military", "armoury": "military",
+    # The buildings a town is known by, which had no kind at all and so were
+    # ordinary housing: thinned like a house, grown like a house and given a
+    # sofa and two bedrooms. A castle keeps its great hall and its chapel; a
+    # ground is a concourse, changing rooms and a kit store.
+    "castle": "castle", "fort": "castle", "fortress": "castle",
+    "citadel": "castle", "manor": "castle", "palace": "castle",
+    "city_gate": "castle",
+    "stadium": "stadium", "sports_centre": "stadium", "sports_hall": "stadium",
+    "grandstand": "stadium", "pavilion": "stadium", "arena": "stadium",
 }
 
 # Last resort when the tags say nothing useful but the name is obvious.
@@ -147,7 +163,7 @@ SPECIAL_BY_NAME = [
     ("cathedral", "church"), ("hospital", "medical"), ("clinic", "medical"),
     ("pharmacy", "medical"), ("warehouse", "industrial"),
     ("factory", "industrial"), ("mill", "industrial"), ("plant", "industrial"),
-    ("market", "shop"), ("mall", "shop"), ("store", "shop"), ("shop", "shop"),
+    ("market", "shop"), ("mall", "mall"), ("store", "shop"), ("shop", "shop"),
     ("diner", "restaurant"), ("restaurant", "restaurant"), ("grill", "restaurant"),
     ("cafe", "restaurant"), ("bar ", "restaurant"), ("barn", "barn"),
     ("library", "library"), ("bibliot", "library"), ("kütüphane", "library"),
@@ -179,6 +195,12 @@ DEFAULT_LEVELS = {
     "police": (1, 2),
     "library": (1, 2),
     "fire": (1, 1),
+    # A keep is tall and a stand is not. Kept short because the mix is dealt
+    # again on every storey: at four levels a castle had four chapels.
+    "castle": (2, 3),
+    "stadium": (1, 2),
+    # Knox County's mall runs to five storeys; two is the common one.
+    "mall": (1, 2),
 }
 
 # Rows of units under one outline.
@@ -366,7 +388,8 @@ def building_levels(tags: dict, kind: str | None, area_tiles: int,
 def classify_building(tags: dict) -> str | None:
     """The special kind for this building, or None for an ordinary one."""
     for key in ("amenity", "shop", "healthcare", "leisure", "tourism",
-                "office", "industrial", "craft", "military", "building"):
+                "office", "industrial", "craft", "military", "historic",
+                "building"):
         value = (tags.get(key) or "").strip().lower()
         if not value:
             continue
@@ -421,7 +444,10 @@ BLOCK_SHARE = 55
 # Police and a library are civic. The call site still dresses a barracks or
 # a fire station as industrial, via STYLE_AS, before this is consulted.
 BORROWED_STYLE = {"police": "civic", "library": "civic", "fire": "civic",
-                  "military": "civic"}
+                  "military": "civic",
+                  # Stone, not clapboard: a castle has no style of its own and
+                  # the house styles would have built one out of weatherboard.
+                  "castle": "church", "stadium": "civic", "mall": "civic"}
 
 
 def wall_variants(kind: str) -> list[dict]:

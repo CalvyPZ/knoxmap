@@ -304,6 +304,21 @@ def _storefront_runs(storey, doors) -> list[tuple[str, int, int, int]]:
     return runs
 
 
+# How many different interior wall sets one building uses. Knox County's
+# figure, measured over 77 buildings in Muldraugh, is 4.48.
+#
+# A mall is the exception: every unit in it is let to somebody else and
+# painted to suit, and the game's own runs to 117 different wall tiles in the
+# one building where an ordinary house has a dozen. It gets one per room kind
+# instead, out of the whole list.
+INTERIOR_WALLS_PER_BUILDING = 4
+WALLS_PER_KIND = {"mall": 99}
+# How many room kinds in a building carry wall trim. Knox County's schools
+# run to 0.25 pieces of walls_interior_detailing per 10 m2 and ours to 2.43
+# with every room trimmed, so about one kind in ten keeps it.
+TRIM_SHARE = 0.12
+
+
 def render_tbx(plan: Plan | Building, name: str,
                style: dict | None = None) -> str:
     """Return the complete .tbx document for a plan or a stack of them.
@@ -445,6 +460,67 @@ def render_tbx(plan: Plan | Building, name: str,
         ("RoofTop", top_idx),
         ("GrimeWall", grime_idx),
     ]
+    # A floor per room kind, drawn once for this building from the shares the
+    # game lays them in (layout.FLOOR_CHOICES). One house keeps one floor per
+    # kind so it reads as one house; the next house down the street draws
+    # again. A style's own floor still overrides the lot. This has to happen
+    # before the tile entries are written out below, and before used_tiles is
+    # counted, or the new entries never reach the file.
+    from .layout import FLOOR_CHOICES, KIND_FLOOR_CHOICES
+
+    # What sort of building this is, for the rooms it floors differently: a
+    # station's corridor is not somebody's hallway.
+    of_kind = KIND_FLOOR_CHOICES.get(
+        next((s.kind for s in storeys if s.kind), None) or "", {})
+    # The style's floor is the building's default, not its whole story. It
+    # used to override every room, which meant a school, a shop, a civic
+    # building and a block of flats each had one floor throughout - a shop
+    # tile down a school corridor, one carpet over a flat's bathroom and its
+    # kitchen alike - and none of the per-room floors below ever applied to
+    # them. Knox County gives a bathroom 18 different floors and a kitchen 35.
+    # A room with a floor of its own takes it; the rest fall back to the
+    # style's.
+    # Which room kinds this building trims (see InteriorWallTrim below).
+    trim_rng = random.Random(
+        hash((name, building.width, building.height, 'trim')) & 0xFFFFFFFF)
+    trimmed = {k for k in sorted({r.kind for r in building.rooms})
+               if trim_rng.random() < TRIM_SHARE}
+    room_floor: dict[str, int] = {}
+    pick_rng = random.Random(
+        hash((name, len(building.rooms), building.width,
+              building.height)) & 0xFFFFFFFF)
+    for kind in sorted({r.kind for r in building.rooms}):
+        options = [o for o in of_kind.get(kind, FLOOR_CHOICES.get(kind, ()))
+                   if o in C.EXTRA_FLOORS]
+        if not options:
+            continue
+        entries.append(C.floor_entry(pick_rng.choice(options)))
+        room_floor[kind] = len(entries)
+
+    # Interior walls, room by room. InteriorWall has always been a per-room
+    # attribute here and every room was given the same one, so a building was
+    # one colour throughout however many its style could have used. Knox
+    # County paints 4.48 different sets into a single building - a kitchen is
+    # not the colour of the bedroom next door - over 9 in all. A few are dealt
+    # out per room kind rather than per room, so two bedrooms match and the
+    # kitchen does not, the way the floors above already work.
+    room_wall: dict[str, int] = {}
+    palette = [interior_idx]
+    spare = [e for e in C.INTERIOR_WALLS
+             if not style or e is not style.get("interior")]
+    pick_rng.shuffle(spare)
+    kinds_here = sorted({r.kind for r in building.rooms})
+    want = min(WALLS_PER_KIND.get(getattr(storeys[0], "kind", None) or "",
+                                  INTERIOR_WALLS_PER_BUILDING),
+               len(kinds_here))
+    for entry in spare[:max(0, want - 1)]:
+        entries.append(entry)
+        palette.append(len(entries))
+    for i, kind in enumerate(kinds_here):
+        # A mall gives each trade its own; everywhere else they share a few.
+        room_wall[kind] = (palette[i % len(palette)] if want >= len(kinds_here)
+                           else pick_rng.choice(palette))
+
     out.append(f"<building{_attrs(building_attrs)}>")
 
     base_n = len(C.TILE_ENTRIES)
@@ -484,19 +560,37 @@ def render_tbx(plan: Plan | Building, name: str,
 
     for room in building.rooms:
         floor_idx, _label, _ = ROOM_STYLE[room.kind]
+        floor_idx = room_floor.get(room.kind, floor_idx)
         # The shipped templates set Name identical to InternalName; the room
         # name is what reaches the game's room definitions, so don't get
         # creative with it.
+        # An open-plan flat's one room is ours; the game knows it as a living
+        # room, and the name is what its loot tables key off (layout.ROOM_NAME).
+        from .layout import ROOM_NAME
+        game_name = ROOM_NAME.get(room.kind, room.kind)
         room_attrs = [
-            ("Name", room.kind),
-            ("InternalName", room.kind),
+            ("Name", game_name),
+            ("InternalName", game_name),
             ("Color", C.ROOM_COLORS[room.kind]),
-            ("InteriorWall", interior_idx),
-            ("InteriorWallTrim", C.INTERIOR_WALL_TRIM),
-            ("Floor", floor_override or floor_idx),
+            ("InteriorWall", room_wall.get(room.kind, interior_idx)),
+            # Skirting and picture rail. Set on every room it came to 2.43
+            # pieces per 10 m2 against Knox County's 0.25 - a band of
+            # detailing round every wall of every room, which at a distance
+            # reads as fittings hung all the way along. Only some rooms get
+            # it, drawn once per building per kind so one room is not
+            # trimmed and the one next door bare.
+            ("InteriorWallTrim",
+             C.INTERIOR_WALL_TRIM if room.kind in trimmed else 0),
+            # A room with a floor of its own first, then the style's, then
+            # the room kind's own default.
+            ("Floor", room_floor.get(room.kind) or floor_override or floor_idx),
             ("GrimeFloor", 0),
             ("GrimeWall", 0),
-            ("Ceiling", C.CEILING),
+            # A concourse has no ceiling: it is open to the storey above, and
+            # BuildingEd draws a room's ceiling on the floor above it - which
+            # laid a lid straight across the hole and hid the ground floor
+            # the hole is cut to show.
+            ("Ceiling", 0 if room.kind == "concourse" else C.CEILING),
         ]
         out.append(f" <room{_attrs(room_attrs)}/>")
 
@@ -560,6 +654,13 @@ def render_tbx(plan: Plan | Building, name: str,
         if level + 1 < len(storeys):
             above = np.asarray(storeys[level + 1].grid)
             exposed = np.where(above != 0, np.int32(0), storey_grid)
+            # A square left open in the storey above - the hole down the
+            # middle of a mall's upper floor - has no room there, but it is
+            # still built over: roofing it would put a ceiling across the
+            # concourse and hide the floor the hole exists to show.
+            for x, y in storeys[level + 1].void:
+                if 0 <= y < exposed.shape[0] and 0 <= x < exposed.shape[1]:
+                    exposed[y, x] = 0
         else:
             above = None
             exposed = storey_grid

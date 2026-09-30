@@ -376,6 +376,16 @@ def _shell() -> str:
 def _set_progress(map_name: str, **fields) -> None:
     with _PROGRESS_LOCK:
         _PROGRESS.setdefault(map_name, {}).update(fields)
+    # Discord Rich Presence, if the player asked for it. It is a set on a
+    # background thread and nothing here waits on it: knoxpresence swallows
+    # its own errors so a Discord that is closed, restarting or not installed
+    # cannot interrupt a map halfway through.
+    if "stage" in fields:
+        try:
+            import knoxpresence
+            knoxpresence.stage(str(fields["stage"]))
+        except Exception:  # noqa: BLE001 - presence is never worth a failure
+            pass
 
 
 def _paint_corners(window) -> list:

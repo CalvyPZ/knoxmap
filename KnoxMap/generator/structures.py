@@ -573,9 +573,39 @@ NOT_MONUMENT_MEMORIALS = {"building", "plaque", "blue_plaque", "bench", "tree",
 MONUMENT_BUILDINGS = {"triumphal_arch", "monument", "memorial", "obelisk"}
 MAX_MONUMENT_M2 = 900
 
+# Towers. These are the things a town is navigated by and nobody walks into:
+# the water tower on the ridge, the lighthouse, the mill, the clock tower over
+# the square. classify_building() has no kind for any of them, so they were
+# ordinary housing - thinned like a house, grown like a house and furnished
+# with a sofa and two bedrooms. They are built as what they are instead, and
+# taken off the building list the way an obelisk already is.
+TOWER_MAN_MADE = {"water_tower", "lighthouse", "windmill", "tower"}
+# man_made=tower is also every phone mast and floodlight there is, and a
+# hundred concrete blocks up the hillside is not a landmark. Only the towers
+# somebody would give directions by.
+TOWER_TYPES = {"clock", "bell_tower", "observation", "watchtower", "defensive",
+               "campanile", "cooling", "water_tower"}
+# How tall each stands when OpenStreetMap does not say, in storeys.
+TOWER_LEVELS = {"water_tower": 6, "lighthouse": 7, "windmill": 4, "tower": 5}
+# A tower is tall, not broad: past this the footprint is the base it stands on
+# and the shaft rises from the middle of it.
+TOWER_SHAFT = 3
+
+
+def tower_kind(tags: dict) -> str | None:
+    """water_tower, lighthouse, windmill or tower; None for anything else."""
+    made = (tags.get("man_made") or "").lower()
+    if made not in TOWER_MAN_MADE:
+        made = (tags.get("building") or "").lower()
+        if made not in TOWER_MAN_MADE:
+            return None
+    if made == "tower" and (tags.get("tower:type") or "").lower() not in TOWER_TYPES:
+        return None
+    return made
+
 
 def monument_kind(tags: dict) -> str | None:
-    """arch, column, statue, fountain or stone; None for anything else."""
+    """arch, column, statue, fountain, stone or tower; None for anything else."""
     historic = tags.get("historic")
     memorial = (tags.get("memorial") or tags.get("monument") or "").lower()
     artwork = (tags.get("artwork_type") or "").lower()
@@ -583,6 +613,8 @@ def monument_kind(tags: dict) -> str | None:
     building = tags.get("building")
     if tags.get("amenity") == "fountain":
         return "fountain"
+    if tower_kind(tags):
+        return "tower"
     if tags.get("man_made") == "obelisk" or memorial in {"obelisk", "column"}:
         return "column"
     if building == "triumphal_arch" or memorial == "arch" or (
@@ -624,7 +656,7 @@ def plan_monuments(feats: list, proj, meters_per_tile: float, plan: Plan) -> Non
             if not shape.is_valid or shape.area * meters_per_tile ** 2 > MAX_MONUMENT_M2:
                 continue
             levels = feat.tags.get("building:levels")
-            if levels and kind != "arch":
+            if levels and kind not in ("arch", "tower"):
                 try:
                     if float(levels) > 1:
                         continue
@@ -646,7 +678,7 @@ def plan_monuments(feats: list, proj, meters_per_tile: float, plan: Plan) -> Non
             plan.not_buildings.add(id(feat))
         plan.paving.append(shape.buffer(1.0, join_style=2))
         {"arch": _arch, "column": _column, "statue": _statue,
-         "fountain": _fountain, "stone": _stone}[kind](plan, shape, feat.tags)
+         "fountain": _fountain, "stone": _stone, "tower": _tower}[kind](plan, shape, feat.tags)
         plan.monuments += 1
 
 
@@ -690,6 +722,36 @@ def _column(plan: Plan, shape, tags: dict) -> None:
     height = max(2, min(8, _storeys(tags, 4)))
     for z in range(height):
         plan.put(cx, cy, z, "Floor", BLOCK)
+
+
+def _tower(plan: Plan, shape, tags: dict) -> None:
+    """A shaft rising from its footprint, topped the way its kind is known by.
+
+    A water tower is a tank on legs, so the shaft is narrow all the way and the
+    last two storeys spread back out to the whole footprint. The rest stand on
+    their base: the shaft rises from the middle and what is left of the
+    footprint is a low plinth around it, which is a lighthouse or a mill seen
+    from across a town.
+    """
+    kind = tower_kind(tags) or "tower"
+    cells = _cells(shape)
+    cx, cy = int(shape.centroid.x), int(shape.centroid.y)
+    half = TOWER_SHAFT // 2
+    shaft = [(x, y) for x, y in cells
+             if abs(x - cx) <= half and abs(y - cy) <= half] or [(cx, cy)]
+    height = max(2, min(8, _storeys(tags, TOWER_LEVELS.get(kind, 5))))
+    for z in range(height):
+        for x, y in shaft:
+            plan.put(x, y, z, "Floor", BLOCK)
+    if kind == "water_tower":
+        # The tank, wider than the legs it stands on.
+        for z in range(max(0, height - 2), height):
+            for x, y in cells:
+                plan.put(x, y, z, "Floor", BLOCK)
+    else:
+        for x, y in cells:
+            if (x, y) not in shaft:
+                plan.put(x, y, 0, "Floor", PLINTH)
 
 
 def _statue(plan: Plan, shape, tags: dict) -> None:

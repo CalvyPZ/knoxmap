@@ -378,7 +378,7 @@ const fx = (() => {
     else dot.removeAttribute('title');
   }
 
-  async function watchUpdates() {
+  async function watchUpdates(round = 0) {
     const box = $('#updateNote');
     if (!box) return;
     let st;
@@ -408,7 +408,14 @@ const fx = (() => {
       box.hidden = false;
       box.textContent = `Downloading KnoxMap ${st.latest}...`;
     }
-    setTimeout(watchUpdates, st.state === 'downloading' ? 5000 : 10 * 60 * 1000);
+    // The first check runs a few seconds after the window opens and the
+    // download takes a moment, so ask often to begin with and settle down
+    // afterwards: one poll every ten minutes meant the banner could be ten
+    // minutes late on a window somebody only had open for five.
+    const gap = st.state === 'downloading' || round < 12 ? 5000
+                : round < 20 ? 30 * 1000
+                : 10 * 60 * 1000;
+    setTimeout(() => watchUpdates(round + 1), gap);
   }
 
   // ---- version menu ---------------------------------------------------------------

@@ -137,6 +137,11 @@ def town() -> list[OSMFeature]:
     feats.append(statue)
     feats.append(way({"building": "triumphal_arch", "historic": "monument", "height": "12",
                       "name": "Selftest Arch"}, box(420, 420, 432, 425)))
+    # A water tower on the edge of town, mapped as a building the way a
+    # surveyor maps one. classify_building has no kind for it, so it used to
+    # come out as a bungalow with a sofa in it.
+    feats.append(way({"man_made": "water_tower", "building": "yes",
+                      "name": "Selftest Water Tower"}, box(392, 420, 400, 428)))
     # A coast along the south: land on the left of the line, sea to the right.
     # Deliberately short: a real download often holds only part of a shore.
     feats.append(way({"natural": "coastline"}, [(0, 30), (600, 30)]))
@@ -1000,8 +1005,12 @@ def check_facing(check) -> None:
     # home put warehouse wire racking in people's bathrooms.
     from collections import Counter as _Counter
 
+    # Every room a house has, not just the ones you sit in: the box room and
+    # the laundry were left out of this, and that is exactly where the steel
+    # racking and the packing crates were sitting.
     indoors = {"livingroom", "bedroom", "kidsbedroom", "kitchen", "bathroom",
-               "dining", "hall"}
+               "dining", "diningroom", "hall", "storage", "laundry", "closet",
+               "office", "openplan"}
     industrial = {"metal_rack", "crate", "shop_shelf", "shop_aisle"}
     strays = _Counter()
     for i in range(48):
@@ -1494,6 +1503,63 @@ def check_overture(check, work: str) -> None:
     check("Overture" not in plain and "Overture Maps Foundation" in filled
           and "OpenStreetMap" in filled,
           "a map that used Overture credits it, and one that did not does not")
+
+
+def check_kitchen_fit(check) -> None:
+    """A kitchen is fitted out the way Knox County fits one out.
+
+    Measured over its 672 kitchens (median 21 m2): 1.0 sink, 1.0 fridge, 1.2
+    cooking appliances and 3.9 pieces of the counter tileset, which includes
+    the wall cupboards - they are fixtures_counters_01_024-027. Ours filled
+    both long walls end to end and then hung cupboards above that, for 7.1,
+    put a microwave over every one of them for 1.8 cooking appliances, and had
+    a washing machine in 80% of kitchens against the game's 16%.
+    """
+    import collections as _collections
+    import random as _random
+
+    from knoxbuild import layout as _L
+    from knoxbuild.settings import Settings as _Settings
+
+    groups = {
+        "sink": lambda r: "sink" in r,
+        "cooking": lambda r: r.startswith(("stove", "oven", "microwave")),
+        "fridge": lambda r: r.startswith("fridge"),
+        "counter": lambda r: r.startswith("counter") or "cabinet" in r,
+        "washer": lambda r: r.startswith(("washer", "dryer")),
+    }
+    # (at least, at most) per kitchen. The counter band is wide at the top
+    # because a sink that does not land in a run gets one slid under it, on
+    # the sink's own square - an extra piece but not an extra worktop.
+    want = {"sink": (0.8, 1.3), "cooking": (0.9, 1.4), "fridge": (0.8, 1.2),
+            "counter": (3.0, 5.6), "washer": (0.0, 0.35)}
+
+    rng = _random.Random(7)
+    seen = _collections.Counter()
+    kitchens = 0
+    for _ in range(200):
+        w, h = rng.randrange(9, 20), rng.randrange(9, 20)
+        b = _L.build_building(w, h, levels=1, seed=rng.randrange(1 << 20),
+                              kind="house", commercial=False,
+                              settings=_Settings())
+        for storey in b.storeys:
+            for room in storey.rooms:
+                if room.kind != "kitchen":
+                    continue
+                kitchens += 1
+                for role, x, y, _o in storey.furniture:
+                    if not (room.x0 <= x <= room.x1
+                            and room.y0 <= y <= room.y1):
+                        continue
+                    for name, test in groups.items():
+                        if test(role):
+                            seen[name] += 1
+    check(kitchens > 50, f"{kitchens} kitchens to measure")
+    for name, (lo, hi) in want.items():
+        per = seen[name] / max(1, kitchens)
+        check(lo <= per <= hi,
+              f"a kitchen has {per:.1f} {name} per room, the game's is "
+              f"{ {'sink': 1.0, 'cooking': 1.2, 'fridge': 1.0, 'counter': 3.9, 'washer': 0.2}[name] }")
 
 
 def check_standing(check) -> None:
@@ -2260,10 +2326,13 @@ def check_updater(check, work: str) -> None:
         z.writestr("KnoxMap/output/mytown/mytown.bmp", "a release must not overwrite maps")
         z.writestr("KnoxMap/../escape.txt", "outside the folder")
     saved = {k: getattr(updater, k) for k in ("BASE_DIR", "UPDATE_DIR", "STAGED", "MANIFEST",
+                                              "ASIDE_DIR", "FILE_TRIES", "FILE_GAP_S",
                                               "current_version", "enabled")}
     try:
         updater.BASE_DIR, updater.UPDATE_DIR = base, update_dir
         updater.STAGED, updater.MANIFEST = update_dir / "staged.json", base / saved["MANIFEST"].name
+        updater.ASIDE_DIR = update_dir / "replaced"
+        updater.FILE_TRIES, updater.FILE_GAP_S = 2, 0.01
         updater.current_version = lambda: "1.0"
         updater.enabled = lambda: True
         updater.STAGED.write_text(json.dumps({"version": "9.9", "zip": str(zip_path)}))
@@ -2290,6 +2359,47 @@ def check_updater(check, work: str) -> None:
               "a version chosen in the menu goes in, older ones too")
         check(updater.is_newer("1.10", "1.9") and not updater.is_newer("1.2", "1.2.0")
               and updater.is_newer("1.2.1", "1.2"), "versions compare as numbers")
+
+        # One file that will not go in must not lose the whole update. Windows
+        # refuses to overwrite a file another program has open - a virus
+        # scanner reading KnoxMap.exe was enough - and the run used to stop
+        # there with half the release in place, CHANGELOG.md among it, so
+        # KnoxMap read as the new version and never looked again.
+        updater.enabled = lambda: True
+        (base / updater.VERSION_FILE).write_text("## 1.0\n")
+        # A folder where the release has a file cannot be overwritten on any
+        # system, which is the same dead end: the old one is moved aside.
+        stuck = base / "stuck"
+        stuck.mkdir()
+        (stuck / "in the way").write_text("not something a file can replace")
+        aside_zip = update_dir / "KnoxMap-v9.9.zip"
+        with zipfile.ZipFile(aside_zip, "w") as z:
+            z.writestr(f"KnoxMap/{updater.VERSION_FILE}", "## 9.9\n")
+            z.writestr("KnoxMap/stuck", "a file where the install has a folder")
+        updater.STAGED.write_text(json.dumps({"version": "9.9", "zip": str(aside_zip)}))
+        check(updater.apply_staged() and (base / "stuck").is_file()
+              and (updater.ASIDE_DIR / "stuck" / "in the way").exists(),
+              "a file that will not be overwritten is moved aside and the update goes in")
+
+        # And when it cannot even be moved: the version stays as it was and
+        # the download waits for the next start rather than being thrown away.
+        (base / updater.VERSION_FILE).write_text("## 1.0\n")
+        (base / "locked").write_text("a file where the release has a folder")
+        half_zip = update_dir / "KnoxMap-v9.9b.zip"
+        with zipfile.ZipFile(half_zip, "w") as z:
+            z.writestr(f"KnoxMap/{updater.VERSION_FILE}", "## 9.9\n")
+            z.writestr("KnoxMap/locked/module.py", "cannot be unpacked over a file")
+        updater.STAGED.write_text(json.dumps({"version": "9.9", "zip": str(half_zip)}))
+        blocked = updater.apply_staged()
+        left = json.loads(updater.STAGED.read_text()) if updater.STAGED.exists() else {}
+        check(not blocked and (base / updater.VERSION_FILE).read_text().startswith("## 1.0")
+              and left.get("tries") == 1 and half_zip.exists(),
+              "an update that will not go in keeps the version it had and stays staged")
+        (base / "locked").unlink()
+        check(updater.apply_staged()
+              and (base / "locked" / "module.py").exists()
+              and (base / updater.VERSION_FILE).read_text().startswith("## 9.9"),
+              "and the next start puts that update in")
     finally:
         for k, v in saved.items():
             setattr(updater, k, v)
@@ -2325,6 +2435,7 @@ def main(argv: list[str]) -> int:
         check(colours.get(C.PALE_CONCRETE, 0) > 0, "streets have pavements")
         print("bridges and monuments")
         import json as _json
+        from generator import structures
         raised = _json.load(open(os.path.join(out, "selftest_structures.json"), encoding="utf-8"))
         tiles = raised["tiles"]
         check(any(t[3] == "Floor" and t[4].startswith("ramps_01") and t[2] == 0 for t in tiles)
@@ -2347,6 +2458,19 @@ def main(argv: list[str]) -> int:
         check(any("cemetary_01" in t[4] for t in tiles) and "Selftest Arch" not in names
               and any(t[4] == "ramps_01_19" and t[2] >= 2 for t in tiles),
               "a statue stands in the park and the arch is an arch, not a house")
+        # A tower is legs with a tank on top, and never a floor plan. Counted
+        # around the tower itself: every structure on the map is in this list
+        # and the arch's span would pass a count taken over all of them.
+        tx, ty = proj.to_px(*_ll(396, 424))
+        by_level: dict = {}
+        for x, y, z, layer, tile in tiles:
+            if layer == "Floor" and abs(x - tx) < 15 and abs(y - ty) < 15:
+                by_level.setdefault(z, set()).add((x, y))
+        top = max(by_level) if by_level else 0
+        check(top >= 4 and len(by_level.get(top, ())) > len(by_level.get(top - 2, set()))
+              and "Selftest Water Tower" not in names,
+              f"the water tower is a tank on legs, not a house ({top + 1} storeys, "
+              f"{len(by_level.get(top, ()))} tiles on top over {len(by_level.get(0, ()))})")
         veg = Image.open(os.path.join(out, "selftest_veg.bmp")).convert("RGB")
         pixels = veg.get_flattened_data() if hasattr(veg, "get_flattened_data") else veg.getdata()
         kerbs = sum(1 for c in pixels if c[0] == 12 and c[1] == 34)
@@ -2374,6 +2498,7 @@ def main(argv: list[str]) -> int:
         check_wall_corners(check)
         check_overture(check, work)
         check_standing(check)
+        check_kitchen_fit(check)
         check_wall_styles(check)
         check_squares(check)
         check_house_plan(check)

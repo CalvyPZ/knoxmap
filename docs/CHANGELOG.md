@@ -72,8 +72,278 @@
   rings with an island, not discs of tarmac. The download now asks for those
   nodes, so the first generate after this version fetches the area again.
 
-- **Upstream through 1.4.6 is in this copy.** Interior plans, porch lights, Overpass tiles that arrive empty, paper-map outlines, dedicated-server notes, and the Linux Qt fixes. The notes for those releases follow this one.
+- **Upstream through 1.4.8 is in this copy.** Interior plans, porch lights, Overpass tiles that arrive empty, paper-map outlines, dedicated-server notes, the Linux Qt fixes, malls and castles, and Discord presence. The notes for those releases follow this one.
+## 1.4.8
 
+- **Every unit in a mall its own colour** (`knoxbuild/catalog.py`,
+  `knoxbuild/tbx.py`). Knox County's mall paints 117 different interior wall
+  tiles into the one building, where ours managed 27 - each unit is let to
+  somebody else and decorated to suit. The wall styles the game itself uses
+  are read off its compiled cells rather than guessed at from tile numbers,
+  which is how the school ended up full of clocks: a style is its four wall
+  tiles at a base on a 16 with the window and door tiles after them, and only
+  the eighteen whose whole set the game uses are taken. Twenty-three styles
+  to draw from now, and a mall takes one per trade. Ours: 112 tiles. Ordinary
+  buildings are untouched at 4.0 wall sets each against the game's 4.48.
+
+- **Malls** (`knoxbuild/layout.py`, `knoxbuild/build.py`,
+  `knoxbuild/interiors.py`, `knoxbuild/catalog.py`). A shopping centre was a
+  "shop" - the corner-shop recipe, which makes one sales floor the width of
+  the front - so a 92x72 mall came out as a single room of 5,670 tiles with
+  an office block on top of it. Loot is capped per room, so that one room got
+  one room's worth over the whole floor. Malls are their own kind now, built
+  from what Knox County's own mall (Muldraugh cell 54_22, 325 rooms over five
+  storeys) is made of: a concourse with the units off it, and fourteen new
+  room kinds - clothes, shoe, electronics, houseware, sewing, corner shop,
+  optometrist, food court and the storerooms behind them. `clothesstore` is
+  the game's spelling, 158 rooms across the county against 9 for the
+  `clothingstore` we were writing, so it carries the better loot table. A big
+  mall lets to 23.8 different trades where the game's lets to about 30.
+
+- **The concourse is a concourse** (`knoxbuild/layout.py`). Knox County's is
+  not a corridor down the middle: it is a wide spine across the building with
+  arms running off it to the far walls, and it covers 27% of its own bounding
+  box. Cut as one band it covered 100% of one and read as a warehouse aisle.
+  Spine and arms are each their own rectangle, and at the size of the game's
+  own mall ours comes out at 27% of the floor against its 25%.
+
+- **Two floors, one space** (`knoxbuild/layout.py`, `knoxbuild/tbx.py`). The
+  game leaves 89% of its mall's ground concourse open to the floor above -
+  5,185 of 5,855 squares have nothing on them at level 1 - so the mall is one
+  room several storeys tall. Ours now cuts the same hole, with a gallery
+  either side and the arms carrying on across it as bridges: without those
+  the hole cut the storey in two and half the units had no way to the stairs.
+  The roof pass counts a hole as built over, or the storey below was roofed;
+  a concourse is written with no ceiling, or BuildingEd laid a lid straight
+  across the opening. The stairs keep their floor and a walkway out to the
+  nearer gallery, rather than standing in mid-air.
+
+- **Nothing of the shops left standing in the mall**
+  (`knoxbuild/layout.py`). A unit is fitted from its own walls outward, and
+  one whose front is the concourse edge laid its wall pieces on the far side
+  of that wall: a furniture shop left fourteen dressers out in the middle of
+  the concourse. The concourse itself is furnished as one - planters, bins,
+  vending - and it is nearly bare on purpose. Knox County's holds 16 pieces
+  of furniture in 5,855 tiles; what fills it is the shopfronts along its
+  edges, not anything standing on it.
+
+- **Castles, forts and grounds the size the game makes them**
+  (`knoxbuild/layout.py`). Everything past a building's room mix falls to the
+  fill, and whichever fill kind has no cap takes the lot: a castle was 5%
+  bedrooms at the size these were tuned on and 63% at the size the landmark
+  growth actually gives them - a keep of nothing but beds. Fixing that
+  exposed the same thing in a stadium, at 39% changing rooms and then 50%
+  cafes. The fill now carries on round its list instead of dropping the whole
+  remainder on the first entry, one room may be cut into at most four, and
+  bedroom and cafe have shares of their own. Police, school, military, shop,
+  house and flats are unmoved.
+
+- **A building is not one colour inside** (`knoxbuild/tbx.py`,
+  `knoxbuild/catalog.py`). InteriorWall has always been written per room and
+  every room was handed the same one, so a building was a single colour
+  throughout however many its style could have used - and the civic styles
+  lead with a blue, which is why every public building was blue. Knox County
+  paints 4.48 different wall sets into one building over 9 in all; a few are
+  dealt out per room kind now, so two bedrooms match and the kitchen does
+  not. Measured back at 4.50.
+
+## 1.4.7.3
+
+- **The logo on the Discord presence** (`knoxpresence.py`). `large_image` was
+  the plain name "knoxmap", which Discord matches against the name the art
+  asset was uploaded under - one uploaded as anything else shows no logo and
+  says nothing about why. KnoxMap reads the application's art assets instead,
+  which are public and need no token, and sends the asset's id: that works
+  whatever it was named and survives a rename. If the lookup cannot be
+  reached - some networks block discord.com - it falls back to the name as
+  before, and `"discord_asset"` in `knoxmap_config.json` (or
+  KNOXMAP_DISCORD_ASSET) sets the id outright. The lookup runs on the
+  presence thread, once an hour at most, and never in front of the window.
+
+
+- **The copies stranded by the old updater update themselves after all**
+  (`.github/workflows/release.yml`). 1.4.7.1 fixed the unpacking, but the
+  updater doing the unpacking is the one already on the PC, so a copy on
+  1.4.7 or earlier still had the broken one and could not be reached by it.
+  An updater that old walks a release in the order its files are stored and
+  stops at the first one Windows will not let it overwrite - KnoxMap.exe,
+  held open by the virus scanner that takes an interest in it (#9) - and
+  everything after that point was left at the old version. KnoxMap.exe is
+  stored last now, so the whole release is already in place when that
+  happens, the fixed updater with it, and the only thing left behind is a
+  launcher that still works. Measured on a real 1.4.7 install running its own
+  updater with the file held open: updater.py, app.py and knoxpresence.py
+  were all left behind before, and all land now. The release stops rather
+  than publishing if the file is not last.
+
+- **Rich Presence is on, and on while nothing is building**
+  (`knoxpresence.py`, `app.py`, `knoxmap.py`, `templates/index.html`). The
+  presence was only ever set from the build progress, so it showed nothing at
+  all until a map started and went blank again the moment one finished -
+  which is most of the time the window is open, and it read as broken.
+  KnoxMap says "Planning a map" from the moment the window opens and the
+  three build lines replace it while a map runs. The map's name is not on
+  there: it is named after the place somebody is building, which is often
+  where they live. It is on by default now and
+  the switch in the header is gone; `"discord_presence": false` in
+  `knoxmap_config.json` or `KNOXMAP_NO_DISCORD=1` still turns it off.
+
+- **The Discord handshake is read** (`knoxpresence.py`). Nothing read
+  Discord's side of the conversation, so a connection Discord had already
+  refused - an application id it does not know - looked live and every update
+  went into the dark. The handshake now has to come back READY before the
+  socket counts as open, and a rejected activity is written to the log
+  instead of being a profile that silently never changes.
+
+- **Towers are towers** (`generator/structures.py`, `generator/osm.py`). A
+  water tower, a lighthouse, a windmill, a clock tower: `classify_building`
+  has no kind for any of them, so every one was ordinary housing - thinned
+  like a house, grown like a house and furnished with a sofa and two
+  bedrooms. They are built as what they are now, the way an obelisk already
+  was, and taken off the building list: a shaft rising from the footprint,
+  and for a water tower the tank spread back out over the legs. `man_made`
+  towers were never downloaded at all unless the mapper also tagged
+  `building=*`, and now they are - except masts and floodlights, because a
+  hundred concrete blocks up the hillside is not a landmark.
+
+- **Castles and grounds** (`knoxbuild/build.py`, `knoxbuild/layout.py`,
+  `knoxbuild/procedural.py`). The same gap one storey down: a castle, a fort,
+  a city gate, a stadium or a sports centre had no kind either, so a keep came
+  out as a bungalow. A castle is a great hall, a chapel, the kitchen that fed
+  everybody, a library and its chambers; a ground is the concourse, changing
+  rooms, a kit store, a first aid room and a counter. `historic=*` is read at
+  last, which is what carried castle and city gate. Stone walls, not
+  clapboard.
+
+- **A room-size setting that moves something** (`knoxbuild/layout.py`).
+  `_room_cap` falls back to MAX_ROOM_AREA for any kind not in KIND_MAX_ROOM,
+  and the split target is clamped to it - so the new kinds sat at 120 tiles
+  whatever KIND_ROOM_SCALE said, and a sweep from 10 to 24 moved the room
+  count by nothing at all. With a cap of their own a castle went from 21 rooms
+  a floor to 9 and a stadium from 21 to 11, median room 45 tiles to 105.
+
+## 1.4.7.1
+
+- **An update no longer gives up on one file it cannot write**
+  (`updater.py`). Windows will not let a file be overwritten while another
+  program has it open, and something usually does for a moment: a virus
+  scanner reading the file it was just handed - KnoxMap.exe above all, which
+  Defender takes an interest in (#9) - OneDrive, the launcher that has not
+  quite finished exiting. One such file ended the whole update, and because
+  CHANGELOG.md is what KnoxMap reads its version out of and went in before it,
+  the install was left reading as the new version with most of the release
+  still the old one, with the download deleted and nothing to try again.
+  Reproduced by holding KnoxMap.exe open over a 1.4.6 install: it came out
+  saying 1.4.7 with `app.py`, `knoxmap.py` and everything else past that file
+  untouched. Each file is now waited for and tried again, and when it still
+  will not go the old one is renamed out of the way instead, which Windows
+  allows where it does not allow a replacement. The version file goes in last,
+  so a run that stops halfway still reads as the old version, keeps its
+  download and applies it on the next start - and after three starts it says
+  so in the window rather than fetching the same zip every few hours.
+
+- **Restart to update appears when it is ready** (`static/js/fx.js`). The
+  window asked the update state once on load and then every ten minutes, and
+  the first check only runs a few seconds after the window opens, so the
+  banner could be ten minutes late on a window somebody had open for five. It
+  asks every five seconds for the first minute now, then eases off.
+
+- **Discord Rich Presence** (`knoxpresence.py`, new). What KnoxMap is doing on
+  your Discord profile: Scooping data from osm, Mapping, Compiling, and
+  nothing once the run is over. Off until you turn it on with the switch in
+  the header - it is on show to everyone on your friends list - and it needs
+  no library: Discord's own client listens on a named pipe. It runs on its own
+  thread and fails quietly, so Discord being closed, restarting or refusing
+  the socket costs a map halfway through nothing at all.
+
+## 1.4.7
+
+- **Rooms reachable, lit, and one flat to a front door**
+  (`knoxbuild/layout.py`). Making a bathroom a dead end pushed whatever it
+  had blocked into the door tree's last resort, and that pass is allowed to
+  join two flats together: 246 doors between neighbouring dwellings and 101
+  flats with two or three front doors of their own. The bathroom rule gives
+  way a pass earlier now and the one-front-door rule holds to the last, which
+  leaves bathrooms dead ends in 96% of cases and neither of the other two at
+  all. Light switches are back in every room - the game lights a room from
+  the switch inside it, so a room without one is dark whatever the sprite
+  count says, and 1,945 rooms had none.
+
+- **No warehouse racking in a house** (`knoxbuild/layout.py`). A house's box
+  room, laundry and closet were furnished out of the storage list, which is
+  steel shelving and packing crates: a stockroom, not a cupboard under the
+  stairs. Homes and flats keep none of it now and get shelving and a chest
+  instead; sheds, barns and warehouses still have theirs. There was already a
+  check for this - it looked at living rooms and bedrooms and not at the three
+  rooms the racking was actually in, and it now looks at every room a house
+  has.
+
+- **Kitchens fitted the way the game fits them** (`knoxbuild/layout.py`).
+  Counters filled both long walls end to end and cupboards were hung above
+  that, for 7.1 pieces of the counter tileset against Knox County's 3.9 over
+  672 kitchens; the figure this was first tuned against, 12 per 10 m2, was
+  every piece of furniture in the room rather than the counters. Counters and
+  cupboards now share one budget scaled to the floor. A microwave went over
+  every cupboard, for 1.8 cooking appliances against the game's 1.2, and is
+  now the exception it is there. The washing machine came off the wishlist
+  proper, which placed one in 80% of kitchens against the game's 16%.
+
+- **A town is not made of one shelf** (`knoxbuild/catalog.py`,
+  `knoxbuild/layout.py`). One sprite, `furniture_shelving_01_001-004`, was on
+  nearly every room's list in every house and came to 3.9% of all the
+  furniture in a town. Knox County spreads its 2,028 household shelving tiles
+  over about a dozen styles, its most-used single shelf being 12% of them. Two
+  more styles, their facings read off the vanilla map the way the porch lights
+  were and confirmed at 84-95% over 27 to 77 sightings each. Down to 1.9%.
+
+- **Rooms the size the building wants them** (`knoxbuild/layout.py`). A pass
+  added to stop a police cell coming out at 24 m2, where Knox County's are 15,
+  was applied to every kind of room and quietly became what set room size
+  everywhere: it cut a school's halls to 43 m2 and its offices to 48 however
+  large the floor had been divided, and no room-size setting could move it. It
+  now only touches the rooms that want to be small. A school floor went from
+  22 rooms to 12 and its median room from 42 m2 to 105.
+
+- **The clocks** (`knoxbuild/layout.py`, `knoxbuild/catalog.py`).
+  location_community_school_01_32-35 is the commonest thing in the game's
+  classrooms and stands against a wall in 93-95% of 800 sightings, so it was
+  added as a school desk. It is a wall clock, and a school came out with 765
+  of them. Taken out again; a classroom is tables and chairs until the real
+  desk in that tileset is identified.
+
+- **Floors reach the rooms that never had them** (`knoxbuild/tbx.py`). A
+  style's floor overrode every room in the building, so a block of flats had
+  one carpet over its bathrooms and its kitchens alike and a school a shop
+  tile throughout - and none of the per-room floors applied to them at all.
+  The style's floor is the fallback now. Knox County gives a bathroom 18
+  different floors and a kitchen 35.
+
+- **A police station, not a house with cells** (`knoxbuild/layout.py`). Its
+  corridor used the house wishlist and its reception the house lobby: 8.2 side
+  tables, 6.9 chests and a sofa to a building. Workplaces have their own list
+  now, and a lamp stands on a filing cabinet. The room mix is a lobby,
+  offices, interrogation, lockers, an armoury with gun lockers, an evidence
+  room and a few cells - offices fell from 36% of the building to 13%.
+
+- **Flats that are flats** (`knoxbuild/layout.py`). A flat was cut towards the
+  building's room size rather than a flat's, so 117 m2 of floor became six
+  rooms. 40% are open plan now - one room that is kitchen and living room
+  both, which is how the game does 44% of its own - 37% are not rectangles,
+  and rooms reached only by walking through another fell from 29% to 20%.
+  Bathrooms are dead ends: 95% have exactly one door.
+
+- **Wall clutter** (`knoxbuild/layout.py`, `knoxbuild/tbx.py`). Measured
+  against Knox County, per 10 m2: interior trim 2.43 against 0.25, corkboards
+  in schools 0.24 against none at all, light switches 0.27 against 0.12, rugs
+  in corridors 1.49 against 0.08. All brought to the game's own rates, and
+  workplaces hang no pictures.
+
+- **Room names the game knows** (`knoxbuild/layout.py`). Houses called their
+  dining room "dining", which Knox County has 11 of against 694 "diningroom" -
+  the loot tables key off the name, so ours spawned nothing. Closets and
+  laundries were never built at all: the rule that makes a small room a closet
+  needed one of 8 tiles or under, and the splitter cannot make a room smaller
+  than 9, so it had never once fired.
 ## 1.4.6
 
 - **A map is not empty because a server said nothing** (`generator/osm.py`).

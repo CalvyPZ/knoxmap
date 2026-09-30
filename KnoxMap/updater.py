@@ -79,9 +79,27 @@ ASSET_NAME = re.compile(
 _PROGRAM = {"windows": "exe", "linux": "AppImage", "macos": "dmg"}
 UPDATE_DIR = BASE_DIR / "update"
 STAGED = UPDATE_DIR / "staged.json"
+# Where a file that will not be overwritten is moved to instead, see
+# _put_in_place(). Inside update/, which an update never touches and which is
+# emptied of these on the next start.
+ASIDE_DIR = UPDATE_DIR / "replaced"
 MANIFEST = BASE_DIR / ".knoxmap_files.json"
 USER_AGENT = f"KnoxMap-updater (+https://github.com/{REPO})"
 CHECK_EVERY_S = 6 * 3600
+
+# knoxlog.version() reads the first heading in CHANGELOG.md, so that one file
+# is what decides which version KnoxMap thinks it is on. It goes in last, so a
+# run that stops halfway still reads as the old version and is tried again
+# rather than claiming a version whose files are half in place.
+VERSION_FILE = "CHANGELOG.md"
+# How many times one file is waited for before the old one is moved aside, how
+# long all that waiting may add up to across the whole release - a scanner
+# working through the folder must not hold the window shut for minutes - and
+# how many starts an update is retried over before it is given up on.
+FILE_TRIES = 5
+FILE_GAP_S = 0.4
+WAIT_BUDGET_S = 20.0
+APPLY_TRIES = 3
 
 # Never replaced or removed by an update, whatever a zip contains.
 PROTECTED = {".venv", ".python", "output", "logs", "vendor", "cache", "update", ".git",
@@ -172,6 +190,16 @@ def check(force: bool = False) -> dict:
         if _state["state"] in ("checking", "downloading"):
             return dict(_state)
     staged = _read_staged()
+    if staged and int(staged.get("tries") or 0) >= APPLY_TRIES:
+        # It downloaded and would not unpack over this copy on several starts,
+        # so say so instead of fetching the same zip again every few hours.
+        # Picking it from the version menu stages it afresh and tries again.
+        _set(state="error", latest=staged["version"],
+             error=(f"KnoxMap {staged['version']} downloaded but could not be unpacked "
+                    "over this copy: something on this PC is holding KnoxMap's files "
+                    "open. Unzip the release from GitHub by hand, or choose the "
+                    "version again to retry."))
+        return status()
     if staged and staged.get("chosen") and Path(staged.get("zip", "")).exists():
         # A version chosen in the window waits for its restart, whether or
         # not automatic updates are on.
@@ -463,9 +491,57 @@ def _digest(path: Path) -> str | None:
         return None
 
 
+def _put_in_place(src: Path, dest: Path, rel: str, budget: list[float]) -> None:
+    """Move src onto dest, whatever is holding dest open at the time.
+
+    Windows will not let a file be overwritten while another program has it
+    open, and something usually does for a moment: a virus scanner reading the
+    file it has just been handed, OneDrive, the launcher that has not quite
+    finished exiting. So this waits and tries again.
+
+    When it still will not go, the old file is renamed out of the way and the
+    new one put in its place. Windows allows a file that is in use to be
+    renamed where it will not allow it to be replaced, which is how KnoxMap.exe
+    - the one file Defender takes an interest in, issue #9 - is updated while a
+    scanner is still looking at it. The old one is deleted on the next start,
+    by then holding nothing open.
+    """
+    last: OSError | None = None
+    for attempt in range(FILE_TRIES):
+        try:
+            os.replace(src, dest)
+            return
+        except OSError as exc:
+            last = exc
+        if budget[0] <= 0:
+            break
+        gap = min(FILE_GAP_S * (attempt + 1), budget[0])
+        budget[0] -= gap
+        time.sleep(gap)
+    aside = ASIDE_DIR / rel
+    aside.parent.mkdir(parents=True, exist_ok=True)
+    if aside.is_dir():
+        shutil.rmtree(aside, ignore_errors=True)
+    else:
+        aside.unlink(missing_ok=True)
+    try:
+        os.replace(dest, aside)
+    except OSError:
+        raise last from None       # nothing left to try: the update is off
+    os.replace(src, dest)
+
+
+def _clear_aside() -> None:
+    """Delete the files a previous update had to move out of the way."""
+    if not ASIDE_DIR.exists():
+        return
+    shutil.rmtree(ASIDE_DIR, ignore_errors=True)
+
+
 def apply_staged() -> bool:
     """Install a downloaded update, if there is one. Returns True when files
     changed, so the caller restarts on the new code."""
+    _clear_aside()
     staged = _read_staged()
     if not staged or not managed():
         return False
@@ -475,6 +551,11 @@ def apply_staged() -> bool:
         return False
     chosen = bool(staged.get("chosen"))
     if not chosen and not enabled():
+        return False
+    tries = int(staged.get("tries") or 0)
+    if tries >= APPLY_TRIES:
+        # Tried on the last few starts and it would not go in. check() says so
+        # in the window rather than downloading it over and over.
         return False
     zip_path = Path(staged.get("zip", ""))
     wanted = (_parse(staged["version"]) != _parse(current_version()) if chosen
@@ -499,12 +580,14 @@ def apply_staged() -> bool:
             # Unpack everything first, then move it into place: a failure while
             # unpacking leaves the working copy as it was.
             z.extract(tmp, [f"KnoxMap/{rel}" for rel in new_files])
+            new_files.sort(key=lambda rel: rel == VERSION_FILE)
+            budget = [WAIT_BUDGET_S]
             for rel in new_files:
                 src = Path(tmp) / "KnoxMap" / rel
                 dest = BASE_DIR / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 mode = src.stat().st_mode
-                os.replace(src, dest)
+                _put_in_place(src, dest, rel, budget)
                 # Keep the executable bit the tarball carried, and put one on
                 # the launchers whatever it said: a zip has no such bit, so
                 # after a Windows-built release ./knoxmap.sh would not run.
@@ -527,8 +610,18 @@ def apply_staged() -> bool:
         MANIFEST.write_text(json.dumps({"version": staged["version"], "files": sorted(new_files)}),
                             encoding="utf-8")
     except Exception:  # noqa: BLE001
-        log.exception("update: applying %s failed; KnoxMap starts as it was", staged["version"])
-        STAGED.unlink(missing_ok=True)
+        # Keep the download and try again on the next start: whatever was
+        # holding a file open is usually gone by then. CHANGELOG.md going in
+        # last means KnoxMap still reads as the old version here, so the next
+        # start sees an update to apply rather than one already done.
+        left = APPLY_TRIES - (tries + 1)
+        log.exception("update: applying %s failed; KnoxMap starts as it was and tries "
+                      "again on the next start (%d more)", staged["version"], max(left, 0))
+        staged["tries"] = tries + 1
+        try:
+            STAGED.write_text(json.dumps(staged), encoding="utf-8")
+        except OSError:
+            STAGED.unlink(missing_ok=True)
         return False
     STAGED.unlink(missing_ok=True)
     zip_path.unlink(missing_ok=True)

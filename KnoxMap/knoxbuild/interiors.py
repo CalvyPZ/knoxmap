@@ -77,6 +77,18 @@ _LIKE = {
     "gardenstore": ("toolstore", {"front": ["plant", "plant"], "wall": ["shop_shelf_wood", "plant"]}),
     "furniturestore": ("generalstore", {"rows": "bookcases", "wall": ["wardrobe", "dresser", "sofa"],
                                         "back": ["double_bed", "wardrobe2"], "front": ["armchair"]}),
+    # The units Knox County's mall is let out to. clothesstore is the game's
+    # own spelling - 158 rooms across the county against 9 for the
+    # clothingstore we were writing - so it carries the better loot table.
+    "clothesstore": ("clothingstore", {}),
+    "shoestore": ("clothingstore", {"rows": "shop_shelf_wood",
+                                    "wall": ["shop_shelf_wood", "shop_display"],
+                                    "front": ["mirror"]}),
+    "sewingstore": ("clothingstore", {"rows": "shop_display", "wall": ["shop_shelf_wood"]}),
+    "electronicsstore": ("camerastore", {"wall": ["shop_shelf", "shop_case"]}),
+    "housewarestore": ("generalstore", {"wall": ["shop_shelf_wood", "dresser"]}),
+    "cornerstore": ("conveniencestore", {}),
+    "optometrist": ("pharmacy", {"front": ["mirror"]}),
 }
 # What may stand in an aisle, besides the piece "rows" names.
 #
@@ -494,8 +506,10 @@ def bed_against_wall(plan, idx: int, room, slots, occupied: set, door_tiles: set
 # home kitchen. Knox County's own are booth sets and tables with their chairs,
 # a counter across the back, and a kitchen of steel counters, commercial
 # ovens, a griddle and fryers.
+# The food court is a dining room the size of a car park, ringed by the
+# kitchens that serve it - 1,601 tiles of it in Knox County's mall.
 DINING_ROOMS = {"restaurantdining", "italianrestaurant", "chineserestaurant", "restaurant",
-                "cafe", "icecream", "bar"}
+                "cafe", "icecream", "bar", "foodcourt"}
 # A booth, its table and the facing booth, as the game's own set lays them.
 BOOTH_SETS = {
     "diner": [("diner_booth", 0, 0, "W"), ("diner_table", 0, 1, "W"), ("diner_booth", 0, 2, "E")],

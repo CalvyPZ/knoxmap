@@ -221,6 +221,53 @@ FLOOR_TILE_PALE = 11
 FLOOR_TILE_CHECK = 12
 FLOOR_LINO = 13
 
+# The floors Knox County actually lays, counted over 86,045 interior tiles in
+# eight town cells: 47 different ones, against the six above. The two carpets
+# above - carpet_01_000 and _008 - are not among the ones it uses at all; its
+# bedroom carpets are carpet_01_9 to _12, and its commonest floor of any kind
+# is tilesandwood_01_42, a third of every interior tile in the county.
+# Appended to a building's own tile table by knoxbuild/tbx.py, the way a
+# style's floor is, so they cost nothing in buildings that do not use them.
+
+EXTRA_FLOORS = {
+    "wood_pale":    "floors_interior_tilesandwood_01_42",
+    "wood_mid":     "floors_interior_tilesandwood_01_45",
+    "wood_dark":    "floors_interior_tilesandwood_01_51",
+    "wood_grey":    "floors_interior_tilesandwood_01_49",
+    "carpet_beige": "floors_interior_carpet_01_9",
+    "carpet_green": "floors_interior_carpet_01_10",
+    "carpet_brown": "floors_interior_carpet_01_11",
+    "carpet_grey":  "floors_interior_carpet_01_12",
+    "carpet_red":   "floors_interior_carpet_01_1",
+    "carpet_blue":  "floors_interior_carpet_01_2",
+    "tile_white":   "floors_interior_tilesandwood_01_11",
+    "tile_grey":    "floors_interior_tilesandwood_01_5",
+    "tile_cream":   "floors_interior_tilesandwood_01_12",
+    "tile_small":   "floors_interior_tilesandwood_01_7",
+    "hall_runner":  "floors_interior_tilesandwood_01_28",
+    "office_grey":  "floors_interior_tilesandwood_01_44",
+    # Civic floors, measured in the buildings that hold a policeoffice. A
+    # station is hard floor throughout: its cells are tilesandwood_01_18 and
+    # nothing else, its corridors _18 and _17, its lockers and lavatories _17.
+    "civic_hall":   "floors_interior_tilesandwood_01_18",
+    "civic_pale":   "floors_interior_tilesandwood_01_17",
+    "civic_grey":   "floors_interior_tilesandwood_01_21",
+    "civic_dark":   "floors_interior_tilesandwood_01_31",
+    "civic_scuff":  "floors_interior_tilesandwood_01_15",
+    "civic_worn":   "floors_interior_tilesandwood_01_3",
+    # School floors, measured over its classrooms, gyms and lobbies: all
+    # tilesandwood, none of them the shop tile the school style forced on
+    # every room. A gym is _42 in every one; a library _41.
+    "school_pale":  "floors_interior_tilesandwood_01_46",
+    "school_wood":  "floors_interior_tilesandwood_01_41",
+    "school_warm":  "floors_interior_tilesandwood_01_43",
+}
+
+
+def floor_entry(name: str) -> dict:
+    """One EXTRA_FLOORS name as a tile-table entry."""
+    return {"category": "floors", "tiles": {"Floor": EXTRA_FLOORS[name]}}
+
 ROOF_CAP = 14
 ROOF_SLOPE = 15
 ROOF_TOP = 16
@@ -269,6 +316,20 @@ FURNITURE = {'bed': {'W': {'0,0': 'furniture_bedding_01_002', '1,0': 'furniture_
            'N': {'0,0': 'furniture_shelving_01_001'},
            'E': {'0,0': 'furniture_shelving_01_003'},
            'S': {'0,0': 'furniture_shelving_01_004'}},
+ # Two more household shelving styles, so a town is not one wooden shelf. The
+ # facings were read off the vanilla map the way the porch lights were - for
+ # every shelf standing in a room with a wall on exactly one side, that side -
+ # and came back N/W/E/S in order at 84-95% over 27 to 77 sightings each.
+ # furniture_shelving_01_046 is the one the map is too thin on to confirm; it
+ # is the E of its set, which the other three of that set settle.
+ 'shelf_1': {'N': {'0,0': 'furniture_shelving_01_040'},
+             'W': {'0,0': 'furniture_shelving_01_041'},
+             'E': {'0,0': 'furniture_shelving_01_042'},
+             'S': {'0,0': 'furniture_shelving_01_043'}},
+ 'shelf_2': {'N': {'0,0': 'furniture_shelving_01_044'},
+             'W': {'0,0': 'furniture_shelving_01_045'},
+             'E': {'0,0': 'furniture_shelving_01_046'},
+             'S': {'0,0': 'furniture_shelving_01_047'}},
  'fridge': {'W': {'0,0': 'appliances_refrigeration_01_001'},
             'N': {'0,0': 'appliances_refrigeration_01_000'},
             'E': {'0,0': 'appliances_refrigeration_01_003'},
@@ -371,6 +432,38 @@ FURNITURE = {'bed': {'W': {'0,0': 'furniture_bedding_01_002', '1,0': 'furniture_
                           '0,1': 'furniture_bedding_01_052',
                           '1,0': 'furniture_bedding_01_055',
                           '1,1': 'furniture_bedding_01_054'}},
+ # The basin a public lavatory has. Knox County uses one room name for every
+ # bathroom, so what tells a public one from a household one is the fitting:
+ # a house has fixtures_sinks_01_0-3 at 1.03 a room and a public bathroom at
+ # 0.08, where the public one has these instead. Its four facings are not a
+ # quad - they sit at 12, 13, 28 and 29 - and each was read off the map (N 88%
+ # of 498, W 82% of 513, S 87% of 318, E 84% of 271). The same scan returned
+ # kitchen_sink's own four facings at 99-100%, which is how it is known to be
+ # reading the map right.
+ # The gun locker a police gun store has: furniture_storage_02_8/9/10 are
+ # what Knox County's 14 of them hold, at 0.5, 0.43 and 0.21 a room. Facings:
+ # 8 came back N at 91% of 58 sightings and 11 E at 94% of 16; 9 is W on a
+ # 57% plurality of 35, and 10 is S by what is left. That order - N, W, E, S -
+ # is the one quad 0-3 of the same tileset was measured at (86%, 86%, 74%,
+ # 90%), so two of its quads agree on it. Rare rooms give thin samples; this
+ # is as far as the map settles it.
+ # The school desk. Knox County furnishes a classroom out of
+ # location_community_school at 2.97 pieces per 10 m2 - more than half of
+ # everything in the room - and we had no role for that tileset at all, which
+ # is why our classrooms were chairs and a bookcase. All four facings read off
+ # the map at 93-95%, the two common ones over 800 and 776 sightings.
+ 'school_desk': {'N': {'0,0': 'location_community_school_01_032'},
+                 'W': {'0,0': 'location_community_school_01_033'},
+                 'E': {'0,0': 'location_community_school_01_035'},
+                 'S': {'0,0': 'location_community_school_01_034'}},
+ 'gun_locker': {'N': {'0,0': 'furniture_storage_02_008'},
+                'W': {'0,0': 'furniture_storage_02_009'},
+                'E': {'0,0': 'furniture_storage_02_011'},
+                'S': {'0,0': 'furniture_storage_02_010'}},
+ 'sink_public': {'N': {'0,0': 'fixtures_sinks_01_012'},
+                 'W': {'0,0': 'fixtures_sinks_01_013'},
+                 'E': {'0,0': 'fixtures_sinks_01_029'},
+                 'S': {'0,0': 'fixtures_sinks_01_028'}},
  'kitchen_sink': {'W': {'0,0': 'fixtures_sinks_01_008'},
                   'N': {'0,0': 'fixtures_sinks_01_009'},
                   'E': {'0,0': 'fixtures_sinks_01_010'},
@@ -1526,6 +1619,8 @@ FURNITURE_LAYERS = {'armchair': 'Furniture',
  'rug_wide': 'FloorFurniture',
  'shag_rug': 'FloorFurniture',
  'shelf': 'Furniture',
+ 'shelf_1': 'Furniture',
+ 'shelf_2': 'Furniture',
  'shop_aisle': 'Furniture',
  'shop_aisle_red': 'Furniture',
  'shop_bin': 'Furniture',
@@ -1546,6 +1641,8 @@ FURNITURE_LAYERS = {'armchair': 'Furniture',
  'sidetable': 'Furniture',
  'sink': 'Furniture',
  'sink_cream': 'Furniture',
+ 'gun_locker': 'Furniture',
+ 'sink_public': 'Furniture',
  'sofa': 'Furniture',
  'sofa_1': 'Furniture',
  'sofa_10': 'Furniture',
@@ -7061,7 +7158,30 @@ ERIKA_SIGNS = {'N': [['signs_erika_01_000',
        ['signs_erika_02_027', 'signs_erika_02_026', 'signs_erika_02_025', 'signs_erika_02_024']]}
 
 # Official room colours, straight from the tools' RoomNames.txt.
-ROOM_COLORS = {'livingroom': '233 112 19',
+ROOM_COLORS = {
+               # The rooms Knox County's own mall is made of (Muldraugh cell
+               # 54_22, 325 rooms). Every unit in it has a back storeroom of
+               # its own, and the food court is ringed by kitchens.
+               'concourse': '170 170 170',
+               'foodcourt': '236 156 92',
+               'clothesstore': '198 140 196',
+               'clothesstorage': '150 110 150',
+               'shoestore': '176 124 160',
+               'electronicsstore': '110 150 186',
+               'housewarestore': '156 170 130',
+               'sewingstore': '186 150 170',
+               'cornerstore': '200 180 120',
+               'optometrist': '140 190 190',
+               'dressingrooms': '214 180 214',
+               'departmentstorage': '140 130 120',
+               'giftstorage': '150 140 130',
+               'toystorage': '145 135 125',
+               'bookstorage': '135 130 120',
+               'armory': '120 120 140',
+               'lockerroom': '120 140 150',
+               'evidenceroom': '130 125 115',
+               'openplan': '233 112 19',
+               'livingroom': '233 112 19',
  'kitchen': '246 172 101',
  'bedroom': '26 26 52',
  'bathroom': '15 66 251',
@@ -11409,6 +11529,68 @@ HOUSE_STYLES = [{'name': 'clapboard',
                       'NorthWindow': 'overlay_grime_wall_01_009',
                       'WestDoor': 'overlay_grime_wall_01_010',
                       'NorthDoor': 'overlay_grime_wall_01_011'}}}]
+
+# Every interior wall set the house styles carry, one of each. Knox County
+# paints 4.48 different ones into a single building - a kitchen is not the
+# colour of the bedroom next door - and has 9 in all, which is what these are.
+# tbx.py deals a few of them out per room kind (INTERIOR_WALLS_PER_BUILDING).
+def _interior_walls() -> list[dict]:
+    out, seen = [], set()
+    for style in HOUSE_STYLES:
+        entry = style.get("interior")
+        if not entry:
+            continue
+        key = entry["tiles"].get("West")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(entry)
+    return out
+
+
+# The interior wall styles Knox County itself uses, read off its compiled
+# cells rather than guessed at: a style is four tiles (west, north, and the
+# two corners) at a base that falls on a 16, with its window and door tiles
+# eight and ten further on. Only the ones whose whole set the game uses are
+# here - a style with no window or door tile in it would leave a hole in a
+# wall. Its mall alone paints 117 different wall tiles where we managed 27.
+GAME_WALL_STYLES = [
+    ("walls_commercial_01", 32), ("walls_commercial_02", 16),
+    ("walls_commercial_02", 32), ("walls_commercial_03", 16),
+    ("walls_interior_house_01", 0), ("walls_interior_house_01", 16),
+    ("walls_interior_house_01", 32), ("walls_interior_house_01", 48),
+    ("walls_interior_house_02", 0), ("walls_interior_house_02", 16),
+    ("walls_interior_house_02", 48),
+    ("walls_interior_house_03", 0), ("walls_interior_house_03", 16),
+    ("walls_interior_house_03", 32), ("walls_interior_house_03", 48),
+    ("walls_interior_house_04", 0), ("walls_interior_house_04", 16),
+    ("walls_interior_house_04", 32),
+]
+
+
+def _wall_style(sheet: str, base: int) -> dict:
+    """One (sheet, base) as an interior-wall tile-table entry."""
+    def t(n: int) -> str:
+        return f"{sheet}_{base + n:03d}"
+    return {"category": "interior_walls",
+            "tiles": {"West": t(0), "North": t(1), "NorthWest": t(2),
+                      "SouthEast": t(3), "WestWindow": t(8), "NorthWindow": t(9),
+                      "WestDoor": t(10), "NorthDoor": t(11)}}
+
+
+def _all_interior_walls() -> list[dict]:
+    out = _interior_walls()
+    seen = {e["tiles"]["West"] for e in out}
+    for sheet, base in GAME_WALL_STYLES:
+        entry = _wall_style(sheet, base)
+        if entry["tiles"]["West"] not in seen:
+            seen.add(entry["tiles"]["West"])
+            out.append(entry)
+    return out
+
+
+INTERIOR_WALLS = _all_interior_walls()
+
 
 # Materials for buildings OSM tags as something particular.
 SPECIAL_STYLES = {'school': {'name': 'school',

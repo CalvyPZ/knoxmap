@@ -260,6 +260,10 @@ second without rebuilding, then compile again so the game sees the change.
   the background and the top of the window says **Restart to update**; closing
   and opening KnoxMap installs it too. Your maps, logs and settings are kept.
   To turn it off, add `"auto_update": false` to `knoxmap_config.json`.
+- **Discord status.** What KnoxMap is doing - Planning a map, Scooping data
+  from osm, Mapping, Compiling - shows on your Discord profile, where your
+  friends list can see it. To turn it off, add `"discord_presence": false` to
+  `knoxmap_config.json`, or start KnoxMap with `KNOXMAP_NO_DISCORD=1`.
 
 ## Compatibility
 
