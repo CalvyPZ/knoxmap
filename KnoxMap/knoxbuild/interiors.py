@@ -138,36 +138,32 @@ def store_kind(rng: random.Random, hint: str | None = None) -> str:
     return rng.choices(kinds, weights=[STORE_WEIGHTS[k] for k in kinds])[0]
 
 
+_L = None
+
+
 def _layout():
-    from . import layout
-    return layout
+    """The layout module, imported once. Hot loops used to import it per tile."""
+    global _L
+    if _L is None:
+        from . import layout as layout_mod
+        _L = layout_mod
+    return _L
 
 
-def _cells(plan, idx: int, room) -> set[tuple[int, int]]:
-    g = plan.grid
-    return {(x, y) for y in range(room.y0, room.y1 + 1) for x in range(room.x0, room.x1 + 1)
-            if g[y, x] == idx}
-
-
-def _front_side(plan, idx: int, cells: set, street: str | None) -> str:
+def _front_side(plan, idx: int, counts: dict, street: str | None) -> str:
     """The side of the room its shop front is on: the street side if it has an
     outside wall there, else the side with its outside door, else the side
-    with the most outside wall."""
+    with the most outside wall.
+
+    `counts` is the outside-wall tally already made from the room's slots.
+    """
     L = _layout()
-    counts = {s: 0 for s in STEP}
-    edge = {"N": lambda x, y: (x, y, "N"), "S": lambda x, y: (x, y + 1, "N"),
-            "W": lambda x, y: (x, y, "W"), "E": lambda x, y: (x + 1, y, "W")}
-    for x, y in cells:
-        for s, (dx, dy) in STEP.items():
-            # A wall shared with the next building is no shop front.
-            if not L._room_at(plan, x + dx, y + dy) and edge[s](x, y) not in plan.party:
-                counts[s] += 1
     if street in counts and counts[street] >= 3:
         return street
     for x, y, d in plan.doors:
         for inside, outside, side in (((x, y), (x - 1, y) if d == "W" else (x, y - 1), "W" if d == "W" else "N"),
                                       ((x - 1, y) if d == "W" else (x, y - 1), (x, y), "E" if d == "W" else "S")):
-            if inside in cells and not L._room_at(plan, *outside):
+            if L._room_at(plan, *inside) == idx and not L._room_at(plan, *outside):
                 return side
     return max(counts, key=lambda s: counts[s])
 
@@ -175,11 +171,9 @@ def _front_side(plan, idx: int, cells: set, street: str | None) -> str:
 class Frame:
     """Room coordinates as (along the front, depth in from the front)."""
 
-    def __init__(self, cells: set, front: str):
+    def __init__(self, front: str, x0: int, x1: int, y0: int, y1: int):
         self.front = front
-        xs = [x for x, _ in cells]
-        ys = [y for _, y in cells]
-        self.x0, self.x1, self.y0, self.y1 = min(xs), max(xs), min(ys), max(ys)
+        self.x0, self.x1, self.y0, self.y1 = x0, x1, y0, y1
         self.along_x = front in ("N", "S")
         self.length = (self.x1 - self.x0 + 1) if self.along_x else (self.y1 - self.y0 + 1)
         self.depth = (self.y1 - self.y0 + 1) if self.along_x else (self.x1 - self.x0 + 1)
@@ -201,10 +195,16 @@ def _fits(plan, idx, role, x, y, orient, blocked) -> list[tuple[int, int]] | Non
     cells = L._cells_for(role, x, y, orient)
     occ = getattr(plan, "occ", None)
     if occ is not None:
-        h, w = plan.height, plan.width
-        g = plan.grid
+        ids = plan._ids
+        if ids is None:
+            ids = L._bind_ids(plan)
+        mv = plan._occ_mv
+        if mv is None:
+            mv = L._bind_occ(plan)
+        w, h = plan.width, plan.height
         for cx, cy in cells:
-            if not (0 <= cx < w and 0 <= cy < h) or g[cy, cx] != idx or occ[cy, cx]:
+            if (cx < 0 or cy < 0 or cx >= w or cy >= h
+                    or ids[cy * w + cx] != idx or mv[cy * w + cx]):
                 return None
         return cells
     if any(c in blocked or L._room_at(plan, *c) != idx for c in cells):
@@ -212,48 +212,77 @@ def _fits(plan, idx, role, x, y, orient, blocked) -> list[tuple[int, int]] | Non
     return cells
 
 
+def _still_free(plan, cells) -> bool:
+    """Whether `cells` are still clear. The room test already passed."""
+    mv = plan._occ_mv
+    if mv is None:
+        mv = _layout()._bind_occ(plan)
+    w = plan.width
+    for cx, cy in cells:
+        if mv[cy * w + cx]:
+            return False
+    return True
+
+
 def furnish_store(plan, idx: int, room, rng: random.Random, door_tiles: set,
-                  keep_clear: set, street: str | None) -> bool:
-    """Fit out a shop's sales floor. False if the room is too small to."""
+                  keep_clear: set, street: str | None, walls: dict,
+                  outside: dict) -> bool:
+    """Fit out a shop's sales floor. False if the room is too small to.
+
+    `walls` and `outside` come from the slots the room loop already built.
+    """
     L = _layout()
     spec = STORES[room.kind]
-    cells = _cells(plan, idx, room)
-    if len(cells) < MIN_SALES_FLOOR:
+    box = L._room_box(plan, idx, room)
+    if box is None or box[0] < MIN_SALES_FLOOR:
         return False
-    front = _front_side(plan, idx, cells, street)
-    frame = Frame(cells, front)
+    _count, x0, x1, y0, y1 = box
+    front = _front_side(plan, idx, outside, street)
+    frame = Frame(front, x0, x1, y0, y1)
     blocked = set(keep_clear)
     # A tile's clearance round every door into the room.
     for dx, dy in door_tiles:
-        if (dx, dy) in cells:
+        if L._room_at(plan, dx, dy) == idx:
             blocked |= {(dx + i, dy + j) for i in (-1, 0, 1) for j in (-1, 0, 1)}
     # The occupancy grid is what _fits reads. Doors and the flight are already
-    # on it; the halo around each door is only for this shop.
+    # on it; the halo around each door is only for this shop, and only on
+    # this shop's own tiles.
     if getattr(plan, "occ", None) is not None:
-        L._occ_mark(plan, blocked, L.B_EXTRA)
+        L._occ_mark_room(plan, idx, blocked, L.B_EXTRA)
     placed: set[tuple[int, int]] = set()
+    use_grid = getattr(plan, "occ", None) is not None
 
-    def put(role, x, y, orient, ring=False) -> bool:
-        got = _fits(plan, idx, role, x, y, orient, blocked | placed)
+    def put(role, x, y, orient, ring=False, got=None) -> bool:
         if got is None:
-            return False
+            got = _fits(plan, idx, role, x, y, orient, blocked | placed)
+            if got is None:
+                return False
+        elif use_grid:
+            if not _still_free(plan, got):
+                return False
+        else:
+            got = _fits(plan, idx, role, x, y, orient, blocked | placed)
+            if got is None:
+                return False
         plan.furniture.append((role, x, y, orient))
-        placed.update(got)
         if ring:
             ring_cells = [(cx + i, cy + j) for cx, cy in got
                           for i in (-1, 0, 1) for j in (-1, 0, 1)]
-            placed.update(ring_cells)
         else:
             ring_cells = ()
-        if getattr(plan, "occ", None) is not None:
+        if use_grid:
             L._occ_mark(plan, got, L.B_ITEM)
             if ring:
-                L._occ_mark(plan, ring_cells, L.B_ITEM)
+                L._occ_mark_room(plan, idx, ring_cells, L.B_ITEM)
+        else:
+            placed.update(got)
+            if ring:
+                placed.update(ring_cells)
         return True
 
     # The till counter: just inside the door, in a short run parallel to the
     # shop front, with its register, and room behind it for the cashier.
-    doors_in = [(x, y) for x, y in door_tiles if (x, y) in cells]
+    doors_in = [(x, y) for x, y in door_tiles if L._room_at(plan, x, y) == idx]
     front_tiles = [(a, frame.xy(a, 0)) for a in range(frame.length)]
     door_along = next((a for a, xy in front_tiles if xy in doors_in), frame.length // 2)
     counter = spec["counter"]
@@ -262,22 +291,32 @@ def furnish_store(plan, idx: int, room, rng: random.Random, door_tiles: set,
     for start in (door_along + 2, door_along - 1 - run, 1, frame.length - run - 1):
         spots = [frame.xy(start + k, 2) for k in range(run)]
         orient = L._facing(counter, back_to)
-        if all(_fits(plan, idx, counter, x, y, orient, blocked | placed) for x, y in spots):
-            for x, y in spots:
-                put(counter, x, y, orient)
-            mx, my = spots[len(spots) // 2]
-            plan.furniture.append(("register", mx, my, L._facing("register", back_to)))
-            # The cashier's tile behind, and a tile in front for customers.
+        fitted = []
+        for x, y in spots:
+            got = _fits(plan, idx, counter, x, y, orient, blocked | placed)
+            if got is None:
+                fitted = None
+                break
+            fitted.append((x, y, got))
+        if not fitted:
+            continue
+        for x, y, got in fitted:
+            put(counter, x, y, orient, got=got)
+        mx, my = spots[len(spots) // 2]
+        plan.furniture.append(("register", mx, my, L._facing("register", back_to)))
+        # The cashier's tile behind, and a tile in front for customers.
+        # _fits ignores this set once the occupancy grid is up, which it is
+        # for every furnished storey. Kept for a plan with no grid.
+        if not use_grid:
             placed.update(frame.xy(start + k, d) for k in range(-1, run + 1) for d in (1, 3))
-            break
+        break
 
     # Along the walls. Each wall is walked tile by tile, fitting one piece after
     # another so they stand in a line.
     def fill_wall(side: str, roles: list[str]):
         if not roles:
             return
-        line = sorted((c for c in cells if L._room_at(plan, c[0] + STEP[side][0], c[1] + STEP[side][1]) != idx),
-                      key=lambda c: (c[0], c[1]))
+        line = walls.get(side) or []
         on_wall = set(line)
         k = 0
         i = 0
@@ -295,10 +334,10 @@ def furnish_store(plan, idx: int, room, rng: random.Random, door_tiles: set,
                 continue
             # Pieces grow east or south from their anchor; on a south or east
             # wall the anchor is the piece's own first tile all the same.
-            if _layout()._is_wall_piece(role):
-                if _layout()._wall_edge(x, y, side) not in plan.wall_pieces and \
-                        put(role, x, y, orient):
-                    plan.wall_pieces.add(_layout()._wall_edge(x, y, side))
+            if L._is_wall_piece(role):
+                edge = L._wall_edge(x, y, side)
+                if edge not in plan.wall_pieces and put(role, x, y, orient):
+                    plan.wall_pieces.add(edge)
                     k += 1
                 i += 1
                 continue
@@ -480,8 +519,8 @@ def bed_against_wall(plan, idx: int, room, slots, occupied: set, door_tiles: set
                 edge_x = x
                 flank = [(edge_x, ay - 1), (edge_x, ay + h + 1)]
             plan.furniture.append((bed, ax, ay, orient))
-            occupied.update(got)
-            occupied.update(foot)
+            L._note(plan, occupied, got)
+            L._note(plan, occupied, foot)
             L._occ_mark(plan, got, L.B_ITEM)
             L._occ_mark(plan, foot, L.B_ITEM)
             # A bedside table with no sprite for this wall is left out rather
@@ -495,7 +534,7 @@ def bed_against_wall(plan, idx: int, room, slots, occupied: set, door_tiles: set
                            and L._room_at(plan, *c) == idx
                            for c in tc):
                         plan.furniture.append((side_table, fx, fy, t_or))
-                        occupied.update(tc)
+                        L._note(plan, occupied, tc)
                         L._occ_mark(plan, tc, L.B_ITEM)
             return True
     return False
@@ -593,7 +632,7 @@ def _wall_sets(plan, idx: int, room, group, placed_cells: set, blocked: set) -> 
                    for c in cells):
                 for r, dx, dy, o in pieces:
                     plan.furniture.append((r, ox + dx, oy + dy, o))
-                placed_cells.update(cells)
+                L._note(plan, placed_cells, cells)
                 L._occ_mark(plan, cells, L.B_ITEM)
                 n += 1
                 t += WALL_SET_EVERY
@@ -603,22 +642,26 @@ def _wall_sets(plan, idx: int, room, group, placed_cells: set, blocked: set) -> 
 
 
 def furnish_dining(plan, idx: int, room, rng: random.Random, occupied: set,
-                   keep_clear: set, door_tiles: set, street: str | None) -> list[str]:
+                   keep_clear: set, door_tiles: set, street: str | None,
+                   outside: dict) -> list[str]:
     """Fit out a dining room, café or bar. Returns what is left for the walls."""
     L = _layout()
     style = eatery_style(plan, idx, room)
-    cells = _cells(plan, idx, room)
     # The doorways and the tile either side of each: a small café cannot give
     # a whole ring of floor to every door.
     blocked = set(keep_clear) | set(door_tiles)
     for x, y, d in plan.doors:
         blocked |= {(x - 1, y), (x + 1, y)} if d == "N" else {(x, y - 1), (x, y + 1)}
     if getattr(plan, "occ", None) is not None:
-        L._occ_mark(plan, blocked, L.B_EXTRA)
+        L._occ_mark_room(plan, idx, blocked, L.B_EXTRA)
 
     # The counter across the back, away from the street door.
-    front = _front_side(plan, idx, cells, street)
-    frame = Frame(cells, front)
+    front = _front_side(plan, idx, outside, street)
+    box = L._room_box(plan, idx, room)
+    if box is None:
+        return ["plant", "painting", "plant"]
+    _count, x0, x1, y0, y1 = box
+    frame = Frame(front, x0, x1, y0, y1)
     counter = BACK_COUNTERS.get(style, BACK_COUNTERS["tables"])
     counter = [c for c in counter if c in C.FURNITURE]
     back = OPPOSITE[front]
@@ -634,13 +677,13 @@ def furnish_dining(plan, idx: int, room, rng: random.Random, occupied: set,
                 a += 1
                 continue
             plan.furniture.append((role, x, y, orient))
-            occupied.update(got)
+            L._note(plan, occupied, got)
             L._occ_mark(plan, got, L.B_ITEM)
             a += len(got)
         # Room behind the counter to stand, and in front to queue.
         standing = [frame.xy(a2, depth - k) for a2 in range(start - 1, a + 1) for k in (1,)]
-        occupied.update(standing)
-        L._occ_mark(plan, standing, L.B_ITEM)
+        L._note(plan, occupied, standing)
+        L._occ_mark_room(plan, idx, standing, L.B_ITEM)
 
     # Seating: sets out in the floor where there is room for an aisle all
     # round, else against the long wall.
