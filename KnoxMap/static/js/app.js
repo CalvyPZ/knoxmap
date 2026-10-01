@@ -1363,6 +1363,9 @@ const SIDE_LABELS = {
   export: 'Export',
 };
 
+// Edit sits between Generate and Export. Off until that step is ready again.
+const EDIT_STEP_ENABLED = false;
+
 function showMaster(master) {
   sideMaster = master;
   for (const panel of document.querySelectorAll('.side-panel')) {
@@ -1378,6 +1381,7 @@ function sideSteps() {
   for (const panel of document.querySelectorAll('.side-panel')) {
     const master = panel.dataset.master;
     if (!master || seen.has(master)) continue;
+    if (!EDIT_STEP_ENABLED && master === 'edit') continue;
     seen.add(master);
     steps.push({ master });
   }
