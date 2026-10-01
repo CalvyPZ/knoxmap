@@ -14,6 +14,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from urllib.parse import urljoin
 
 import requests
 
@@ -164,23 +165,113 @@ def _stamp(response: requests.Response) -> dict:
     }
 
 
-def _remote_changed(url: str, meta: dict, timeout: int) -> requests.Response | None:
-    """HEAD the file. None when the local stamp still matches."""
+# A "...-latest" name is not the file. Following every redirect runs into a
+# loop, so these are read one hop at a time and only from a GET.
+_REDIRECTS = (301, 302, 303, 307, 308)
+
+
+def _https(url: str) -> str:
+    """The redirect names an http URL. The same path is served on https."""
+    marker = "://download.geofabrik.de/"
+    if url.startswith("http" + marker):
+        return "https" + url[4:]
+    return url
+
+
+def _file_url(url: str) -> str:
+    """A dated extract is published with a trailing slash, and that URL 404s.
+
+    The "...-latest" name with a slash is a real hop, so that slash stays.
+    """
+    url = _https(url)
+    if url.endswith(".osm.pbf/") and not url.endswith("-latest.osm.pbf/"):
+        return url[:-1]
+    return url
+
+
+def _probe_headers() -> dict:
+    """Bypass the proxy cache. A HEAD of a latest name is cached as a 301 to
+    itself, and the next GET is then served that loop instead of the dated file."""
+    headers = dict(_HEADERS)
+    headers["Cache-Control"] = "no-cache"
+    headers["Pragma"] = "no-cache"
+    return headers
+
+
+def _settle(url: str, timeout: int) -> str:
+    """The URL that holds the bytes.
+
+    A "...-latest" extract answers GET with 301 to the same path plus a
+    slash, and that slashed name answers with the dated file. Following
+    either hop automatically runs into the cached slash loop, which is the
+    "Exceeded 30 redirects" failure. Each hop is read on its own. A HEAD is
+    used only once the name is already a real file; heading the latest name
+    is what poisons the cache.
+    """
+    current = _file_url(url)
+    seen: set[str] = set()
+    for _ in range(5):
+        if current in seen:
+            break
+        seen.add(current)
+        if "-latest." not in current and not current.endswith("/"):
+            head = requests.head(
+                current, headers=_HEADERS, timeout=timeout, allow_redirects=False)
+            try:
+                if head.status_code not in _REDIRECTS:
+                    head.raise_for_status()
+                    return current
+            finally:
+                head.close()
+        response = requests.get(
+            current, headers=_probe_headers(), timeout=timeout,
+            allow_redirects=False, stream=True)
+        try:
+            if response.status_code not in _REDIRECTS:
+                response.raise_for_status()
+                return current
+            location = (response.headers.get("Location") or "").strip()
+        finally:
+            response.close()
+        if not location:
+            return current
+        nxt = _file_url(urljoin(current, location))
+        if nxt == current:
+            slashed = current if current.endswith("/") else current + "/"
+            if slashed in seen:
+                return current
+            current = slashed
+            continue
+        current = nxt
+    return current
+
+
+def _same_file(url: str, meta: dict, timeout: int) -> bool | None:
+    """Whether the settled file is the one already recorded.
+
+    True when the stamp matches, False when it does not, None when the
+    check itself failed. Redirects are not followed: a dated file that has
+    started redirecting is a different file.
+    """
     try:
-        head = requests.head(url, headers=_HEADERS, timeout=timeout, allow_redirects=True)
+        head = requests.head(url, headers=_HEADERS, timeout=timeout, allow_redirects=False)
+        if head.status_code in _REDIRECTS:
+            head.close()
+            return False
         head.raise_for_status()
     except requests.RequestException:
         return None
     remote = _stamp(head)
+    head.close()
     if meta.get("last_modified") and meta.get("last_modified") == remote["last_modified"]:
-        return None
+        return True
     if not remote["last_modified"] and meta.get("etag") and meta.get("etag") == remote["etag"]:
-        return None
+        return True
     if not remote["last_modified"] and not remote["etag"]:
         # No stamp to compare. A file fetched today is this daily.
         if meta.get("fetched") and time.time() - float(meta["fetched"]) < 20 * 3600:
-            return None
-    return head
+            return True
+    return False
 
 
 class _Rate:
@@ -210,11 +301,34 @@ def _refresh(url: str, path: str, meta_path: str, timeout: int,
     while the file comes down. total is 0 when the server does not say.
     """
     meta = _meta(meta_path)
-    if os.path.exists(path) and _remote_changed(url, meta, timeout) is None and meta:
+    try:
+        settled = _settle(url, timeout)
+    except requests.RequestException:
+        if os.path.exists(path):
+            return False
+        raise
+    # The dated name is the daily. The same name is the same file, so a
+    # later build does not download it again.
+    if os.path.exists(path) and meta.get("url") == settled:
         return False
+    # A copy saved before the dated name was remembered. Its stamp still
+    # matches the settled file when that file is the one already on disk.
+    if os.path.exists(path) and meta and not meta.get("url"):
+        same = _same_file(settled, meta, timeout)
+        if same is None:
+            return False
+        if same:
+            meta["url"] = settled
+            with open(meta_path, "w", encoding="utf-8") as fh:
+                json.dump(meta, fh)
+            return False
     tmp = path + ".part"
     try:
-        with requests.get(url, headers=_HEADERS, timeout=timeout, stream=True) as response:
+        with requests.get(settled, headers=_HEADERS, timeout=timeout,
+                          stream=True, allow_redirects=False) as response:
+            if response.status_code in _REDIRECTS:
+                raise requests.HTTPError(
+                    f"The extract at {settled} is still a redirect.", response=response)
             response.raise_for_status()
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             try:
@@ -241,6 +355,7 @@ def _refresh(url: str, path: str, meta_path: str, timeout: int,
             if on_bytes:
                 on_bytes(done, total or done, 0.0)
             stamp = _stamp(response)
+            stamp["url"] = settled
     except requests.RequestException:
         if os.path.exists(tmp):
             os.remove(tmp)
