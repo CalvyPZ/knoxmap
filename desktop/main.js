@@ -150,8 +150,86 @@ function attachGuards(contents) {
     return { action: 'deny' };
   });
   contents.on('will-navigate', (event, url) => {
+    if (url.startsWith('data:')) return;
     if (!sameOrigin(url)) event.preventDefault();
   });
+}
+
+const SPLASH_BG = '#151714';
+let splashWindow = null;
+let suppressQuit = false;
+
+function splashMarkup() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>KnoxMap</title>
+<style>
+  html, body { margin: 0; height: 100%; background: ${SPLASH_BG}; color: #e6e5de;
+    font: 600 15px/1.4 system-ui, "Segoe UI", sans-serif; }
+  body { display: flex; align-items: center; justify-content: center; }
+  .card { display: flex; flex-direction: column; align-items: center; gap: 18px; }
+  svg { width: 72px; height: 72px; display: block; }
+  .spin {
+    width: 28px; height: 28px; box-sizing: border-box; border-radius: 50%;
+    border: 3px solid #30352c; border-top-color: #a5e266;
+    animation: turn .75s linear infinite;
+  }
+  p { margin: 0; }
+  @keyframes turn { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+</style>
+</head>
+<body>
+  <div class="card">
+    <svg viewBox="0 0 512 512" aria-hidden="true">
+      <rect width="512" height="512" rx="96" fill="#14180f"/>
+      <path d="M256 300 L420 382 L256 464 L92 382 Z" fill="none" stroke="#a5e266" stroke-width="22" stroke-linejoin="round"/>
+      <path d="M256 382 C256 382 150 262 150 188 A106 106 0 0 1 362 188 C362 262 256 382 256 382 Z" fill="#a5e266"/>
+      <circle cx="256" cy="190" r="40" fill="#14180f"/>
+    </svg>
+    <div class="spin" aria-hidden="true"></div>
+    <p>Launching KnoxMap</p>
+  </div>
+</body>
+</html>`;
+}
+
+function showSplash() {
+  if (splashWindow && !splashWindow.isDestroyed()) return splashWindow;
+  const splash = new BrowserWindow({
+    width: 360,
+    height: 300,
+    frame: false,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    center: true,
+    show: true,
+    alwaysOnTop: true,
+    backgroundColor: SPLASH_BG,
+    title: 'KnoxMap',
+    autoHideMenuBar: true,
+    icon: windowIcon(),
+    webPreferences: webPreferences(),
+  });
+  splashWindow = splash;
+  splash.show();
+  splash.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(splashMarkup()));
+  splash.on('closed', () => {
+    const closedByUser = splashWindow === splash;
+    if (closedByUser) splashWindow = null;
+    if (closedByUser && !suppressQuit && !quitting) app.quit();
+  });
+  return splash;
+}
+
+function closeSplash() {
+  const splash = splashWindow;
+  splashWindow = null;
+  if (splash && !splash.isDestroyed()) splash.destroy();
 }
 
 function createWindow() {
@@ -173,9 +251,14 @@ function createWindow() {
   mainWindow = win;
   if (saved && saved.maximized) win.maximize();
 
-  win.once('ready-to-show', () => win.show());
+  win.once('ready-to-show', () => {
+    win.show();
+    win.focus();
+    closeSplash();
+  });
   win.webContents.on('did-fail-load', (_event, code, desc, _url, isMainFrame) => {
     if (!isMainFrame || code === -3) return;
+    closeSplash();
     dialog.showErrorBox(
       'KnoxMap',
       `The window could not open the page (${desc}).\n\nDetails are in:\n${logFile()}`,
@@ -282,6 +365,8 @@ function parentDied() {
   }
   if (parentAlive()) return;
   parentReported = true;
+  suppressQuit = true;
+  closeSplash();
   dialog.showErrorBox(
     'KnoxMap',
     `KnoxMap stopped unexpectedly.\n\nDetails are in:\n${logFile()}`,
@@ -574,10 +659,11 @@ function watchParent() {
 
 if (gotLock) {
   app.on('second-instance', () => {
-    if (!mainWindow) return;
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
+    const win = mainWindow || splashWindow;
+    if (!win || win.isDestroyed()) return;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
   });
 
   app.on('web-contents-created', (_event, contents) => attachGuards(contents));
@@ -595,9 +681,12 @@ if (gotLock) {
         app.exit(0);
         return;
       }
+      showSplash();
       try {
         await startServer();
       } catch (err) {
+        suppressQuit = true;
+        closeSplash();
         dialog.showErrorBox('KnoxMap', String(err && err.message || err));
         app.exit(1);
         return;
@@ -609,6 +698,8 @@ if (gotLock) {
       );
       app.exit(1);
       return;
+    } else {
+      showSplash();
     }
     installMenus();
     installToken();
@@ -627,9 +718,13 @@ if (gotLock) {
       mainWindow.webContents.openDevTools({ mode: 'detach' });
     }
   }).catch((err) => {
+    suppressQuit = true;
+    closeSplash();
     dialog.showErrorBox('KnoxMap', String(err && err.message || err));
     app.exit(1);
   });
 
-  app.on('window-all-closed', () => app.quit());
+  app.on('window-all-closed', () => {
+    if (!suppressQuit) app.quit();
+  });
 }
