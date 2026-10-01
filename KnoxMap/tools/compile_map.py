@@ -117,8 +117,13 @@ if sys.platform == "win32":
         """
         def __init__(self, cmd, stdout_f, stderr_f, env=None):
             self.cmd = cmd
-            self._desk_name = "KnoxHiddenDesktop"
+            # One desktop per process. CreateDesktop fails if the name already
+            # exists, and several mods compile at once, each in its own WorldEd.
+            self._desk_name = f"KnoxCompile_{os.getpid()}_{uuid.uuid4().hex[:8]}"
             self._hdesk = ctypes.windll.user32.CreateDesktopW(self._desk_name, None, None, 0, 0x01FF, None)
+            if not self._hdesk:
+                err = ctypes.GetLastError()
+                raise OSError(f"CreateDesktopW failed: {err}")
 
             h_out = msvcrt.get_osfhandle(stdout_f.fileno())
             h_err = msvcrt.get_osfhandle(stderr_f.fileno())
@@ -265,7 +270,7 @@ if sys.platform == "win32":
             self._cleanup()
 
 
-def _run_batch(cmd, should_stop, started: float):
+def _run_batch(cmd, should_stop, started: float, on_tick=None):
     """Run one WorldEd batch, watching for a stop while it works.
 
     subprocess.run waits for the process and nothing else, so a compile could
@@ -314,6 +319,11 @@ def _run_batch(cmd, should_stop, started: float):
             else:
                 out, err = said()
                 return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+            if on_tick is not None:
+                try:
+                    on_tick()
+                except Exception:  # noqa: BLE001 - a progress note must not stop the batch
+                    knoxlog.log.exception("compile: progress note failed")
             if should_stop is not None and should_stop():
                 _end_batch(proc)
                 raise knoxstop.Stopped("the compile")
@@ -464,6 +474,32 @@ def assign_converted_maps(pzw: Path) -> int:
     return count
 
 
+def _batch_lot_files(project: Path, pzw: Path, bx: int, by: int,
+                     x1: int, y1: int) -> list[Path] | None:
+    """The .lotheader files this batch owns. None when the origin cannot be read.
+
+    Shared edges belong to two batches, so the rectangle is this batch's own.
+    """
+    try:
+        text = pzw.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    origin = re.search(r'<worldOrigin origin="(-?\d+),(-?\d+)"', text)
+    if not origin:
+        return None
+    lots = project / "lots"
+    ox, oy = int(origin.group(1)), int(origin.group(2))
+
+    def span(origin_cell: int, c0: int, c1: int) -> range:
+        tile0 = (origin_cell + c0) * 300
+        tile1 = (origin_cell + c1 + 1) * 300
+        return range(tile0 // 256, (tile1 - 1) // 256 + 1)
+
+    return [lots / f"{ix}_{iy}.lotheader"
+            for ix in span(ox, bx, x1)
+            for iy in span(oy, by, y1)]
+
+
 def _batch_written(project: Path, pzw: Path, bx: int, by: int,
                    x1: int, y1: int) -> bool:
     """Whether this batch's 256-tile lot cells are already on disk.
@@ -472,28 +508,23 @@ def _batch_written(project: Path, pzw: Path, bx: int, by: int,
     just to be told to skip it. Shared edges belong to two batches, so a
     batch is done only when every cell of its own rectangle is there.
     """
+    files = _batch_lot_files(project, pzw, bx, by, x1, y1)
+    if not files or not (project / "lots").is_dir():
+        return False
+    return all(path.is_file() for path in files)
+
+
+def _conversion_done(pzw: Path) -> bool:
+    """Whether BMP to TMX has already pointed every cell at a map.
+
+    The compiler skips that step when it has, and goes straight to lots.
+    """
     try:
         text = pzw.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    origin = re.search(r'<worldOrigin origin="(-?\d+),(-?\d+)"', text)
-    if not origin:
-        return False
-    lots = project / "lots"
-    if not lots.is_dir():
-        return False
-    ox, oy = int(origin.group(1)), int(origin.group(2))
-
-    def span(origin_cell: int, c0: int, c1: int) -> range:
-        tile0 = (origin_cell + c0) * 300
-        tile1 = (origin_cell + c1 + 1) * 300
-        return range(tile0 // 256, (tile1 - 1) // 256 + 1)
-
-    for ix in span(ox, bx, x1):
-        for iy in span(oy, by, y1):
-            if not (lots / f"{ix}_{iy}.lotheader").is_file():
-                return False
-    return True
+    maps = re.findall(r'<cell x="\d+" y="\d+" map="([^"]*)"', text)
+    return bool(maps) and all(item.endswith(".tmx") for item in maps)
 
 
 def clear_stale(project: Path) -> None:
@@ -690,6 +721,12 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
     machine rather than this batch: a Qt that cannot start fails every batch
     in exactly the same way, and forty-eight batches of it is hours of
     nothing. Those stop the run at once, with what to do about it.
+
+    on_progress(done, total, cells, skipped) fires when a batch is finished.
+    skipped is true when the cells were already on disk. done is 0 once,
+    before the first batch, so the clock can start after the batches are listed.
+    A call with finished=False only names the step in progress (phase, detail)
+    and does not count as a finished batch.
     """
     project = Path(project_dir).resolve()
     pzw = project / f"{project.name}.pzw"
@@ -704,7 +741,16 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
     # looks like it did its batches out of order.
     run = uuid.uuid4().hex[:8]
 
+    def _phase(done: int, total: int, phase: str, detail: str = "") -> None:
+        if on_progress:
+            on_progress(done, total, 0, False, phase=phase, detail=detail,
+                        finished=False)
+
+    def _where(bx: int, by: int, x1: int, y1: int) -> str:
+        return f"cells {bx},{by} to {x1},{y1}"
+
     with _only_one(project, run):
+        _phase(0, 0, "prepare", "Repairing the project")
         clear_stale(project)
         # Whatever wrote the project, one entry past the edge of the map must not
         # stop the whole compile: WorldEd refuses a project over a single one.
@@ -724,6 +770,7 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
         lots.mkdir(exist_ok=True)
         (project / "tmx").mkdir(exist_ok=True)
 
+        _phase(0, 0, "prepare", "Listing cells")
         w, h = world_size(pzw)
         if not w or not h:
             raise ValueError(f"Could not read the world size from {pzw.name}")
@@ -748,6 +795,9 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
         # so: this has always been a plain loop, but a compile that looked
         # like it jumped from 25 to 18 is worth being able to rule out.
         previous = 0
+        _phase(0, len(batches), "prepare", f"{len(batches)} batches")
+        if on_progress:
+            on_progress(0, len(batches), 0, True)
         for i, (bx, by, x1, y1) in enumerate(batches, start=1):
             if i != previous + 1:
                 raise RuntimeError(f"compile {project.name}: batch {i} followed {previous} "
@@ -757,10 +807,13 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
                 knoxlog.log.info("compile %s [%s]: batch %d/%d cells %d,%d..%d,%d "
                                  "already written, skipping", project.name, run,
                                  i, len(batches), bx, by, x1, y1)
+                _phase(i, len(batches), "skip",
+                       f"{_where(bx, by, x1, y1)} already compiled")
                 assign_converted_maps(pzw)
+                _phase(i, len(batches), "record", _where(bx, by, x1, y1))
                 cells = len(list(lots.glob("*.lotheader")))
                 if on_progress:
-                    on_progress(i, len(batches), cells)
+                    on_progress(i, len(batches), cells, True)
                 else:
                     print(f"  batch {i}/{len(batches)} cells {bx},{by}..{x1},{y1} "
                           f"already written  ({time.time() - started:.0f}s)", flush=True)
@@ -768,10 +821,33 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
             cmd = knoxpaths.command_for(exe_path) + [
                 f"--generate-map={knoxpaths.tool_path(pzw)}",
                 f"--cells={bx},{by},{x1},{y1}"]
+            where = _where(bx, by, x1, y1)
+            lot_files = _batch_lot_files(project, pzw, bx, by, x1, y1) or []
+            lots_before = sum(1 for path in lot_files if path.is_file())
+            tmx_dir = project / "tmx"
             for attempt in range(1, BATCH_ATTEMPTS + 1):
                 knoxstop.check(should_stop, "the compile")
                 attempt_started = time.time()
-                proc = _run_batch(cmd, should_stop, attempt_started)
+                again = (f", attempt {attempt} of {BATCH_ATTEMPTS}"
+                         if attempt > 1 else "")
+                # A retry already has the maps from the attempt that died
+                # during lots. The project file is only updated afterwards,
+                # so the cell list still looks unconverted.
+                converting = not _conversion_done(pzw) and (
+                    attempt == 1 or not any(tmx_dir.glob("*.tmx")))
+
+                def on_tick(where=where, again=again, converting=converting,
+                            lots_before=lots_before, lot_files=lot_files):
+                    present = sum(1 for path in lot_files if path.is_file())
+                    if converting and present <= lots_before:
+                        written = len(list(tmx_dir.glob("*.tmx")))
+                        detail = f"{written} maps written" if written else "Reading the bitmaps"
+                        _phase(i, len(batches), "convert", f"{where}{again} · {detail}")
+                    else:
+                        _phase(i, len(batches), "lots", f"{where}{again}")
+
+                on_tick()
+                proc = _run_batch(cmd, should_stop, attempt_started, on_tick)
                 # WorldEd's own account of the batch, kept whatever happened: when it
                 # crashes this is the only record of how far it got.
                 saved = knoxlog.save_tool_output("PZWorldEd_cli", project.name,
@@ -793,6 +869,7 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
                 if attempt < BATCH_ATTEMPTS:
                     knoxlog.log.warning("compile %s [%s]: batch %d/%d failed, trying again",
                                         project.name, run, i, len(batches))
+            _phase(i, len(batches), "record", where)
             assign_converted_maps(pzw)
             cells = len(list(lots.glob("*.lotheader")))
             # 65 used to be tolerated because the wait for WorldEd was a guess.
@@ -808,7 +885,7 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
                                   "rest", project.name, run, i, len(batches),
                                   bx, by, x1, y1, BATCH_ATTEMPTS)
             if on_progress:
-                on_progress(i, len(batches), cells)
+                on_progress(i, len(batches), cells, False)
             else:
                 elapsed = time.time() - started
                 state = "FAILED" if proc.returncode != 0 else f"-> {cells} compiled"
