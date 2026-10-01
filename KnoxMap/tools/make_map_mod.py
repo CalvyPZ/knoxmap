@@ -460,7 +460,8 @@ def write_attribution(project_dir: str, mod_root: str, name: str) -> None:
     # Overture publishes its buildings theme under ODbL too, so the credit is
     # owed on the same terms and goes in the same file. The fetch leaves its
     # answer beside the map, so its being there is what says the data was used.
-    overture = any(e.endswith("_overture.json.gz") for e in os.listdir(project_dir))
+    overture = (any(e.endswith("_overture.json.gz") for e in os.listdir(project_dir))
+                or bool(info.get("overture")))
     from_overture = """
 Some buildings come from Overture Maps (https://overturemaps.org), whose
 buildings theme is published under ODbL as well, and is itself OpenStreetMap
