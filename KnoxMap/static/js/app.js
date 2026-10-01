@@ -188,11 +188,12 @@ function clearSelection() {
   clearBboxFields();
 }
 
-// A new shape adds an area. With the eraser on, the same shape is cut out
-// of the area already drawn.
+// A new shape joins the area already drawn. With the eraser on, the same
+// shape is cut out of it.
 function applyDrawn(layer) {
   if (!eraseMode) {
-    setSelection(layer);
+    if (!currentRect) setSelection(layer);
+    else setSelection(L.featureGroup(selectionPieces().concat([layer])));
     return;
   }
   if (!currentRect) {
