@@ -264,8 +264,267 @@ def _inside(feat: OSMFeature, proj: Projector, shape) -> bool:
     return shape.contains(Point(pts[0]))
 
 
+def _project_xy(proj: Projector, lat, lon):
+    """Pixel coordinates for many lat/lon pairs, in one projection call."""
+    import numpy as np
+
+    lat = np.asarray(lat, dtype=np.float64)
+    lon = np.asarray(lon, dtype=np.float64)
+    if lat.size == 0:
+        return lat, lon
+    x_m, y_m = proj._transformer.transform(lon, lat)
+    x_m = np.asarray(x_m, dtype=np.float64)
+    y_m = np.asarray(y_m, dtype=np.float64)
+    rot = proj.rotation
+    if rot:
+        trig = getattr(proj, "_px_trig", None)
+        if trig is None or trig[0] != rot:
+            ang = math.radians(rot)
+            trig = (rot, math.cos(ang), math.sin(ang))
+            proj._px_trig = trig
+        cx = proj.rot_cx_m
+        cy = proj.rot_cy_m
+        if cx is None or cy is None:
+            cx, cy = proj._rot_center()
+        cos_a, sin_a = trig[1], trig[2]
+        dx = x_m - cx
+        dy = y_m - cy
+        x_m = cx + dx * cos_a - dy * sin_a
+        y_m = cy + dx * sin_a + dy * cos_a
+    mpt = proj.meters_per_tile
+    return ((x_m - proj.min_x_m) / mpt,
+            proj.height - (y_m - proj.min_y_m) / mpt)
+
+
+def _unproject_xy(proj: Projector, px, py):
+    """The inverse of _project_xy, for a whole array of pixels."""
+    import numpy as np
+
+    px = np.asarray(px, dtype=np.float64)
+    py = np.asarray(py, dtype=np.float64)
+    back = getattr(proj, "_back", None)
+    if back is None:
+        back = pyproj.Transformer.from_crs(proj._transformer.target_crs,
+                                           "EPSG:4326", always_xy=True)
+        object.__setattr__(proj, "_back", back)
+    x_m = proj.min_x_m + px * proj.meters_per_tile
+    y_m = proj.min_y_m + (proj.height - py) * proj.meters_per_tile
+    if proj.rotation:
+        cx, cy = proj._rot_center()
+        ang = math.radians(-proj.rotation)
+        cos_a, sin_a = math.cos(ang), math.sin(ang)
+        dx, dy = x_m - cx, y_m - cy
+        x_m = cx + dx * cos_a - dy * sin_a
+        y_m = cy + dx * sin_a + dy * cos_a
+    lon, lat = back.transform(x_m, y_m)
+    return np.asarray(lat, dtype=np.float64), np.asarray(lon, dtype=np.float64)
+
+
+def _rings_px(feats, proj: Projector, min_points: int) -> list:
+    """Every ring of these features, projected together."""
+    import numpy as np
+
+    lats: list[float] = []
+    lons: list[float] = []
+    spans: list[tuple[int, int]] = []
+    for feat in feats:
+        geoms = ([feat.geometry] if feat.kind == "way"
+                 else [coords for _role, coords in feat.role_geoms])
+        for geom in geoms:
+            if not geom or len(geom) < min_points:
+                continue
+            start = len(lats)
+            for la, lo in geom:
+                lats.append(la)
+                lons.append(lo)
+            spans.append((start, len(geom)))
+    if not spans:
+        return []
+    px, py = _project_xy(proj, lats, lons)
+    return [np.column_stack((px[start:start + count], py[start:start + count]))
+            for start, count in spans]
+
+
+def _polygons_xy(parts: list):
+    """Polygons for many rings. GEOS builds them in one call and drops the interpreter lock."""
+    import numpy as np
+    import shapely
+
+    if not parts:
+        return np.empty(0, dtype=object)
+    arrays = [np.asarray(part, dtype=np.float64) for part in parts]
+    counts = np.fromiter((len(part) for part in arrays), dtype=np.int64, count=len(arrays))
+    xy = np.concatenate(arrays, axis=0)
+    indices = np.repeat(np.arange(len(arrays), dtype=np.int64), counts)
+    return shapely.polygons(shapely.linearrings(xy, indices=indices))
+
+
+def _lines_xy(parts: list):
+    import numpy as np
+    import shapely
+
+    if not parts:
+        return np.empty(0, dtype=object)
+    arrays = [np.asarray(part, dtype=np.float64) for part in parts]
+    counts = np.fromiter((len(part) for part in arrays), dtype=np.int64, count=len(arrays))
+    xy = np.concatenate(arrays, axis=0)
+    indices = np.repeat(np.arange(len(arrays), dtype=np.int64), counts)
+    return shapely.linestrings(xy, indices=indices)
+
+
+def _repair(polys):
+    """Invalid outlines get buffer(0), the same repair as checking them one by one."""
+    import numpy as np
+    import shapely
+
+    if len(polys) == 0:
+        return polys
+    bad = ~np.asarray(shapely.is_valid(polys), dtype=bool)
+    if not bad.any():
+        return polys
+    polys = np.array(polys, dtype=object, copy=True)
+    polys[bad] = shapely.buffer(polys[bad], 0)
+    return polys
+
+
+def _nonempty(polys):
+    import numpy as np
+    import shapely
+
+    if len(polys) == 0:
+        return polys
+    empty = np.asarray(shapely.is_empty(polys), dtype=bool)
+    return polys[~empty]
+
+
+def _any_hit(tree, geoms, predicate=None, distance=None):
+    """True for each geometry that meets anything in the tree."""
+    import numpy as np
+
+    geoms = np.asarray(geoms, dtype=object)
+    if geoms.ndim == 0:
+        geoms = geoms.reshape(1)
+    mask = np.zeros(geoms.shape[0], dtype=bool)
+    if geoms.shape[0] == 0:
+        return mask
+    kwargs = {}
+    if predicate is not None:
+        kwargs["predicate"] = predicate
+    if distance is not None:
+        kwargs["distance"] = distance
+    hits = tree.query(geoms, **kwargs)
+    if getattr(hits, "size", 0) == 0:
+        return mask
+    hits = np.asarray(hits)
+    if hits.ndim == 1:
+        if geoms.shape[0] == 1 and hits.size:
+            mask[0] = True
+        return mask
+    mask[hits[0]] = True
+    return mask
+
+
+def _features_inside(feats: list[OSMFeature], proj: Projector, shape) -> list[OSMFeature]:
+    """Features whose middle sits in the drawn shape.
+
+    The whole list is projected and tested together. One building at a time
+    holds the interpreter for the whole call, and the other terrain threads
+    wait on that even while cores are free.
+    """
+    try:
+        return _features_inside_batch(feats, proj, shape)
+    except knoxstop.Stopped:
+        raise
+    except Exception as exc:
+        import knoxlog
+        knoxlog.log.warning("clip test fell back to one feature at a time: %s", exc)
+        return [feat for feat in feats if _inside(feat, proj, shape)]
+
+
+def _features_inside_batch(feats: list[OSMFeature], proj: Projector, shape) -> list[OSMFeature]:
+    import numpy as np
+    import shapely
+
+    if not feats:
+        return []
+    shapely.prepare(shape)
+    lats: list[float] = []
+    lons: list[float] = []
+    spans: list[tuple[int, str, int, int]] = []
+    for index, feat in enumerate(feats):
+        if feat.kind == "relation":
+            rings = [ring for role, ring in feat.role_geoms
+                     if role != "inner" and len(ring) >= 3]
+            if not rings:
+                continue
+            ring = rings[0]
+            start = len(lats)
+            for la, lo in ring:
+                lats.append(la)
+                lons.append(lo)
+            spans.append((index, "rel", start, len(ring)))
+            continue
+        geom = feat.geometry or []
+        if not geom:
+            continue
+        start = len(lats)
+        for la, lo in geom:
+            lats.append(la)
+            lons.append(lo)
+        spans.append((index, "way", start, len(geom)))
+    if not spans:
+        return []
+    px, py = _project_xy(proj, lats, lons)
+    rel_parts, rel_index = [], []
+    ring_parts, ring_index = [], []
+    line_parts, line_index = [], []
+    point_index, point_x, point_y = [], [], []
+    for index, kind, start, count in spans:
+        xy = np.column_stack((px[start:start + count], py[start:start + count]))
+        if kind == "rel":
+            rel_index.append(index)
+            rel_parts.append(xy)
+        elif count >= 3 and xy[0, 0] == xy[-1, 0] and xy[0, 1] == xy[-1, 1]:
+            ring_index.append(index)
+            ring_parts.append(xy)
+        elif count >= 2:
+            line_index.append(index)
+            line_parts.append(xy)
+        else:
+            point_index.append(index)
+            point_x.append(float(xy[0, 0]))
+            point_y.append(float(xy[0, 1]))
+    keep = np.zeros(len(feats), dtype=bool)
+    if rel_parts:
+        polys = _repair(_polygons_xy(rel_parts))
+        empty = np.asarray(shapely.is_empty(polys), dtype=bool)
+        ok = np.zeros(len(polys), dtype=bool)
+        use = ~empty
+        if use.any():
+            rep = shapely.point_on_surface(polys[use])
+            ok[use] = np.asarray(shapely.contains(shape, rep), dtype=bool)
+        keep[np.asarray(rel_index, dtype=np.int64)] = ok
+    if ring_parts:
+        polys = _polygons_xy(ring_parts)
+        valid = np.asarray(shapely.is_valid(polys), dtype=bool)
+        first = np.vstack([part[0] for part in ring_parts])
+        spots = np.array(shapely.points(first), dtype=object, copy=True)
+        if valid.any():
+            spots[valid] = shapely.point_on_surface(polys[valid])
+        ok = np.asarray(shapely.contains(shape, spots), dtype=bool)
+        keep[np.asarray(ring_index, dtype=np.int64)] = ok
+    if line_parts:
+        lines = _lines_xy(line_parts)
+        ok = np.asarray(shapely.intersects(shape, lines), dtype=bool)
+        keep[np.asarray(line_index, dtype=np.int64)] = ok
+    if point_index:
+        ok = np.asarray(shapely.contains_xy(shape, point_x, point_y), dtype=bool)
+        keep[np.asarray(point_index, dtype=np.int64)] = ok
+    return [feats[index] for index in range(len(feats)) if keep[index]]
+
+
 def _clip_to_shape(landscape: Image.Image, shape, buckets: dict[str, list[OSMFeature]],
-                   proj: Projector):
+                   proj: Projector, show=None, span=None):
     """Outside the drawn shape, the ground goes back to countryside.
 
     Water stays - a river does not stop at a line on the map - and so do the
@@ -298,10 +557,17 @@ def _clip_to_shape(landscape: Image.Image, shape, buckets: dict[str, list[OSMFea
                     if len(ring) >= 3:
                         kd.polygon(ring, fill=255)
     strip = 1024
+    count = max(1, (h + strip - 1) // strip)
+    index = 0
     for y0 in range(0, h, strip):
+        index += 1
         y1 = min(h, y0 + strip)
+        _announce_strip(show, "Clipping the map edge", index, count,
+                        landscape, span, False)
         outside = np.asarray(keep.crop((0, y0, w, y1))) == 0
         if not outside.any():
+            _announce_strip(show, "Clipping the map edge", index, count,
+                            landscape, span, True)
             continue
         ground = np.asarray(landscape.crop((0, y0, w, y1)))
         water = (ground[:, :, 0] == C.WATER[0]) & (ground[:, :, 1] == C.WATER[1]) \
@@ -310,6 +576,8 @@ def _clip_to_shape(landscape: Image.Image, shape, buckets: dict[str, list[OSMFea
         if outside.any():
             grass = Image.new("RGB", (w, y1 - y0), C.DARK_GRASS)
             landscape.paste(grass, (0, y0), Image.fromarray(outside.astype(np.uint8) * 255))
+        _announce_strip(show, "Clipping the map edge", index, count,
+                        landscape, span, True)
     return keep
 
 
@@ -711,30 +979,75 @@ def _draw_line(draw: ImageDraw.ImageDraw, rings: list[list[tuple[float, float]]]
                     draw.ellipse((x - r, y - r, x + r, y + r), fill=fill)
 
 
-def _paint_watch(on_view, every: float = 1.2):
-    """Hand the bitmap to on_view as it is painted, at most once a second or so.
+def _paint_watch(on_view, key: str = ""):
+    """Tell the window which pass is running, and keep a picture of it.
 
-    A new `stage` is sent at once, so the window can show each pass (terrain,
-    streets, and what follows) instead of waiting out the throttle.
+    The picture is handed to the shared preview thread, which paints each
+    coordinate mod in order when it has changed, and not again for five
+    seconds. This thread never builds the picture and never waits. The words
+    and the fraction go out as the work changes, including every strip.
     """
-    last = 0.0
     shown = None
+    last_sent = 0.0
+    last_work = None
+    view_key = key or "draw"
+    # One queued picture reads the live bitmaps, so further changes do not
+    # need another submit until that picture has been taken.
+    armed = False
 
-    def show(image, force: bool = False, stage: str | None = None) -> None:
-        nonlocal last, shown
+    def show(image, force: bool = False, stage: str | None = None,
+             work: float | None = None, image_at=None) -> None:
+        nonlocal shown, last_sent, last_work, armed
         if on_view is None:
             return
-        now = time.monotonic()
-        if stage is not None and stage != shown:
-            force = True
-        if not force and now - last < every:
-            return
-        last = now
+        stage_changed = stage is not None and stage != shown
         if stage is not None:
             shown = stage
-        on_view(image, shown)
+        if work is not None:
+            last_work = work
+        now = time.monotonic()
+        wants_image = image is not None or image_at is not None
+        send_note = force or stage_changed or (
+            work is not None and now - last_sent >= 0.3)
+        if send_note:
+            last_sent = now
+            on_view(None, stage=shown, work=last_work)
+        if not wants_image or armed:
+            return
+        # The preview thread builds the picture. A pass ending does not.
+        shot = image
+        make = image_at
+        armed = True
+
+        def build(shot=shot, make=make):
+            nonlocal armed
+            armed = False
+            if make is not None:
+                return make()
+            return _live_frame(shot, None)
+
+        import knoxpreview
+        knoxpreview.submit(view_key, build, lambda frame: on_view(frame))
 
     return show
+
+
+def _strip_work(span, index: int, count: int, done: bool):
+    if not span or count <= 0:
+        return None
+    frac = index / count if done else (index - 1) / count
+    start, end = span
+    return start + (end - start) * frac
+
+
+def _announce_strip(show, label: str, index: int, count: int, image,
+                    span, done: bool, image_at=None) -> None:
+    if show is None:
+        return
+    show(image if done else None,
+         stage=f"{label}, strip {index} of {count}",
+         work=_strip_work(span, index, count, done),
+         image_at=image_at if done else None)
 
 
 # --- main entry point ------------------------------------------------------
@@ -765,7 +1078,8 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
            straight_roads: bool = False,
            should_stop=None,
            proj: "Projector | None" = None,
-           on_view=None) -> RenderResult:
+           on_view=None,
+           file_workers: int | None = None) -> RenderResult:
     if proj is None:
         proj = Projector.build(south, west, north, east, meters_per_tile, rotation)
     # Read more than once below - the buildings pass goes back over the
@@ -795,12 +1109,14 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
     cover = biomes.Cover(
         (proj.width, proj.height), (south + north) / 2.0, (west + east) / 2.0)
     l_draw = ImageDraw.Draw(landscape)
-    # The window watches this bitmap while it is painted. Throttled so a
-    # long road pass still redraws, without a copy on every feature.
-    show = _paint_watch(on_view)
+    # The window watches this bitmap while it is painted. The shared preview
+    # thread makes the picture, so a long pass still redraws without this
+    # thread stopping. That thread does not lock the bitmap: a picture must
+    # not hold up saving the files.
+    show = _paint_watch(on_view, key=map_name)
     # The grass sheet is the first frame worth showing. Land use paints onto
     # it next; streets wait until that pass has had its own frame.
-    show(landscape, force=True, stage="Terrain and biomes")
+    show(landscape, force=True, stage="Terrain and biomes", work=0.08)
 
     # Bucket features so we paint in a deterministic order.
     buckets: dict[str, list[OSMFeature]] = {}
@@ -835,10 +1151,15 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
             if cat in {"forest", "scrub", "tree_single", "hedge"}:
                 continue
         if cat == "building":
-            if clip is not None and not _inside(feat, proj, clip):
-                continue
             building_feats.append(feat)
         buckets.setdefault(cat, []).append(feat)
+
+    if clip is not None:
+        building_feats = _features_inside(building_feats, proj, clip)
+        if building_feats:
+            buckets["building"] = list(building_feats)
+        else:
+            buckets.pop("building", None)
 
     # Bridges lifted over the roads they cross, and monuments. See
     # generator/structures.py; what they leave out of the ground is cut here.
@@ -906,10 +1227,32 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
                     l_draw.polygon(list(hole.coords), fill=C.DARK_GRASS)
                     cover.polygon([list(hole.coords)], cover.open)
 
+    paint_total = 1
+    for _cat in LANDSCAPE_ORDER:
+        paint_total += len(paint_buckets.get(_cat, []))
+    for _road in ("road_minor", "road_medium", "road_major"):
+        paint_total += sum(
+            1 for _feat in paint_buckets.get(_road, []) if not _is_polygon(_feat))
+    for _road in VERGE_M:
+        paint_total += sum(
+            1 for _feat in paint_buckets.get(_road, []) if not _is_polygon(_feat))
+    paint_total += len(paint_buckets.get("railway", []))
+    paint_total += len(paint_buckets.get("airport", []))
+    paint_seen = 0
+
+    def beat(image, stage: str) -> None:
+        nonlocal paint_seen
+        paint_seen += 1
+        show(image, stage=stage,
+             work=0.08 + 0.42 * min(1.0, paint_seen / paint_total))
+
+    def drawn_work() -> float:
+        return 0.08 + 0.42 * min(1.0, paint_seen / paint_total)
+
     paint_stage = "Terrain and biomes"
     for cat in LANDSCAPE_ORDER:
         if paint_stage == "Terrain and biomes" and cat not in _GROUND_FIRST:
-            show(landscape, force=True, stage="Terrain and biomes")
+            show(landscape, force=True, stage="Terrain and biomes", work=drawn_work())
             paint_stage = "Streets"
         if cat == "railway":
             # Pavements, as one pass over every road class and after the land
@@ -925,7 +1268,7 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
                     _draw_line(l_draw, ground_rings(feat),
                                C.PALE_CONCRETE, int(width_px))
                     cover.line(ground_rings(feat), biomes.DIRT, int(width_px))
-                    show(landscape, stage=paint_stage)
+                    beat(landscape, "Streets · pavements")
             for road, verge in VERGE_M.items():
                 for feat in paint_buckets.get(road, []):
                     if _is_polygon(feat):
@@ -934,7 +1277,7 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
                     rings = ground_rings(feat)
                     _draw_line(l_draw, rings, C.DARK_GRASS, int(width_px))
                     cover.line(rings, biomes.TOWN, int(width_px))
-                    show(landscape, stage=paint_stage)
+                    beat(landscape, "Streets · verges")
         fill = LANDSCAPE_FILL.get(cat)
         if fill is None:
             continue
@@ -966,7 +1309,7 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
                 width_px = max(1, int(metres / meters_per_tile))
                 _draw_line(l_draw, rings, fill, width_px)
                 _mark(cat, feat, rings, width_px)
-            show(landscape, stage=paint_stage)
+            beat(landscape, f"{paint_stage} · {cat.replace('_', ' ')}")
         if cat == "industrial":
             yard = LANDSCAPE_FILL["railway"]
             for feat in paint_buckets.get("railway", []):
@@ -974,7 +1317,7 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
                     continue
                 _paint_filled(l_draw, landscape, feat, proj, yard)
                 _mark("railway", feat, _feature_coords_px(feat, proj))
-                show(landscape, stage=paint_stage)
+                beat(landscape, "Streets · railway yards")
 
     # Runways, taxiways and aprons. After every land-cover polygon, so the
     # infield grass does not erase them, and before the shape clip.
@@ -989,7 +1332,7 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
             drawn = ground_rings(feat)
             _draw_line(l_draw, drawn, C.DARK_ASPHALT, max(1, int(width_px)))
             cover.line(drawn, biomes.DIRT, max(1, int(width_px)))
-        show(landscape, stage=paint_stage)
+        beat(landscape, "Streets · runway")
 
     # Bridges over water squared to the tiles (generator/structures.py).
     for deck, cat in lifted.straight:
@@ -1004,19 +1347,23 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
         landscape, junctions, proj, cover, building_rings, set(lifted.cut),
         [deck.bounds for deck, _cat in lifted.straight])
     blocks = _pave_dense_ground(landscape, building_feats, paint_buckets, proj,
-                                cover=cover)
+                                cover=cover, show=show, span=(0.50, 0.56))
     for paved in lifted.paving:
         l_draw.polygon(list(paved.exterior.coords), fill=C.PAVING)
         cover.polygon([list(paved.exterior.coords)], biomes.TOWN)
     keep = None
     if clip is not None:
-        keep = _clip_to_shape(landscape, clip, paint_buckets, proj)
+        keep = _clip_to_shape(landscape, clip, paint_buckets, proj,
+                              show=show, span=(0.56, 0.60))
+    show(None, stage="Wearing the road surface", work=0.60)
     _weather_roads(landscape, proj)
     # Streets already went out while they were drawn. This frame is the
     # ground between them, when any block was paved, weathered roads included.
-    show(landscape, force=True, stage="City blocks" if blocks else "Streets")
+    show(landscape, force=True, stage="City blocks" if blocks else "Streets",
+         work=0.62)
 
     knoxstop.check(should_stop, "the terrain")
+    show(None, stage="Painting trees", work=0.62)
     _paint_vegetation(vegetation, landscape, paint_veg, proj,
                       density=tree_density)
     _stamp_biome_woods(cover, paint_veg, proj)
@@ -1024,7 +1371,9 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
     cover.apply_shores()
     if keep is not None:
         cover.apply_keep(keep)
+    show(None, stage="Painting gardens", work=0.68)
     _paint_gardens(vegetation, landscape, building_feats, proj, density=tree_density)
+    show(None, stage="Scattering wild growth", work=0.71)
     _paint_wild_growth(vegetation, landscape, proj, density=tree_density)
     _clear_building_vegetation(vegetation, building_feats, proj)
     # An airfield is mown grass. Wild growth and garden trees treat that
@@ -1034,12 +1383,14 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
         [f for f in paint_buckets.get("airport", []) if _is_polygon(f)],
         proj)
     _clear_route_vegetation(vegetation, paint_buckets, proj)
-    show(_build_preview(landscape, vegetation), force=True, stage="Vegetation")
-    show(None, force=True, stage="Road markings and kerbs")
-    _paint_road_details(vegetation, landscape, buckets, proj, junctions.skip_rects())
-    show(None, force=True, stage="Intersections")
+    show(None, force=True, stage="Vegetation", work=0.74,
+         image_at=lambda: _live_frame(landscape, vegetation))
+    show(None, force=True, stage="Road markings and kerbs", work=0.74)
+    _paint_road_details(vegetation, landscape, buckets, proj, junctions.skip_rects(),
+                        show=show, span=(0.74, 0.90))
+    show(None, force=True, stage="Intersections", work=0.90)
     reserved = intersections.paint_controls(vegetation, landscape, junctions, proj)
-    show(None, force=True, stage="Street furniture")
+    show(None, force=True, stage="Street furniture", work=0.93)
     _paint_street_furniture(vegetation, landscape, reserved)
     # Nothing grows through a deck or a ramp, and no lamp stands on one.
     veg_px = vegetation.load()
@@ -1053,19 +1404,13 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
     structures.settle_posts(lifted, lambda x, y: 0 <= x < proj.width and 0 <= y < proj.height
                             and ground_px[x, y] not in under)
 
-    # The spawn density image and the visual preview only read the finished
-    # bitmaps, so compose them at the same time.
+    # The spawn map is part of the map. The human preview is not: the shared
+    # preview thread writes it, and this piece goes on to the other files.
     spawn_w = proj.width // C.SPAWN_MAP_SCALE
     spawn_h = proj.height // C.SPAWN_MAP_SCALE
-    show(None, force=True, stage="Compositing output images")
-    with ThreadPoolExecutor(max_workers=2,
-                            thread_name_prefix="knox-compose") as executor:
-        spawn_future = executor.submit(
-            _build_spawn_map, landscape, spawn_w, spawn_h, spawn_density)
-        preview_future = executor.submit(_build_preview, landscape, vegetation)
-        spawn_map = spawn_future.result()
-        preview = preview_future.result()
-    show(preview, force=True, stage="Writing map files")
+    show(None, force=True, stage="Compositing output images", work=0.95)
+    spawn_map = _build_spawn_map(landscape, spawn_w, spawn_h, spawn_density)
+    show(None, force=True, stage="Writing map files", work=0.97)
 
     # --- output files ---
     os.makedirs(output_dir, exist_ok=True)
@@ -1127,6 +1472,8 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
 
     roads = [feat for cat in ROAD_EXPORT_CATEGORIES
              for feat in buckets.get(cat, [])]
+    fence_export = (_features_inside(fence_feats, proj, clip)
+                    if clip is not None else fence_feats)
     output_jobs = {
         "landscape": lambda: save_base(
             landscape, landscape_path,
@@ -1135,7 +1482,6 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
             vegetation, veg_path,
             os.path.join(output_dir, f"{map_name}_veg_base.bmp")),
         "zombie map": lambda: save_image(spawn_map, spawn_path, "BMP"),
-        "preview": lambda: save_image(preview, preview_path, "PNG"),
         "buildings": lambda: save_json(
             buildings_path, lambda: _buildings_geojson(building_feats)),
         "areas": lambda: save_json(
@@ -1149,8 +1495,7 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
             lambda: intersections.to_json(junctions)),
         "fences": lambda: save_json(
             os.path.join(output_dir, f"{map_name}_fences.geojson"),
-            lambda: _lines_geojson([f for f in fence_feats
-                                    if clip is None or _inside(f, proj, clip)])),
+            lambda: _lines_geojson(fence_export)),
         "structures": lambda: save_json(
             os.path.join(output_dir, f"{map_name}_structures.json"),
             lambda: {"bridges": lifted.bridges, "monuments": lifted.monuments,
@@ -1159,25 +1504,63 @@ def render(features: Iterable[OSMFeature], south: float, west: float,
             os.path.join(output_dir, f"{map_name}_places.json"),
             lambda: _places(place_feats, proj), ensure_ascii=False),
         "metadata": lambda: save_json(meta_path, lambda: metadata, indent=2),
-        "biomes": lambda: _write_biomes(
-            cover, output_dir, map_name),
         "zones": lambda: save_json(
             os.path.join(output_dir, f"{map_name}_zones.geojson"),
             lambda: _zones_geojson(buckets)),
     }
-    workers = min(len(output_jobs), os.cpu_count() or 1)
+    # Pictures are the CPU in this stage: each is cut into horizontal bands
+    # and compressed together. Half the cores, so the machine stays usable,
+    # unless the caller is already drawing one piece per core. One band's
+    # deflate releases the interpreter lock, which is why threads here
+    # actually occupy that many cores.
+    _queue_view_file(landscape, vegetation, preview_path,
+                     None if on_view is None else (lambda frame: on_view(frame)))
+    workers = _half_cores() if file_workers is None else max(1, int(file_workers))
+    file_total = len(output_jobs) + 1
+    group_left = {"biomes": 3}
     with ThreadPoolExecutor(max_workers=workers,
                             thread_name_prefix="knox-output") as executor:
-        pending = {executor.submit(job): name for name, job in output_jobs.items()}
+        pending = {}
+        _queue_png(executor, pending, cover.image,
+                   os.path.join(output_dir, f"{map_name}_biome.png"),
+                   "L", "biomes", workers)
+        _queue_png(executor, pending, cover.image,
+                   os.path.join(output_dir, f"{map_name}_biome_overlay.png"),
+                   "overlay", "biomes", workers)
+        pending[executor.submit(_write_biome_legend, output_dir, map_name)] = (
+            "group", "biomes")
+        for name, job in output_jobs.items():
+            pending[executor.submit(job)] = ("job", name)
         completed = 0
+
+        def _finish_group(group: str) -> None:
+            nonlocal completed
+            group_left[group] -= 1
+            if group_left[group] == 0:
+                completed += 1
+                show(None, force=True,
+                     stage=f"Writing map files, {completed} of {file_total}",
+                     work=0.97 + 0.03 * completed / file_total)
+
         while pending:
             finished, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in finished:
-                pending.pop(future)
-                future.result()
-                completed += 1
-                show(None, force=True,
-                     stage=f"Writing map files ({completed} of {len(output_jobs)})")
+                kind = pending.pop(future)
+                result = future.result()
+                if kind[0] == "job":
+                    completed += 1
+                    show(None, force=True,
+                         stage=f"Writing map files, {completed} of {file_total}",
+                         work=0.97 + 0.03 * completed / file_total)
+                elif kind[0] == "group":
+                    _finish_group(kind[1])
+                else:
+                    _png, index = kind[1], kind[2]
+                    _png.parts[index] = result
+                    _png.left -= 1
+                    if _png.left == 0:
+                        _write_banded_png(_png)
+                        _finish_group(_png.group)
 
     return RenderResult(
         landscape_path=landscape_path,
@@ -1328,7 +1711,8 @@ def _real_kerbs(sides):
     return np.where(keep, sides, 0).astype(sides.dtype)
 
 
-def _smooth_road_edges(landscape: Image.Image, asphalt, is_colour) -> None:
+def _smooth_road_edges(landscape: Image.Image, asphalt, is_colour,
+                       show=None, span=None, image_at=None) -> None:
     """Fill one-tile notches along the edge of the road, and shave one-tile bumps.
 
     A street a degree or two off the tile grid rasterises with its edge
@@ -1341,8 +1725,13 @@ def _smooth_road_edges(landscape: Image.Image, asphalt, is_colour) -> None:
 
     w, h = landscape.size
     strip = 1024
+    count = max(1, (h + strip - 1) // strip)
+    index = 0
     for y0 in range(0, h, strip):
+        index += 1
         y1 = min(h, y0 + strip)
+        _announce_strip(show, "Smoothing road edges", index, count,
+                        None if image_at else landscape, span, False)
         top, bottom = max(0, y0 - 1), min(h, y1 + 1)
         ground = np.asarray(landscape.crop((0, top, w, bottom))).copy()
         for _ in range(2):
@@ -1372,11 +1761,14 @@ def _smooth_road_edges(landscape: Image.Image, asphalt, is_colour) -> None:
             ground[bump] = C.PALE_CONCRETE
         rows = slice(y0 - top, y0 - top + (y1 - y0))
         landscape.paste(Image.fromarray(ground[rows]), (0, y0))
+        _announce_strip(show, "Smoothing road edges", index, count,
+                        None if image_at else landscape, span, True,
+                        image_at=image_at)
 
 
 def _paint_road_details(veg: Image.Image, landscape: Image.Image,
                         buckets: dict[str, list[OSMFeature]], proj: Projector,
-                        skip_rects=()) -> None:
+                        skip_rects=(), show=None, span=None) -> None:
     """Kerbs where pavement meets the road, and lines down two-lane roads.
 
     Asphalt ran straight into the pavement with nothing between them, and a
@@ -1399,15 +1791,30 @@ def _paint_road_details(veg: Image.Image, landscape: Image.Image,
             mask |= same
         return mask
 
-    _smooth_road_edges(landscape, asphalt, is_colour)
+    if span is None:
+        smooth_span = kerb_span = None
+        line_at = None
+    else:
+        start, end = span
+        smooth_span = (start, start + (end - start) * 0.4)
+        kerb_span = (start + (end - start) * 0.4, start + (end - start) * 0.85)
+        line_at = (start + (end - start) * 0.85, end)
+    preview = (lambda: _live_frame(landscape, veg)) if show is not None else None
+    _smooth_road_edges(landscape, asphalt, is_colour, show=show,
+                       span=smooth_span, image_at=preview)
 
     # Kerbs, a strip at a time, each strip read with a row of overlap so the
     # tiles either side of a seam still see their neighbours.
     kerb_for = {1: C.KERB_W, 2: C.KERB_N, 4: C.KERB_S, 8: C.KERB_E,
                 3: C.KERB_NW, 5: C.KERB_SW, 10: C.KERB_NE, 12: C.KERB_SE}
     strip = 1024
+    count = max(1, (h + strip - 1) // strip)
+    index = 0
     for y0 in range(0, h, strip):
+        index += 1
         y1 = min(h, y0 + strip)
+        _announce_strip(show, "Painting kerbs", index, count, None,
+                        kerb_span, False)
         top, bottom = max(0, y0 - 1), min(h, y1 + 1)
         ground = np.asarray(landscape.crop((0, top, w, bottom)))
         road = is_colour(ground, asphalt)
@@ -1427,6 +1834,8 @@ def _paint_road_details(veg: Image.Image, landscape: Image.Image,
         for bits, colour in kerb_for.items():
             out[(sides == bits) & free] = colour
         veg.paste(Image.fromarray(out), (0, y0))
+        _announce_strip(show, "Painting kerbs", index, count, None,
+                        kerb_span, True, image_at=preview)
 
     # Centre lines, on roads wide enough for two lanes and straight enough to
     # run along one axis of the tile grid; a line stepping round a diagonal
@@ -1468,7 +1877,14 @@ def _paint_road_details(veg: Image.Image, landscape: Image.Image,
     def road_at(x, y):
         return 0 <= x < w and 0 <= y < h and ground_px[x, y] in asphalt
 
-    for style, edge, ax, ay, bx, by, width in marks:
+    stride = max(1, len(marks) // 20)
+    for n, (style, edge, ax, ay, bx, by, width) in enumerate(marks, start=1):
+        if show is not None and (n == 1 or n == len(marks) or n % stride == 0):
+            work = None
+            if line_at is not None:
+                work = line_at[0] + (line_at[1] - line_at[0]) * (n / len(marks))
+            show(None, stage=f"Painting centre lines, {n} of {len(marks)}",
+                 work=work, image_at=preview)
         steps = int(max(abs(bx - ax), abs(by - ay)))
         for i in range(steps + 1):
             t = i / steps if steps else 0
@@ -1714,7 +2130,7 @@ def _paint_street_furniture(veg: Image.Image, landscape: Image.Image,
 
 def _pave_dense_ground(landscape: Image.Image, building_feats: list[OSMFeature],
                        buckets: dict[str, list[OSMFeature]], proj: Projector,
-                       cover=None):
+                       cover=None, show=None, span=None):
     """Pave the unmapped ground of built-up city blocks.
 
     Land OSM says nothing about is painted as wild grass, which is right in the
@@ -1747,6 +2163,9 @@ def _pave_dense_ground(landscape: Image.Image, building_feats: list[OSMFeature],
                     streets.append(LineString(pts))
     if not streets:
         return
+    if show is not None:
+        show(None, stage="Finding city blocks",
+             work=span[0] if span else None)
     blocks = [b.intersection(frame) for b in
               polygonize(unary_union(streets + [frame.exterior]))]
     blocks = [b for b in blocks if not b.is_empty and b.area > 50]
@@ -1789,11 +2208,18 @@ def _pave_dense_ground(landscape: Image.Image, building_feats: list[OSMFeature],
 
     # Strip by strip, so the colour tests never hold the whole map at once.
     strip = 1024
+    count = max(1, (h + strip - 1) // strip)
+    index = 0
     for y0 in range(0, h, strip):
+        index += 1
         y1 = min(h, y0 + strip)
+        _announce_strip(show, "Paving city blocks", index, count,
+                        landscape, span, False)
         mask = np.asarray(paved.crop((0, y0, w, y1))) > 0
         mask &= np.asarray(keep.crop((0, y0, w, y1))) == 0
         if not mask.any():
+            _announce_strip(show, "Paving city blocks", index, count,
+                            landscape, span, True)
             continue
         ground = np.asarray(landscape.crop((0, y0, w, y1)))
         grass = np.zeros(mask.shape, dtype=bool)
@@ -1808,6 +2234,8 @@ def _pave_dense_ground(landscape: Image.Image, building_feats: list[OSMFeature],
             landscape.paste(paint, (0, y0), Image.fromarray(mask.astype(np.uint8) * 255))
             if cover is not None:
                 cover.paint_mask(mask, biomes.TOWN, y0)
+        _announce_strip(show, "Paving city blocks", index, count,
+                        landscape, span, True)
     return True
 
 
@@ -2435,13 +2863,179 @@ def _zones_geojson(buckets: dict[str, list[OSMFeature]]) -> dict:
     return {"type": "FeatureCollection", "features": features}
 
 
-def _write_biomes(cover, output_dir: str, map_name: str) -> None:
-    """The game's biome index, plus the coloured overlay the window shows."""
-    cover.save(os.path.join(output_dir, f"{map_name}_biome.png"))
-    cover.save_overlay(os.path.join(output_dir, f"{map_name}_biome_overlay.png"))
+def _half_cores() -> int:
+    """How many picture bands to compress at once while map files are written.
+
+    Half the logical processors. The other half stays free so the machine
+    does not stall for the whole of a large mod.
+    """
+    return max(1, (os.cpu_count() or 1) // 2)
+
+
+def _write_biome_legend(output_dir: str, map_name: str) -> None:
+    """Names and colours for the biome overlay the window shows."""
     with open(os.path.join(output_dir, f"{map_name}_biome_legend.json"),
               "w", encoding="utf-8") as handle:
         json.dump(biomes.overlay_legend(), handle)
+
+
+class _BandedPng:
+    """One PNG split into horizontal bands, filled in as each band finishes."""
+
+    def __init__(self, path: str, width: int, height: int, kind: str,
+                 count: int, group: str) -> None:
+        self.path = path
+        self.width = width
+        self.height = height
+        self.kind = kind
+        self.parts: list = [None] * count
+        self.left = count
+        self.group = group
+
+
+def _band_rows(height: int, workers: int) -> list[tuple[int, int]]:
+    """Row ranges that cover `height`, one band per core in use."""
+    count = max(1, min(workers, height))
+    spans = []
+    start = 0
+    for i in range(count):
+        end = height * (i + 1) // count
+        if end > start:
+            spans.append((start, end))
+            start = end
+    return spans
+
+
+def _png_worth_tiling(width: int, height: int, workers: int) -> bool:
+    """Small pictures cost more to split than they cost to compress whole."""
+    return workers > 1 and height >= 2 and width * height >= 512 * 512
+
+
+def _adler_combine(adler1: int, adler2: int, len2: int) -> int:
+    """Adler-32 of two adjacent blocks, the same rule zlib uses."""
+    base = 65521
+    rem = len2 % base
+    sum1 = adler1 & 0xffff
+    sum2 = (rem * sum1) % base
+    sum1 = (sum1 + (adler2 & 0xffff) + base - 1) % base
+    sum2 = (sum2 + ((adler1 >> 16) & 0xffff) + ((adler2 >> 16) & 0xffff)
+            + base - rem) % base
+    return (sum1 | (sum2 << 16)) & 0xffffffff
+
+
+def _deflate_rows(pixels) -> tuple[bytes, int, int]:
+    """Raw deflate of one band, sync-flushed so the next band can follow.
+
+    `pixels` is rows by (width * bytes per pixel). A zero filter byte is
+    written in front of every row, which is a legal PNG scanline.
+    """
+    import zlib
+    import numpy as np
+
+    rows, stride = pixels.shape
+    filtered = np.empty((rows, stride + 1), dtype=np.uint8)
+    filtered[:, 0] = 0
+    filtered[:, 1:] = pixels
+    data = np.ascontiguousarray(filtered).tobytes()
+    compressor = zlib.compressobj(6, zlib.DEFLATED, -15)
+    comp = compressor.compress(data) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    return comp, zlib.adler32(data) & 0xffffffff, len(data)
+
+
+def _png_band_job(kind: str, raw: bytes, y0: int, y1: int,
+                  width: int) -> tuple[bytes, int, int]:
+    """Compress rows y0..y1 of a picture. Overlay bands are coloured here."""
+    import numpy as np
+
+    if kind == "overlay":
+        index = np.frombuffer(raw, dtype=np.uint8).reshape(-1, width)
+        band = index[y0:y1]
+        rgba = np.zeros((band.shape[0], width, 4), dtype=np.uint8)
+        for value, rgb, _biome, _zone in biomes.OVERLAY_ROWS:
+            mask = band == value
+            rgba[mask, 0] = rgb[0]
+            rgba[mask, 1] = rgb[1]
+            rgba[mask, 2] = rgb[2]
+            rgba[mask, 3] = 148
+        return _deflate_rows(rgba.reshape(band.shape[0], width * 4))
+    bpp = {"L": 1, "RGB": 3, "RGBA": 4}[kind]
+    pixels = np.frombuffer(raw, dtype=np.uint8).reshape(-1, width * bpp)
+    return _deflate_rows(pixels[y0:y1])
+
+
+def _save_png_direct(image, path: str) -> None:
+    image.save(path, format="PNG")
+
+
+def _queue_png(executor, pending: dict, image, path: str, kind: str,
+               group: str, workers: int) -> None:
+    """Hand one picture to the pool, whole when it is small, else in bands."""
+    if kind in ("L", "overlay"):
+        image = image.convert("L")
+    elif kind == "RGB":
+        image = image.convert("RGB")
+    elif kind == "RGBA":
+        image = image.convert("RGBA")
+    width, height = image.size
+    if kind != "overlay" and not _png_worth_tiling(width, height, workers):
+        pending[executor.submit(_save_png_direct, image, path)] = ("group", group)
+        return
+    if kind == "overlay" and not _png_worth_tiling(width, height, workers):
+        pending[executor.submit(_save_overlay_direct, image, path)] = (
+            "group", group)
+        return
+    raw = image.tobytes()
+    spans = _band_rows(height, workers)
+    state = _BandedPng(path, width, height, kind, len(spans), group)
+    for index, (y0, y1) in enumerate(spans):
+        pending[executor.submit(_png_band_job, kind, raw, y0, y1, width)] = (
+            "band", state, index)
+
+
+def _save_overlay_direct(image, path: str) -> None:
+    """The coloured biome overlay, for a picture too small to split."""
+    import numpy as np
+
+    index = np.asarray(image.convert("L"))
+    rgba = np.zeros((index.shape[0], index.shape[1], 4), dtype=np.uint8)
+    for value, rgb, _biome, _zone in biomes.OVERLAY_ROWS:
+        mask = index == value
+        rgba[mask, 0] = rgb[0]
+        rgba[mask, 1] = rgb[1]
+        rgba[mask, 2] = rgb[2]
+        rgba[mask, 3] = 148
+    Image.fromarray(rgba, mode="RGBA").save(path, format="PNG")
+
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    import struct
+    import zlib
+    crc = zlib.crc32(tag + data) & 0xffffffff
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+
+def _write_banded_png(state: _BandedPng) -> None:
+    """Join sync-flushed bands into one PNG the game and the window can read."""
+    import struct
+    import zlib
+
+    color = {"L": 0, "RGB": 2, "RGBA": 6, "overlay": 6}[state.kind]
+    ihdr = struct.pack(">IIBBBBB", state.width, state.height, 8, color, 0, 0, 0)
+    adler = 1
+    blocks = []
+    for comp, part_adler, part_len in state.parts:
+        blocks.append(comp)
+        adler = _adler_combine(adler, part_adler, part_len)
+    compressor = zlib.compressobj(6, zlib.DEFLATED, -15)
+    blocks.append(compressor.flush(zlib.Z_FINISH))
+    stream = b"\x78\x9c" + b"".join(blocks) + struct.pack(">I", adler)
+    chunks = [_png_chunk(b"IHDR", ihdr)]
+    step = 1 << 20
+    for offset in range(0, len(stream), step):
+        chunks.append(_png_chunk(b"IDAT", stream[offset:offset + step]))
+    chunks.append(_png_chunk(b"IEND", b""))
+    with open(state.path, "wb") as handle:
+        handle.write(b"\x89PNG\r\n\x1a\n" + b"".join(chunks))
 
 
 def _roads_geojson(feats, classify) -> dict:
@@ -2786,6 +3380,45 @@ def _build_spawn_map(landscape: Image.Image, w: int, h: int,
     return out
 
 
+def _fit(image: Image.Image, longest: int) -> Image.Image:
+    """A copy no longer than `longest` on its long side."""
+    width, height = image.size
+    longest = max(1, int(longest))
+    if max(width, height) <= longest:
+        return image.copy()
+    scale = longest / max(width, height)
+    size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    return image.resize(size, Image.Resampling.BOX)
+
+
+def _live_frame(landscape: Image.Image, vegetation: Image.Image | None) -> Image.Image:
+    """A small picture for the window. Runs on the preview thread.
+
+    The bitmaps stay unlocked. A torn sample is acceptable; waiting on them
+    would hold up the threads that are still drawing and saving the map.
+    """
+    ground = _fit(landscape, 2048)
+    if vegetation is None:
+        return ground
+    trees = _fit(vegetation, 2048)
+    if trees.size != ground.size:
+        trees = trees.resize(ground.size, Image.Resampling.BOX)
+    return _build_preview(ground, trees)
+
+
+def _queue_view_file(landscape: Image.Image, vegetation: Image.Image, path: str,
+                     publish) -> None:
+    """Write the human preview without making the piece wait for it."""
+    def build():
+        ground, trees = landscape.copy(), vegetation.copy()
+        image = _build_preview(ground, trees)
+        image.save(path, format="PNG")
+        return _fit(image, 2048)
+
+    import knoxpreview
+    knoxpreview.submit(path, build, publish)
+
+
 def _build_preview(landscape: Image.Image, vegetation: Image.Image) -> Image.Image:
     """Human-friendly PNG: landscape with trees painted dark green."""
     import numpy as np
@@ -2806,6 +3439,9 @@ def _build_preview(landscape: Image.Image, vegetation: Image.Image) -> Image.Ima
         pack(C.BUSHES_TREES_DARK_GRASS),
     )
     for top in range(0, height, 512):
+        # The picture is lower priority than the map. Let a drawing thread
+        # take the interpreter between bands.
+        time.sleep(0)
         bottom = min(height, top + 512)
         band = np.array(vegetation.crop((0, top, width, bottom)), dtype=np.uint8)
         key = np.empty((bottom - top, width), dtype=np.uint32)
@@ -3043,12 +3679,13 @@ def _houses_along_streets(buckets: dict, buildings: list["OSMFeature"],
     still there, so a house goes on each side, clear of the pavement and of
     every footprint and land use already mapped.
     """
-    from shapely.geometry import LineString, Point, Polygon, box
-    from shapely.prepared import prep
+    import numpy as np
+    import shapely
     from shapely.strtree import STRtree
 
-    roads, road_half = [], []
-    streets = []
+    chosen = []
+    halves = []
+    is_street = []
     for cat in ADDRESS_AVOIDS_ROADS:
         for feat in buckets.get(cat, []):
             if feat.kind != "way" or len(feat.geometry) < 2:
@@ -3057,45 +3694,26 @@ def _houses_along_streets(buckets: dict, buildings: list["OSMFeature"],
                 continue
             if feat.tags.get("junction") in {"roundabout", "circular"}:
                 continue
-            line = LineString([proj.to_px(la, lo) for la, lo in feat.geometry])
-            if line.is_empty or line.length <= 0:
-                continue
-            half = _way_width_m(feat, cat) / proj.meters_per_tile / 2
-            roads.append(line)
-            road_half.append(half)
+            chosen.append(feat)
+            halves.append(_way_width_m(feat, cat) / proj.meters_per_tile / 2)
             highway = feat.tags.get("highway")
-            if cat != "road_minor" or highway not in STREET_FILL_HIGHWAYS:
-                continue
-            if feat.tags.get("tunnel") in {"yes", "building_passage"}:
-                continue
-            if feat.tags.get("bridge") in {"yes", "viaduct", "aqueduct"}:
-                continue
-            streets.append((line, half))
-    if not streets:
+            is_street.append(
+                cat == "road_minor"
+                and highway in STREET_FILL_HIGHWAYS
+                and feat.tags.get("tunnel") not in {"yes", "building_passage"}
+                and feat.tags.get("bridge") not in {"yes", "viaduct", "aqueduct"})
+    if not any(is_street):
         return []
-
-    shapes = []
-    for feat in buildings:
-        for ring in _feature_coords_px(feat, proj):
-            if len(ring) < 3:
-                continue
-            try:
-                poly = Polygon(ring)
-            except (ValueError, TypeError):
-                continue
-            if not poly.is_valid:
-                poly = poly.buffer(0)
-            if not poly.is_empty:
-                shapes.append(poly)
-    tree = STRtree(shapes) if shapes else None
-
-    blocked = []
-    for cat in STREET_HOUSE_AVOIDS:
-        for feat in buckets.get(cat, []):
-            blocked.extend(_area_polygons_px(feat, proj))
-    block_tree = STRtree(blocked) if blocked else None
-    road_tree = STRtree(roads) if roads else None
-    inside = prep(clip) if clip is not None else None
+    parts = _rings_px(chosen, proj, 2)
+    lines = _lines_xy(parts)
+    lengths = np.asarray(shapely.length(lines), dtype=np.float64)
+    alive = lengths > 0
+    lines = lines[alive]
+    lengths = lengths[alive]
+    half = np.asarray(halves, dtype=np.float64)[alive]
+    street = np.asarray(is_street, dtype=bool)[alive]
+    if not street.any():
+        return []
 
     mpt = proj.meters_per_tile
     step = STREET_HOUSE_STEP_M / mpt
@@ -3107,70 +3725,177 @@ def _houses_along_streets(buckets: dict, buildings: list["OSMFeature"],
     half_h = (ADDRESS_HOUSE_M[1] / mpt) / 2
     reach = max(half_w, half_h)
     apart = math.hypot(ADDRESS_HOUSE_M[0], ADDRESS_HOUSE_M[1]) / mpt
-    taken: dict[tuple[int, int], list] = {}
-    cell = max(1.0, apart)
-    made = []
-    next_id = STREET_HOUSE_FIRST_ID
-
-    for line, half in streets:
-        if len(made) >= MAX_STREET_HOUSES:
-            break
-        length = line.length
+    street_lines = lines[street]
+    street_half = half[street]
+    street_len = lengths[street]
+    sample_line = []
+    sample_at = []
+    sample_ahead = []
+    sample_off = []
+    for index, length in enumerate(street_len):
+        length = float(length)
         if length < step + margin:
             continue
-        offset = half + sidewalk + setback + reach
+        offset = float(street_half[index]) + sidewalk + setback + reach
         dist = margin
-        while dist <= length - margin:
-            if len(made) >= MAX_STREET_HOUSES:
-                break
-            at = line.interpolate(dist)
-            ahead = line.interpolate(min(length, dist + 2.0))
-            dx, dy = ahead.x - at.x, ahead.y - at.y
-            norm = math.hypot(dx, dy)
-            if norm < 1e-6:
-                dist += step
-                continue
-            px, py = -dy / norm, dx / norm
-            for side in (-1.0, 1.0):
-                if len(made) >= MAX_STREET_HOUSES:
-                    break
-                x = at.x + px * offset * side
-                y = at.y + py * offset * side
-                if (x - half_w < 0 or y - half_h < 0
-                        or x + half_w >= proj.width or y + half_h >= proj.height):
-                    continue
-                here = Point(x, y)
-                if inside is not None and not inside.contains(here):
-                    continue
-                house = box(x - half_w, y - half_h, x + half_w, y + half_h)
-                if block_tree is not None and any(
-                        blocked[int(i)].intersects(house)
-                        for i in block_tree.query(house)):
-                    continue
-                if tree is not None and any(
-                        shapes[int(i)].distance(house) <= clear
-                        for i in tree.query(house.buffer(clear))):
-                    continue
-                if road_tree is not None and any(
-                        roads[int(i)].distance(house) < road_half[int(i)] + sidewalk
-                        for i in road_tree.query(house.buffer(offset))):
-                    continue
-                key = (int(x // cell), int(y // cell))
-                crowd = [p for gx in (-1, 0, 1) for gy in (-1, 0, 1)
-                         for p in taken.get((key[0] + gx, key[1] + gy), ())]
-                if any((qx - x) ** 2 + (qy - y) ** 2 < apart * apart
-                       for qx, qy in crowd):
-                    continue
-                taken.setdefault(key, []).append((x, y))
-                ring = [(x - half_w, y - half_h), (x + half_w, y - half_h),
-                        (x + half_w, y + half_h), (x - half_w, y + half_h),
-                        (x - half_w, y - half_h)]
-                made.append(OSMFeature(
-                    osm_id=next_id, kind="way",
-                    tags={"building": "house"},
-                    geometry=[proj.to_latlon(rx, ry) for rx, ry in ring]))
-                next_id -= 1
+        limit = length - margin
+        while dist <= limit:
+            sample_line.append(index)
+            sample_at.append(dist)
+            sample_ahead.append(min(length, dist + 2.0))
+            sample_off.append(offset)
             dist += step
+    if not sample_at:
+        return []
+    ids = np.asarray(sample_line, dtype=np.int64)
+    at_d = np.asarray(sample_at, dtype=np.float64)
+    ahead_d = np.asarray(sample_ahead, dtype=np.float64)
+    at = shapely.line_interpolate_point(street_lines[ids], at_d)
+    ahead = shapely.line_interpolate_point(street_lines[ids], ahead_d)
+    ac = shapely.get_coordinates(at)
+    bc = shapely.get_coordinates(ahead)
+    if ac.shape[0] != len(at_d) or bc.shape[0] != len(at_d):
+        raise ValueError(
+            f"street samples {len(at_d)} came back as {ac.shape[0]} and {bc.shape[0]}")
+    dx = bc[:, 0] - ac[:, 0]
+    dy = bc[:, 1] - ac[:, 1]
+    norm = np.hypot(dx, dy)
+    good = norm >= 1e-6
+    if not good.any():
+        return []
+    ac = ac[good]
+    dx = dx[good]
+    dy = dy[good]
+    norm = norm[good]
+    offs = np.asarray(sample_off, dtype=np.float64)[good]
+    ux = -dy / norm
+    uy = dx / norm
+    n = len(offs)
+    xs = np.empty(n * 2, dtype=np.float64)
+    ys = np.empty(n * 2, dtype=np.float64)
+    offsets = np.empty(n * 2, dtype=np.float64)
+    xs[0::2] = ac[:, 0] - ux * offs
+    ys[0::2] = ac[:, 1] - uy * offs
+    xs[1::2] = ac[:, 0] + ux * offs
+    ys[1::2] = ac[:, 1] + uy * offs
+    offsets[0::2] = offs
+    offsets[1::2] = offs
+    inbound = ((xs - half_w >= 0) & (ys - half_h >= 0)
+               & (xs + half_w < proj.width) & (ys + half_h < proj.height))
+    if not inbound.any():
+        return []
+    xs = xs[inbound]
+    ys = ys[inbound]
+    offsets = offsets[inbound]
+
+    try:
+        shape_parts = _rings_px(buildings, proj, 3)
+        shapes = (_nonempty(_repair(_polygons_xy(shape_parts)))
+                  if shape_parts else np.empty(0, dtype=object))
+    except (ValueError, TypeError):
+        from shapely.geometry import Polygon
+        shapes = []
+        for feat in buildings:
+            for ring in _feature_coords_px(feat, proj):
+                if len(ring) < 3:
+                    continue
+                try:
+                    poly = Polygon(np.asarray(ring, dtype=np.float64))
+                except (ValueError, TypeError):
+                    continue
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if not poly.is_empty:
+                    shapes.append(poly)
+        shapes = np.asarray(shapes, dtype=object)
+    tree = STRtree(shapes) if len(shapes) else None
+
+    blocked_ways = []
+    blocked = []
+    for cat in STREET_HOUSE_AVOIDS:
+        for feat in buckets.get(cat, []):
+            if not _is_polygon(feat):
+                continue
+            if feat.kind == "way" and len(feat.geometry) >= 4:
+                blocked_ways.append(feat)
+            elif feat.kind != "way":
+                blocked.extend(_area_polygons_px(feat, proj))
+    try:
+        blocked_parts = _rings_px(blocked_ways, proj, 4)
+        if blocked_parts:
+            blocked.extend(_nonempty(_repair(_polygons_xy(blocked_parts))).tolist())
+    except (ValueError, TypeError):
+        for feat in blocked_ways:
+            blocked.extend(_area_polygons_px(feat, proj))
+    block_tree = STRtree(blocked) if blocked else None
+    road_tree = STRtree(lines) if len(lines) else None
+
+    ok = np.ones(len(xs), dtype=bool)
+    if clip is not None:
+        ok &= np.asarray(shapely.contains_xy(clip, xs, ys), dtype=bool)
+    houses = shapely.box(xs - half_w, ys - half_h, xs + half_w, ys + half_h)
+    if block_tree is not None:
+        ok &= ~_any_hit(block_tree, houses, predicate="intersects")
+    if tree is not None:
+        ok &= ~_any_hit(tree, houses, predicate="dwithin", distance=clear)
+    if road_tree is not None:
+        query = shapely.box(xs - half_w - offsets, ys - half_h - offsets,
+                            xs + half_w + offsets, ys + half_h + offsets)
+        hits = road_tree.query(np.asarray(query, dtype=object))
+        hits = np.asarray(hits)
+        if hits.size and hits.ndim == 2:
+            hi, ri = hits[0], hits[1]
+            dists = np.asarray(shapely.distance(houses[hi], lines[ri]), dtype=np.float64)
+            close = dists < (half[ri] + sidewalk)
+            if close.any():
+                ok[hi[close]] = False
+
+    taken: dict[tuple[int, int], list] = {}
+    cell = max(1.0, apart)
+    accepted = []
+    for index in range(len(xs)):
+        if len(accepted) >= MAX_STREET_HOUSES:
+            break
+        if not ok[index]:
+            continue
+        x = float(xs[index])
+        y = float(ys[index])
+        key = (int(x // cell), int(y // cell))
+        crowd = [p for gx in (-1, 0, 1) for gy in (-1, 0, 1)
+                 for p in taken.get((key[0] + gx, key[1] + gy), ())]
+        if any((qx - x) ** 2 + (qy - y) ** 2 < apart * apart for qx, qy in crowd):
+            continue
+        taken.setdefault(key, []).append((x, y))
+        accepted.append((x, y))
+    if not accepted:
+        return []
+    count = len(accepted)
+    ax = np.fromiter((p[0] for p in accepted), dtype=np.float64, count=count)
+    ay = np.fromiter((p[1] for p in accepted), dtype=np.float64, count=count)
+    cx = np.empty(count * 5, dtype=np.float64)
+    cy = np.empty(count * 5, dtype=np.float64)
+    cx[0::5] = ax - half_w
+    cy[0::5] = ay - half_h
+    cx[1::5] = ax + half_w
+    cy[1::5] = ay - half_h
+    cx[2::5] = ax + half_w
+    cy[2::5] = ay + half_h
+    cx[3::5] = ax - half_w
+    cy[3::5] = ay + half_h
+    cx[4::5] = ax - half_w
+    cy[4::5] = ay - half_h
+    lats, lons = _unproject_xy(proj, cx, cy)
+    made = []
+    next_id = STREET_HOUSE_FIRST_ID
+    for index in range(count):
+        start = index * 5
+        ring = [(float(lats[start + corner]), float(lons[start + corner]))
+                for corner in range(5)]
+        made.append(OSMFeature(
+            osm_id=next_id, kind="way",
+            tags={"building": "house"},
+            geometry=ring))
+        next_id -= 1
     return made
 
 
