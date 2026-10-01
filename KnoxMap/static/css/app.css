@@ -749,19 +749,25 @@ html:not([data-theme="light"]) .leaflet-draw-toolbar a:hover { background-color:
 #map .knox-map-tools .knox-edit-tools .leaflet-draw-toolbar { margin-top: 12px; }
 #map .knox-map-tools .leaflet-draw-toolbar a.lasso-btn,
 #map .knox-map-tools .leaflet-draw-toolbar a.marker-btn,
-#map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn {
+#map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn,
+#map .knox-map-tools .leaflet-draw-toolbar a.leaflet-draw-edit-edit {
   background-image: none;
   text-align: center;
 }
 #map .knox-map-tools .leaflet-draw-toolbar a.lasso-btn { font-size: 17px; line-height: 26px; }
 #map.leaflet-touch .knox-map-tools .leaflet-draw-toolbar a.lasso-btn { line-height: 30px; }
 #map .knox-map-tools .leaflet-draw-toolbar a.marker-btn,
-#map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn {
+#map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn,
+#map .knox-map-tools .leaflet-draw-toolbar a.leaflet-draw-edit-edit {
   display: flex; align-items: center; justify-content: center; line-height: 0;
 }
 #map .knox-map-tools .leaflet-draw-toolbar a.marker-btn svg,
-#map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn svg {
+#map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn svg,
+#map .knox-map-tools .leaflet-draw-toolbar a.leaflet-draw-edit-edit svg {
   width: 15px; height: 15px; margin: 0; display: block; pointer-events: none;
+}
+#map .knox-map-tools .leaflet-draw-toolbar a.leaflet-draw-edit-edit.leaflet-disabled {
+  color: var(--muted); cursor: default;
 }
 #map .knox-map-tools .leaflet-draw-toolbar a.lasso-btn.is-active,
 #map .knox-map-tools .leaflet-draw-toolbar a.marker-btn.is-on,
@@ -774,12 +780,17 @@ html:not([data-theme="light"]) .leaflet-draw-toolbar a:hover { background-color:
 }
 html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.lasso-btn,
 html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.marker-btn,
-html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn {
+html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn,
+html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.leaflet-draw-edit-edit {
   background-color: var(--panel); background-image: none; filter: none; color: var(--text);
+}
+html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.leaflet-draw-edit-edit.leaflet-disabled {
+  color: var(--muted);
 }
 html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.lasso-btn:hover,
 html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.marker-btn:hover,
-html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn:hover {
+html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.eraser-btn:hover,
+html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.leaflet-draw-edit-edit:hover {
   background-color: var(--hover); filter: none;
 }
 html:not([data-theme="light"]) #map .knox-map-tools .leaflet-draw-toolbar a.lasso-btn.is-active,

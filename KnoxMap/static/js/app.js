@@ -97,7 +97,7 @@ const VanillaOverlayControl = L.Control.extend({
     btn.setAttribute('aria-pressed', 'false');
     btn.title = 'Overlay Vanilla Map';
     btn.setAttribute('aria-label', 'Overlay Vanilla Map');
-    btn.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M8 1.6 14 4.6 8 7.6 2 4.6Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" d="M2 8 8 11l6-3"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" d="M2 11.2 8 14.2l6-3"/></svg>';
+    btn.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" d="M1.6 4.2 6 2.4l4 1.6 4.4-1.8v9.6L10 13.6l-4-1.6-4.4 1.8Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M6 2.4v9.6M10 4v9.6"/></svg>';
     const note = L.DomUtil.create('div', 'hint', box);
     note.id = 'vanillaNote';
     L.DomEvent.disableClickPropagation(box);
@@ -236,7 +236,7 @@ const LassoControl = L.Control.extend({
     marker.title = MARKER_TIP;
     marker.setAttribute('role', 'button');
     marker.setAttribute('aria-pressed', 'false');
-    marker.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M2.4 13.4 3.6 10.1 11.5 2.1 13.7 4.3 5.7 12.3z"/></svg>';
+    marker.innerHTML = '<svg viewBox="315 14 32 32" aria-hidden="true"><path fill="currentColor" d="m 337,30.156 0,0.407 0,5.604 c 0,1.658 -1.344,3 -3,3 l -10,0 c -1.655,0 -3,-1.342 -3,-3 l 0,-10 c 0,-1.657 1.345,-3 3,-3 l 6.345,0 3.19,-3.17 -9.535,0 c -3.313,0 -6,2.687 -6,6 l 0,10 c 0,3.313 2.687,6 6,6 l 10,0 c 3.314,0 6,-2.687 6,-6 l 0,-8.809 -3,2.968"/><path fill="currentColor" d="m 338.72,24.637 -8.892,8.892 -2.828,0 0,-2.829 8.89,-8.89 z"/><path fill="currentColor" d="m 338.697,17.826 4,0 0,4 -4,0 z" transform="matrix(-0.70698336,-0.70723018,0.70723018,-0.70698336,567.55917,274.78273)"/></svg>';
     L.DomEvent.on(marker, 'click', (ev) => {
       L.DomEvent.stop(ev);
       setMarkerMode(!markerMode);
@@ -268,6 +268,7 @@ function arrangeMapTools() {
   const overlay = document.querySelector('#map .vanilla-overlay-control');
   const lassoBar = document.querySelector('#map .lasso-control');
   if (!corner || !shapeBtn || !editBtn || !lasso || !eraser || !marker || !zoom || !drawEl) return;
+  editBtn.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M2.3 10.6 4.5 12.8 10.4 6.9 13.2 2.9 8.3 4.6z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M2 14.3h6.2"/></svg>';
 
   const shapeBar = shapeBtn.closest('.leaflet-draw-toolbar');
   const shapeSection = shapeBtn.closest('.leaflet-draw-section');
