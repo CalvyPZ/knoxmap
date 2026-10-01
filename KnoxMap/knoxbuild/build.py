@@ -20,9 +20,7 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import (
-    FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait,
-)
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import numpy as np
 from shapely.geometry import Polygon
@@ -1332,16 +1330,41 @@ def _make_batch(batch: list) -> list:
     return [_make_one(job) for job in batch]
 
 
+def _timed_batch(batch: list):
+    """One queue task, and how long the worker spent inside it.
+
+    The third value is Stop. The elapsed time is what the feeder uses to
+    decide whether the queue already holds five seconds of work per core.
+    """
+    t0 = time.perf_counter()
+    try:
+        made = _make_batch(batch)
+    except knoxstop.Stopped:
+        return None, 0.0, True
+    return made, time.perf_counter() - t0, False
+
+
 # Below this many buildings, starting workers costs more than it saves.
 PARALLEL_FROM = 60
 
 # How long to wait for the first finished building. Packed workers have sat
 # at no CPU and finished nothing; past this the same layout runs here.
-_LAYOUT_STALL_S = 90
+# A mall is one building and can take a couple of minutes, so this has to
+# be longer than that or the pool is thrown away and the town is laid out
+# on a single core.
+_LAYOUT_STALL_S = 300
 
-# Buildings handed to a worker in one task. Two keeps enough tasks in flight
-# to occupy high-core-count CPUs while still amortising process IPC.
-_LAYOUT_BATCH = 2
+# After the largest buildings have been handed out one at a time, the rest
+# travel in tasks of this many. A house finishes faster than the round trip
+# to a worker, so a bigger task is what keeps the cores busy. The largest
+# stay alone: one task of sixteen malls would leave every other core idle.
+_LAYOUT_TAIL = 16
+_LAYOUT_HEAD_WAVES = 4
+
+# The progress picture waits until the queue holds this many seconds of
+# layout for every core. Feeding the cores comes first; a frame is drawn
+# only once that cushion is already sitting in the queue.
+_PREVIEW_BACKLOG_S = 5.0
 
 # Share of a mod's building pass. Used only to turn elapsed time into an ETA;
 # the estimate corrects itself as each stage actually finishes.
@@ -1527,30 +1550,6 @@ def _shutdown(pool, wait: bool, cancel: bool) -> None:
         pool.shutdown(wait=wait)
 
 
-def _alive(proc) -> bool:
-    try:
-        return bool(proc.is_alive())
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _kill_processes(pool, event) -> None:
-    """Stop is stuck if the pool is left to finish the queue. Cancel what has
-    not started, then terminate whatever is still inside one building."""
-    event.set()
-    _shutdown(pool, wait=False, cancel=True)
-    procs = list((getattr(pool, "_processes", None) or {}).values())
-    deadline = time.time() + 0.5
-    while time.time() < deadline and any(_alive(proc) for proc in procs):
-        time.sleep(0.05)
-    for proc in procs:
-        if _alive(proc):
-            try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
-
-
 def _run_ordered(fn, items, workers: int, should_stop, on_done, *, processes: bool):
     """Run `fn` over `items` on threads, results in input order.
 
@@ -1672,7 +1671,7 @@ class LayoutPool:
 
     def __init__(self, should_stop=None):
         self.should_stop = should_stop
-        self.executor = None
+        self.mp = None
         self.event = None
         self.workers = 0
         self.broken = False
@@ -1682,7 +1681,7 @@ class LayoutPool:
     def ensure(self, workers: int) -> bool:
         if self.broken or self._closed:
             return False
-        if self.executor is not None:
+        if self.mp is not None:
             return True
         _blas_one_thread()
         import multiprocessing
@@ -1706,15 +1705,18 @@ class LayoutPool:
 
         threading.Thread(target=watch, name="knoxbuild-stop", daemon=True).start()
         try:
-            self.executor = ProcessPoolExecutor(
-                max_workers=self.workers,
+            # Pool's task queue is unbounded, so the feeder can stack enough
+            # buildings for every core to stay busy while a progress frame
+            # is drawn. A process-pool executor only keeps one spare task.
+            self.mp = multiprocessing.Pool(
+                processes=self.workers,
                 initializer=_init_layout_worker,
                 initargs=(self.event, self._import_lock),
             )
             _trace(f"layout pool ready ({self.workers} workers)")
         except OSError:
             self.broken = True
-            self.executor = None
+            self.mp = None
             if self._watch_done is not None:
                 self._watch_done.set()
             return False
@@ -1725,61 +1727,148 @@ class LayoutPool:
         self.broken = True
         if self._watch_done is not None:
             self._watch_done.set()
-        executor = self.executor
-        self.executor = None
-        if executor is None:
+        mp = self.mp
+        self.mp = None
+        if mp is None:
             return
         event = self.event
         if event is not None:
             event.set()
-        _kill_processes(executor, event)
+        mp.terminate()
+        mp.join()
 
     def close(self) -> None:
         """Wait for workers to finish. A pool that was killed stays dead."""
-        if self._closed and self.executor is None:
+        if self._closed and self.mp is None:
             return
         self._closed = True
-        if self.broken or self.executor is None:
-            if self.executor is not None:
+        if self.broken or self.mp is None:
+            if self.mp is not None:
                 self.kill()
             elif self._watch_done is not None:
                 self._watch_done.set()
             return
         if self._watch_done is not None:
             self._watch_done.set()
-        executor = self.executor
-        self.executor = None
-        _shutdown(executor, wait=True, cancel=False)
+        mp = self.mp
+        self.mp = None
+        mp.close()
+        mp.join()
+
+
+def _layout_batches(jobs, workers: int) -> tuple[list, list]:
+    """Tasks of buildings, and the job index each slot in a task came from.
+
+    The biggest footprints go out alone, a few waves of them, so sixteen
+    workers can each be inside a mall at once. Everything after that is
+    striped: task 0 gets the next-largest and then every Nth smaller one,
+    instead of a solid run of the buildings that are still big.
+    """
+    n = len(jobs)
+    workers = max(1, int(workers))
+    head_n = min(n, workers * _LAYOUT_HEAD_WAVES)
+    groups = [[i] for i in range(head_n)]
+    rest_n = n - head_n
+    if rest_n:
+        nbatches = max(workers, (rest_n + _LAYOUT_TAIL - 1) // _LAYOUT_TAIL)
+        tails: list[list[int]] = [[] for _ in range(nbatches)]
+        for n_i, i in enumerate(range(head_n, n)):
+            tails[n_i % nbatches].append(i)
+        groups.extend(t for t in tails if t)
+    batches = [[jobs[i] for i in group] for group in groups]
+    return batches, groups
 
 
 def _layout_on_pool(pool: LayoutPool, jobs, should_stop, on_done,
                     on_state=None) -> list:
-    batches = [jobs[i:i + _LAYOUT_BATCH]
-               for i in range(0, len(jobs), _LAYOUT_BATCH)]
-    weights = [len(batch) for batch in batches]
-    results: list = [None] * len(batches)
-    limit = max(1, min(pool.workers, len(batches)))
+    """Lay out every building. The task queue is filled before any preview.
 
-    def report_state(active_batches, completed_batches):
+    A frame is drawn only when the tasks not yet started will keep every
+    core busy for `_PREVIEW_BACKLOG_S` seconds. Until a worker has reported
+    how long a task takes, nothing is drawn and the queue keeps growing.
+    """
+    batches, groups = _layout_batches(jobs, pool.workers)
+    weights = [len(batch) for batch in batches]
+    n = len(batches)
+    workers = max(1, pool.workers)
+    results: list = [None] * n
+    pending: dict = {}
+    completed: set[int] = set()
+    next_i = 0
+    finished = 0
+    done_n = 0
+    avg = None
+    started = time.monotonic()
+    last_paint = 0.0
+    _trace(f"layout tasks {n} for {len(jobs)} buildings ({workers} workers)")
+
+    def backlog_s() -> float:
+        if not avg:
+            return 0.0
+        queued = max(0, len(pending) - workers)
+        return queued * avg
+
+    def feed() -> None:
+        nonlocal next_i
+        while next_i < n:
+            queued = max(0, len(pending) - workers)
+            # No pace yet: give every core one waiting task, then wait for
+            # a time. Do not draw, and do not pickle the whole town blind.
+            if avg is None:
+                if queued >= workers:
+                    return
+            elif queued * avg >= _PREVIEW_BACKLOG_S * workers:
+                return
+            pending[next_i] = pool.mp.apply_async(_timed_batch, (batches[next_i],))
+            next_i += 1
+
+    def paint() -> None:
         if on_state is None:
             return
-        active = {i for batch in active_batches
-                  for i in range(batch * _LAYOUT_BATCH,
-                                 min((batch + 1) * _LAYOUT_BATCH, len(jobs)))}
-        completed = {i for batch in completed_batches
-                     for i in range(batch * _LAYOUT_BATCH,
-                                    min((batch + 1) * _LAYOUT_BATCH, len(jobs)))}
-        on_state(active, completed)
+        unfinished = [i for i in range(next_i) if i not in completed]
+        active = {j for b in unfinished[:workers] for j in groups[b]}
+        done = {j for b in completed for j in groups[b]}
+        on_state(active, done)
 
-    stopped = _drain(pool.executor, _make_batch, batches, results, limit,
-                     should_stop, on_done, pool.event,
-                     weights=weights, total=len(jobs), on_state=report_state,
-                     stall_s=_LAYOUT_STALL_S)
-    if stopped:
-        raise knoxstop.Stopped("the buildings")
-    out = []
-    for part in results:
-        out.extend(part)
+    def asked_stop() -> bool:
+        if pool.event is not None and pool.event.is_set():
+            return True
+        return should_stop is not None and should_stop()
+
+    while finished < n:
+        ready = [i for i, ar in pending.items() if ar.ready()]
+        for idx in ready:
+            made, elapsed, stopped = pending.pop(idx).get()
+            if stopped or asked_stop():
+                raise knoxstop.Stopped("the buildings")
+            results[idx] = made
+            completed.add(idx)
+            finished += 1
+            done_n += weights[idx]
+            if elapsed > 0:
+                avg = elapsed if avg is None else (0.8 * avg + 0.2 * elapsed)
+            try:
+                on_done(done_n, len(jobs),
+                        min(workers, len(pending)) or 1, workers)
+            except knoxstop.Stopped:
+                raise knoxstop.Stopped("the buildings")
+        feed()
+        if asked_stop():
+            raise knoxstop.Stopped("the buildings")
+        if finished == 0 and next_i > 0 and (
+                time.monotonic() - started >= _LAYOUT_STALL_S):
+            raise LayoutWorkersStalled()
+        now = time.monotonic()
+        if (avg and backlog_s() >= _PREVIEW_BACKLOG_S * workers
+                and now - last_paint >= _PREVIEW_BACKLOG_S):
+            last_paint = now
+            paint()
+        if finished < n and not ready:
+            time.sleep(0.02)
+    out: list = [None] * len(jobs)
+    for group, part in zip(groups, results):
+        for i, stats in zip(group, part):
+            out[i] = stats
     return out
 
 
@@ -2169,21 +2258,20 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     view_boxes: list[tuple] = []
     view_states: list[str] = []
     view_last = 0.0
+    # Room-layout progress is drawn small. The shared preview thread paints
+    # it. This thread never waits on the picture.
+    layout_canvas = None
+    layout_scale = 1.0
+    layout_open = True
 
-    def show_view(stage: str, force: bool = False, reload: bool = False,
-                  interval: float = 1.2) -> None:
-        nonlocal view_image, view_last
-        if on_view is None and on_overlay is None:
-            return
-        now = time.monotonic()
-        if not force and now - view_last < interval:
-            return
+    def _paint_build_view(stage: str, reload: bool, boxes, states) -> None:
+        nonlocal view_image
         if view_image is None or reload:
             fresh = _ground_preview(out_dir, map_name)
             if fresh is None:
                 return
             view_image = fresh
-        if view_boxes:
+        if boxes:
             from PIL import Image, ImageDraw
             colours = {
                 "pending": (205, 48, 43),
@@ -2204,7 +2292,7 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
                 overlay = Image.new("RGBA", view_image.size, (0, 0, 0, 0))
                 shade = ImageDraw.Draw(overlay)
             painted = False
-            for (x, y, w, h), state in zip(view_boxes, view_states):
+            for (x, y, w, h), state in zip(boxes, states):
                 box = [x, y, x + max(int(w), 1) - 1, y + max(int(h), 1) - 1]
                 # Filled, not stroked: a one-tile outline disappears once the
                 # window scales the bitmap down.
@@ -2217,11 +2305,27 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
             frame = view_image.copy() if on_view is not None else None
             overlay = None
             painted = False
-        view_last = now
         if on_view is not None and frame is not None:
             on_view(frame, stage)
         if on_overlay is not None and overlay is not None and painted:
             on_overlay(overlay)
+
+    def show_view(stage: str, force: bool = False, reload: bool = False,
+                  interval: float = 1.2) -> None:
+        nonlocal view_last
+        if on_view is None and on_overlay is None:
+            return
+        now = time.monotonic()
+        if not force and now - view_last < interval:
+            return
+        view_last = now
+        boxes = list(view_boxes)
+        states = list(view_states)
+        import knoxpreview
+        knoxpreview.submit(
+            f"{map_name}:build",
+            lambda: _paint_build_view(stage, reload, boxes, states),
+        )
     placed_rows = []
     kind_x, kind_y, kind_tiles = [], [], []
     for placed_so_far, (_neg_area, i, px) in enumerate(order):
@@ -2412,7 +2516,6 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
                             real_name if n == 0 else "", fid))
             view_boxes.append((ux0, uy0, uw, uh))
             view_states.append("pending")
-            show_view("Categorising and placing")
     reporter.advance(max(len(order) * 2, 1), 1)
     show_view("Categorising and placing", force=True)
 
@@ -2468,6 +2571,85 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     for j in reused:
         view_states[j] = "complete"
 
+    def _ensure_layout_canvas():
+        nonlocal view_image, layout_canvas, layout_scale
+        if layout_canvas is not None:
+            return layout_canvas, layout_scale
+        if view_image is None:
+            fresh = _ground_preview(out_dir, map_name)
+            if fresh is None:
+                return None, 1.0
+            view_image = fresh
+        w, h = view_image.size
+        longest = max(w, h, 1)
+        scale = 1.0 if longest <= 1024 else 1024 / longest
+        canvas = view_image
+        if scale != 1.0:
+            from PIL import Image
+            canvas = view_image.resize(
+                (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                Image.Resampling.BOX)
+        layout_canvas = canvas
+        layout_scale = scale
+        return canvas, scale
+
+    def _draw_layout(boxes, states) -> None:
+        canvas, scale = _ensure_layout_canvas()
+        if canvas is None or (on_view is None and on_overlay is None):
+            return
+        from PIL import Image, ImageDraw
+        colours = {
+            "pending": (205, 48, 43),
+            "active": (238, 132, 35),
+            "complete": (62, 166, 82),
+        }
+        frame = canvas.copy() if on_view is not None else None
+        draw = ImageDraw.Draw(frame) if frame is not None else None
+        overlay = None
+        shade = None
+        if on_overlay is not None:
+            overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+            shade = ImageDraw.Draw(overlay)
+        painted = False
+        for (x, y, w, h), state in zip(boxes, states):
+            x1 = x + max(int(w), 1)
+            y1 = y + max(int(h), 1)
+            box = [int(x * scale), int(y * scale),
+                   max(int(x * scale), int(x1 * scale) - 1),
+                   max(int(y * scale), int(y1 * scale) - 1)]
+            if draw is not None:
+                draw.rectangle(box, fill=colours[state])
+            if shade is not None and state == "complete":
+                painted = True
+                shade.rectangle(box, fill=(205, 48, 43, 170))
+        if on_view is not None and frame is not None:
+            on_view(frame, "Laying out rooms")
+        if on_overlay is not None and overlay is not None and painted:
+            on_overlay(overlay)
+
+    def _kick_layout_paint() -> None:
+        if not layout_open:
+            return
+        boxes = list(view_boxes)
+        states = list(view_states)
+        import knoxpreview
+
+        def run() -> None:
+            if not layout_open:
+                return
+            try:
+                _draw_layout(boxes, states)
+            except Exception:  # noqa: BLE001 - the picture is not the build
+                _trace("layout preview failed")
+
+        knoxpreview.submit(f"{map_name}:layout", run)
+
+    def _stop_layout_paint() -> None:
+        nonlocal layout_open
+        layout_open = False
+        import knoxpreview
+        knoxpreview.discard(f"{map_name}:layout")
+
     def show_layout_state(active, completed):
         active = set(active)
         completed = set(completed)
@@ -2475,19 +2657,18 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
             view_states[decided_i] = ("complete" if layout_i in completed else
                                       "active" if layout_i in active else
                                       "pending")
-        # Encoding a progress PNG runs on the coordinator. During layout the
-        # workers continue, but completed batches cannot be replaced until it
-        # returns, so a slower cadence keeps the process pool fed.
-        show_view("Laying out rooms", interval=3.0)
+        _kick_layout_paint()
 
     reporter.start("layout", len(layout_jobs), "Laying out rooms",
                    _pool_size(len(layout_jobs)))
-    show_view("Laying out rooms", force=True)
-    fresh = _make_all(
-        layout_jobs, should_stop=should_stop,
-        on_done=lambda done, total, busy, pool_n: reporter.advance(
-            done, busy, pool_n),
-        pool=pool, on_state=show_layout_state)
+    try:
+        fresh = _make_all(
+            layout_jobs, should_stop=should_stop,
+            on_done=lambda done, total, busy, pool_n: reporter.advance(
+                done, busy, pool_n),
+            pool=pool, on_state=show_layout_state)
+    finally:
+        _stop_layout_paint()
     laid: list = [None] * len(jobs)
     for j, stats in reused.items():
         laid[j] = stats
@@ -2521,7 +2702,7 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     rows.sort(key=lambda r: r["file"])
     for j, stats in enumerate(laid):
         view_states[j] = "complete" if stats and not stats[3] else "pending"
-    show_view("Laying out rooms", force=True)
+    _draw_layout(list(view_boxes), list(view_states))
 
     # One military rifle somewhere on the map, whatever this town turned out
     # to be: an army building, else the police station, else a gun shop, else
