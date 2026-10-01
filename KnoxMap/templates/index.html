@@ -166,6 +166,14 @@
             <button type="button" class="preset-card" data-scale="8" role="radio" aria-checked="false">8m2</button>
             <button type="button" class="preset-card" data-scale="10" role="radio" aria-checked="false">10m2</button>
           </div>
+          <div class="setting" id="parallelSetting">
+            <div class="setting-head">
+              <span class="setting-name">Parallel pieces</span>
+              <output class="setting-val" id="parallelVal">1</output>
+            </div>
+            <input type="range" id="parallelPieces" min="1" max="1" step="1" value="1">
+            <span class="setting-hint" id="parallelHint">How many map pieces to draw at the same time. The top of the slider is what this PC's memory can hold. You can set it lower.</span>
+          </div>
           <select id="metersPerTile" hidden>
             <option value="0.5">0.5m2</option>
             <option value="1" selected>1m2</option>
@@ -269,6 +277,14 @@
               <span class="toggle-copy">
                 <span class="toggle-name">Buildings</span>
                 <span class="toggle-hint">Generate and furnish buildings after drawing the map.</span>
+              </span>
+            </label>
+            <label class="toggle toggle-sub">
+              <input type="checkbox" id="genOverture" data-key="fill_gaps" checked>
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Overture</span>
+                <span class="toggle-hint">Adds building footprints from Overture where OpenStreetMap has none.</span>
               </span>
             </label>
             <label class="toggle">
@@ -527,6 +543,7 @@
           </div>
           <div class="bar"><div id="compileBar" class="bar-fill"></div></div>
           <span id="compileNote" class="step-note"></span>
+          <ol id="compileSteps" class="compile-steps" hidden></ol>
           <span id="installNote" class="step-note"></span>
           <span id="worldedNote" class="step-note"></span>
           <button id="retryCellsBtn" class="btn btn-small" type="button" hidden>Compile the cells that failed</button>
@@ -617,7 +634,7 @@
 <script src="/static/js/clip.js"></script>
 <script src="/static/js/fx.js"></script>
 <script src="/static/js/georef.js"></script>
-<script src="/static/js/app.js"></script>
+<script src="/static/js/app.js?v={{ asset_rev }}"></script>
 <script src="/static/js/edit.js"></script>
 <script src="/static/js/tutorial.js"></script>
 <script src="/static/js/i18n.js"></script>

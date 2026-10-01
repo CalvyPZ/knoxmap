@@ -425,6 +425,95 @@ def _bump_paint(map_name: str, index: int) -> None:
         pieces[index]["rev"] = int(pieces[index].get("rev") or 0) + 1
 
 
+_MOD_AT = re.compile(r"__r(\d+)_c(\d+)$")
+
+
+def _piece_where(piece: dict) -> str:
+    """Grid coordinate of a map piece, from its place in the pack.
+
+    The directory name carries the parent map in front of ``__r2_c5``. The
+    window shows the coordinate on its own.
+    """
+    row, col = piece.get("row"), piece.get("col")
+    if row is None or col is None:
+        match = _MOD_AT.search(str(piece.get("name") or ""))
+        if not match:
+            return ""
+        row, col = match.group(1), match.group(2)
+    try:
+        return f"r{int(row)} c{int(col)}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _mod_where(name: str) -> str:
+    return _piece_where({"name": name})
+
+
+def _sync_draw_locked(map_name: str) -> None:
+    """Headline, strip text, and fraction for the pieces being drawn.
+
+    The caller holds _PROGRESS_LOCK. `piece` is the one live piece, so the
+    bar can fill while that piece's strips run. `wave` is the same average
+    when several pieces are drawing at once. Every piece that is still
+    drawing is listed, with its grid coordinate and the step it is on.
+    """
+    prog = _PROGRESS.setdefault(map_name, {})
+    pieces = prog.get("pieces") or []
+    total = len(pieces) or 1
+    done = 0
+    work_sum = 0.0
+    live = []
+    for piece in pieces:
+        work = float(piece.get("work") or 0)
+        if piece.get("finished"):
+            done += 1
+            work_sum += 1.0
+            continue
+        work_sum += work
+        step = piece.get("step") or ""
+        if step:
+            live.append((_piece_where(piece), step, work))
+    prog["stage"] = "mod"
+    prog["message"] = "Drawing a map piece"
+    prog["done"] = done
+    prog["total"] = total
+    prog["fraction"] = work_sum / total
+    prog["detail"] = f"{done} of {total} finished"
+    prog["sections"] = [{"where": where, "step": step} for where, step, _work in live]
+    if len(live) == 1:
+        _where, step, work = live[0]
+        prog["view"] = step
+        prog["piece"] = work
+        prog.pop("wave", None)
+    elif live:
+        prog["view"] = "Drawing map pieces"
+        prog["wave"] = sum(item[2] for item in live) / len(live)
+        prog.pop("piece", None)
+    else:
+        prog["view"] = "Drawing a map piece"
+        prog.pop("piece", None)
+        prog.pop("wave", None)
+
+
+def _touch_piece(map_name: str, index: int, step: str | None = None,
+                 work: float | None = None, finished: bool = False) -> None:
+    with _PROGRESS_LOCK:
+        pieces = (_PROGRESS.get(map_name) or {}).get("pieces")
+        if pieces and 0 <= index < len(pieces):
+            piece = pieces[index]
+            if not piece.get("finished"):
+                if step is not None:
+                    piece["step"] = step
+                if work is not None:
+                    piece["work"] = max(float(piece.get("work") or 0), float(work))
+            if finished:
+                piece["finished"] = True
+                piece["work"] = 1.0
+                piece["step"] = ""
+        _sync_draw_locked(map_name)
+
+
 def _bump_paint_named(map_name: str, piece_name: str) -> None:
     with _PROGRESS_LOCK:
         pieces = (_PROGRESS.get(map_name) or {}).get("pieces") or []
@@ -546,8 +635,8 @@ def api_progress():
     with _PROGRESS_LOCK:
         snap = copy.deepcopy(_PROGRESS.get(request.args.get("map", ""), {}))
     # Elapsed and the time left are worked out here, on the poll, so a stage
-    # that sits on one counter still moves the clock. `started` is the
-    # building pass; terrain progress has neither field.
+    # that sits on one counter still moves the clock. `started` is when the
+    # long pass began: drawing the pieces, or generating the buildings.
     if snap:
         snap["now"] = time.time()
     started = snap.get("started")
@@ -578,9 +667,13 @@ def paint_view(name: str):
 
 @app.route("/")
 def index():
+    try:
+        asset_rev = int((CODE_DIR / "static" / "js" / "app.js").stat().st_mtime)
+    except OSError:
+        asset_rev = 0
     return render_template("index.html", version=knoxlog.version(),
                            in_window=os.environ.get("KNOXMAP_WINDOW") == "1",
-                           shell=_shell())
+                           shell=_shell(), asset_rev=asset_rev)
 
 
 # ---- map tiles, fetched the way the OSM tile policy asks -------------------------
@@ -960,6 +1053,44 @@ def _too_big_for_memory(tiles_w: float, tiles_h: float) -> str | None:
     return None
 
 
+def _memory_gib() -> float:
+    """Installed RAM in gibibytes, or 0 when it cannot be read."""
+    status = knoxlog.memory_status()
+    if not status or status[0] <= 0:
+        return 0.0
+    return status[0] / (1024 ** 3)
+
+
+def _parallel_cap() -> int:
+    """How many full mods this PC may draw at once.
+
+    Installed memory, in gibibytes, divided by 4.75, with the fraction
+    dropped. A full mod is about 4.65 GB; 4.75 leaves a little spare.
+    A machine with less than that still draws one piece.
+    """
+    status = knoxlog.memory_status()
+    if not status or status[0] <= 0:
+        return 1
+    return max(1, int(_memory_gib() / 4.75))
+
+
+def _terrain_workers(count: int, requested) -> int:
+    """How many map pieces to draw at the same time.
+
+    The ceiling is this PC's memory. A request may ask for fewer, and a
+    pack with fewer pieces than that uses one thread per piece.
+    """
+    cap = _parallel_cap()
+    try:
+        chosen = int(requested)
+    except (TypeError, ValueError):
+        chosen = cap
+    if chosen < 1:
+        chosen = cap
+    chosen = min(chosen, cap)
+    return max(1, min(chosen, max(1, count)))
+
+
 @app.route("/api/generate", methods=["POST"])
 def generate():
     data = _json_body()
@@ -1122,94 +1253,184 @@ def generate():
     windows = [
         parent.window(tile.x0, tile.y0, tile.tiles_w, tile.tiles_h) for tile in tiles
     ]
+    # OpenStreetMap first. Overture is asked only for the patches it left
+    # empty, once, and that answer is what every piece reads.
+    overture_rows: list = []
+    overture_note: dict = {}
+    if settings.fill_gaps:
+        from generator import overture
+        _set_progress(map_name, stage="overture",
+                      message="Finding where OpenStreetMap has no buildings",
+                      view="Finding where OpenStreetMap has no buildings",
+                      detail="")
+        try:
+            cover = parent.latlon_bbox()
+            mapped = localosm.features_for_bbox(
+                str(BASE_DIR), regions, *cover, should_stop=_stopper(map_name))
+            gaps = overture.gap_rects(overture.osm_building_boxes(mapped), cover)
+            del mapped
+            if not gaps:
+                log.info("overture %s: OpenStreetMap already covers this map", map_name)
+                overture_note = {"skipped": True}
+            else:
+                places = f"{len(gaps)} area" + ("" if len(gaps) == 1 else "s")
+                _set_progress(map_name, stage="overture",
+                              message="Fetching building footprints",
+                              view="Fetching building footprints",
+                              detail=f"{places} OpenStreetMap has not mapped")
+
+                def _overture_download(done, total, speed, _name=map_name):
+                    _set_progress(_name, stage="overture",
+                                  message="Fetching building footprints",
+                                  view="Fetching building footprints",
+                                  detail=f"{places} OpenStreetMap has not mapped",
+                                  download={"done": int(done), "total": int(total),
+                                            "speed": speed})
+
+                overture_rows, overture_note = overture.prepare(
+                    cover, str(map_dir), map_name, should_stop=_stopper(map_name),
+                    gaps=gaps, progress=_overture_download)
+                log.info("overture %s: %d buildings across %d areas%s",
+                         map_name, len(overture_rows), len(gaps),
+                         " from the copy beside the map" if overture_note.get("cached") else "")
+        except knoxstop.Stopped:
+            return _stopped(map_name, "generate")
+        except Exception as exc:  # noqa: BLE001 - OSM alone still makes a map
+            log.warning("overture %s: %s", map_name, exc)
+            overture_note = {"error": str(exc)}
+    used_overture = (settings.fill_gaps and not overture_note.get("why")
+                     and not overture_note.get("error")
+                     and not overture_note.get("skipped"))
     # The window lays these out before any of them is drawn, then fills each
     # one in as the bitmap is painted.
     _set_progress(map_name, stage="mod", done=0, total=len(tiles),
                   message="Drawing a map piece",
+                  view="Drawing a map piece",
+                  detail=f"0 of {len(tiles)} finished",
+                  fraction=0.0,
+                  started=time.time(),
                   rotation=round(rotation, 1),
                   pieces=[{
                       "name": record["name"],
+                      "row": record["row"],
+                      "col": record["col"],
                       "corners": _paint_corners(window),
                       "rev": 0,
+                      "work": 0,
+                      "step": "",
                   } for record, window in zip(planned, windows)])
     street_houses = 0
+    # One thread per piece, up to one per core. Each thread walks that piece
+    # the whole way: the cut, the missing buildings, the terrain, the files.
+    # The pieces that do not fit in this wave wait, then take a free core.
+    slots = _terrain_workers(len(tiles), data.get("parallel"))
+    log.info("generate %s: %d map pieces, %d at once (memory allows %d)",
+             map_name, len(planned), slots, _parallel_cap())
     try:
-        for index, record in enumerate(planned, start=1):
-            knoxstop.check(_stopper(map_name), "the download")
-            _set_progress(map_name, stage="mod", done=index - 1, total=len(tiles),
-                          message="Drawing a map piece",
-                          detail=f"{record['name']} ({index} of {len(tiles)})")
-            window = windows[index - 1]
-            piece = window.latlon_bbox()
-            features = localosm.features_for_bbox(
-                str(BASE_DIR), regions, *piece, should_stop=_stopper(map_name))
-            piece_gaps = {"added": 0}
-            if settings.fill_gaps:
-                from generator import overture
-                _set_progress(map_name, stage="overture", done=index - 1,
-                              total=len(tiles))
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def draw_piece(index: int, record: dict, window):
+            try:
+                knoxstop.check(_stopper(map_name), "the download")
+                _touch_piece(map_name, index - 1,
+                             step="Reading this map piece", work=0.01)
+                piece = window.latlon_bbox()
+                features = localosm.features_for_bbox(
+                    str(BASE_DIR), regions, *piece, should_stop=_stopper(map_name))
+                piece_gaps = {"added": 0}
+                if settings.fill_gaps:
+                    from generator import overture
+                    _touch_piece(map_name, index - 1,
+                                 step="Filling in missing buildings", work=0.04)
+                    if overture_note.get("why") or overture_note.get("error"):
+                        piece_gaps = dict(overture_note)
+                        piece_gaps.setdefault("added", 0)
+                    else:
+                        try:
+                            features, piece_gaps = overture.fill_from(
+                                features, overture.rows_touching(overture_rows, piece))
+                        except knoxstop.Stopped:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - OSM alone still makes a map
+                            log.warning("overture %s: %s", record["name"], exc)
+                            piece_gaps = {"added": 0, "error": str(exc)}
+                if piece_gaps.get("why"):
+                    log.warning("overture %s: %s", record["name"], piece_gaps["why"])
+                mod_dir = OUTPUT_DIR / record["name"]
+                mod_dir.mkdir(parents=True, exist_ok=True)
+                _save_settings(mod_dir, settings)
+                log.info("generate %s: drawing %s (%d of %d), %d features",
+                         map_name, record["name"], index, len(planned), len(features))
+                _touch_piece(map_name, index - 1,
+                             step="Drawing the ground", work=0.08)
+
+                def on_view(image, stage=None, work=None,
+                            _name=record["name"], _index=index - 1):
+                    if stage is not None or work is not None:
+                        _touch_piece(map_name, _index, step=stage, work=work)
+                    if image is None:
+                        return
+                    try:
+                        _save_paint_view(image, _name)
+                    except OSError:
+                        return
+                    _bump_paint(map_name, _index)
+
+                drawn = renderer.render(
+                    features, piece[0], piece[1], piece[2], piece[3],
+                    meters_per_tile=meters_per_tile,
+                    output_dir=str(mod_dir),
+                    map_name=record["name"],
+                    spawn_density=settings.spawn_density,
+                    tree_density=settings.tree_density,
+                    rotation=rotation,
+                    osm_bbox=fetch_box,
+                    shape=shape,
+                    straight_roads=bool(settings.straight_roads),
+                    should_stop=_stopper(map_name),
+                    proj=window,
+                    on_view=on_view,
+                    file_workers=1 if slots > 1 else None,
+                )
+                _note_piece_layers(map_name, record["name"], mod_dir)
+                _stamp_mod(mod_dir, record, map_name, overture=used_overture)
+                houses = 0
                 try:
-                    features, piece_gaps = overture.add_missing(
-                        features, piece, str(OUTPUT_DIR / record["name"]), record["name"],
-                        should_stop=_stopper(map_name))
-                except knoxstop.Stopped:
+                    with open(mod_dir / f"{record['name']}_info.json", encoding="utf-8") as fh:
+                        houses = int(json.load(fh).get("houses_from_streets") or 0)
+                except (OSError, ValueError, TypeError):
+                    pass
+                _write_readme(mod_dir, record["name"], drawn)
+                _touch_piece(map_name, index - 1, finished=True)
+                return drawn, piece_gaps, len(features), houses
+            finally:
+                pass
+
+        outcomes: list = [None] * len(planned)
+        with ThreadPoolExecutor(max_workers=slots,
+                                thread_name_prefix="knox-terrain") as pool:
+            futures = {
+                pool.submit(draw_piece, index, record, window): index - 1
+                for index, (record, window) in enumerate(
+                    zip(planned, windows), start=1)
+            }
+            for fut in as_completed(futures):
+                try:
+                    outcomes[futures[fut]] = fut.result()
+                except BaseException:
+                    for pending in futures:
+                        pending.cancel()
                     raise
-                except Exception as exc:  # noqa: BLE001 - OSM alone still makes a map
-                    log.warning("overture %s: %s", record["name"], exc)
-                    piece_gaps = {"added": 0, "error": str(exc)}
+        for drawn, piece_gaps, count, houses in outcomes:
             gaps["added"] = gaps.get("added", 0) + piece_gaps.get("added", 0)
             if piece_gaps.get("error") and not gaps.get("error"):
                 gaps["error"] = piece_gaps["error"]
             if piece_gaps.get("why") and not gaps.get("why"):
                 gaps["why"] = piece_gaps["why"]
-                log.warning("overture %s: %s", record["name"], piece_gaps["why"])
-            feature_total += len(features)
-            mod_dir = OUTPUT_DIR / record["name"]
-            mod_dir.mkdir(parents=True, exist_ok=True)
-            _save_settings(mod_dir, settings)
-            log.info("generate %s: drawing %s (%d of %d), %d features",
-                     map_name, record["name"], index, len(planned), len(features))
-            _set_progress(map_name, stage="mod", done=index - 1, total=len(tiles),
-                          message="Drawing a map piece",
-                          detail=f"{record['name']} ({index} of {len(tiles)})")
-
-            def on_view(image, stage=None, _name=record["name"], _index=index - 1):
-                if stage:
-                    _set_progress(map_name, view=stage)
-                if image is None:
-                    return
-                try:
-                    _save_paint_view(image, _name)
-                except OSError:
-                    return
-                _bump_paint(map_name, _index)
-
-            result = renderer.render(
-                features, piece[0], piece[1], piece[2], piece[3],
-                meters_per_tile=meters_per_tile,
-                output_dir=str(mod_dir),
-                map_name=record["name"],
-                spawn_density=settings.spawn_density,
-                tree_density=settings.tree_density,
-                rotation=rotation,
-                osm_bbox=fetch_box,
-                shape=shape,
-                straight_roads=bool(settings.straight_roads),
-                should_stop=_stopper(map_name),
-                proj=window,
-                on_view=on_view,
-            )
-            _note_piece_layers(map_name, record["name"], mod_dir)
-            _stamp_mod(mod_dir, record, map_name)
-            try:
-                with open(mod_dir / f"{record['name']}_info.json", encoding="utf-8") as fh:
-                    street_houses += int(json.load(fh).get("houses_from_streets") or 0)
-            except (OSError, ValueError, TypeError):
-                pass
-            _write_readme(mod_dir, record["name"], result)
+            feature_total += count
+            street_houses += houses
             if shown_result is None:
-                shown_result = result
-            del features
+                shown_result = drawn
     except knoxstop.Stopped:
         return _stopped(map_name, "generate")
     except MemoryError:
@@ -1279,7 +1500,7 @@ def generate():
     })
 
 
-def _stamp_mod(mod_dir: Path, record: dict, parent: str) -> None:
+def _stamp_mod(mod_dir: Path, record: dict, parent: str, overture: bool = False) -> None:
     """Remember which pack this piece belongs to, and the cell it occupies."""
     path = mod_dir / f"{record['name']}_info.json"
     try:
@@ -1292,6 +1513,8 @@ def _stamp_mod(mod_dir: Path, record: dict, parent: str) -> None:
     info["world_origin"] = record["world_origin"]
     info["mod_row"] = record["row"]
     info["mod_col"] = record["col"]
+    if overture:
+        info["overture"] = True
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(info, fh, indent=2)
 
@@ -1594,8 +1817,10 @@ def _pack_mod_dirs(map_dir: Path) -> list[Path]:
     """The pieces of a pack, left to right and top to bottom.
 
     That is the order the map was drawn in. Empty for a map that is already
-    a single piece. Buildings are generated one piece at a time, in this
-    order, never several pieces at once.
+    a single piece. Terrain draws several pieces at once, up to what this
+    PC's memory allows, one piece to a thread. Buildings are generated one piece at a
+    time, in this order. Compiling runs every piece at once: each piece is
+    its own project and writes its own lots folder.
     """
     data = modgrid.read_pack(str(map_dir))
     if not data:
@@ -1704,7 +1929,7 @@ def api_buildings():
                       message="Starting buildings", process=1, processes=1,
                       eta=None, fraction=0, started=t0,
                       mod=1, mods=len(targets),
-                      detail=targets[0].name if targets else "")
+                      detail=_mod_where(targets[0].name) if targets else "")
         out = io.StringIO()
         total = 0
         # One layout pool for every piece of this run. Closed when the run
@@ -1739,7 +1964,7 @@ def api_buildings():
                         fraction=overall,
                         started=t0,
                         mod=_index, mods=len(targets),
-                        detail=target.name,
+                        detail=_mod_where(target.name),
                     )
 
                 def on_phase(text, _index=index, _name=target.name):
@@ -1750,7 +1975,7 @@ def api_buildings():
                               message="Loading building data", process=1, processes=1,
                               eta=None, fraction=(index - 1) / len(targets),
                               started=t0, mod=index, mods=len(targets),
-                              detail=target.name)
+                              detail=_mod_where(target.name))
                 _save_settings(target, settings)
                 _ensure_paint_piece(map_dir.name, target)
 
@@ -2941,13 +3166,32 @@ def _repaint_piece(map_name: str, piece_dir: Path, settings, stop) -> None:
     regions = cover(load_index(str(BASE_DIR), refresh=False), *cover_box)
     features = localosm.features_for_bbox(
         str(BASE_DIR), regions, *box, should_stop=stop)
+    used_overture = False
     if settings.fill_gaps:
         from generator import overture
         try:
-            features, piece_gaps = overture.add_missing(
-                features, box, str(piece_dir), piece_dir.name, should_stop=stop)
+            # The generate pass keeps one copy for the whole map. A piece
+            # redrawn later cuts its buildings out of that, and only asks
+            # again when the copy does not cover it.
+            saved = overture.load_covering(
+                overture.cache_path(str(OUTPUT_DIR / map_name), map_name), box)
+            if saved is None:
+                saved = overture.load_covering(
+                    overture.cache_path(str(piece_dir), piece_dir.name), box)
+            gaps = overture.gap_rects(overture.osm_building_boxes(features), box)
+            if not gaps:
+                piece_gaps = {"added": 0, "skipped": True}
+            elif saved is None:
+                features, piece_gaps = overture.add_missing(
+                    features, box, str(piece_dir), piece_dir.name,
+                    should_stop=stop, gaps=gaps)
+            else:
+                features, piece_gaps = overture.fill_from(
+                    features, overture.rows_touching(saved, box))
             if piece_gaps.get("why"):
                 log.warning("overture %s: %s", piece_dir.name, piece_gaps["why"])
+            used_overture = (not piece_gaps.get("why") and not piece_gaps.get("error")
+                             and not piece_gaps.get("skipped"))
         except knoxstop.Stopped:
             raise
         except Exception as exc:  # noqa: BLE001 - OSM alone still makes a map
@@ -2958,15 +3202,25 @@ def _repaint_piece(map_name: str, piece_dir: Path, settings, stop) -> None:
     shape = info.get("shape") if isinstance(info.get("shape"), dict) else None
     osm_bbox = cover_box if isinstance(fetch, (list, tuple)) else None
 
-    def on_view(image, stage=None, _name=piece_dir.name):
-        if image is not None:
-            try:
-                _save_paint_view(image, _name)
-            except OSError:
-                return
-            _bump_paint_named(map_name, _name)
-        if stage:
-            _set_progress(map_name, view=stage)
+    def on_view(image, stage=None, work=None, _name=piece_dir.name):
+        if stage is not None or work is not None:
+            with _PROGRESS_LOCK:
+                prog = _PROGRESS.setdefault(map_name, {})
+                if stage:
+                    prog["view"] = stage
+                if work is not None:
+                    done = float(prog.get("done") or 0)
+                    total = float(prog.get("total") or 1) or 1.0
+                    held = max(0.0, min(1.0, float(work)))
+                    prog["piece"] = held
+                    prog["fraction"] = (done + held) / total
+        if image is None:
+            return
+        try:
+            _save_paint_view(image, _name)
+        except OSError:
+            return
+        _bump_paint_named(map_name, _name)
 
     renderer.render(
         features, box[0], box[1], box[2], box[3],
@@ -2985,6 +3239,13 @@ def _repaint_piece(map_name: str, piece_dir: Path, settings, stop) -> None:
         on_view=on_view,
     )
     _restore_pack_fields(piece_dir, kept)
+    if used_overture:
+        path = piece_dir / f"{piece_dir.name}_info.json"
+        written = _read_json(path)
+        if isinstance(written, dict):
+            written["overture"] = True
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(written, handle, indent=2)
 
 
 def _ensure_edit_paint(map_name: str, piece_dir: Path, info: dict) -> None:
@@ -3083,11 +3344,13 @@ def api_edit_apply():
                 _set_progress(map_dir.name, stage="mod", done=index - 1,
                               total=len(affected), message="Drawing a map piece",
                               fraction=(index - 1) / len(affected), started=t0,
-                              mod=index, mods=len(affected), detail=target.name)
+                              mod=index, mods=len(affected),
+                              detail=_mod_where(target.name))
                 _repaint_piece(map_dir.name, target, settings, stop)
 
             def on_progress(stage, done, total_n, message, process, processes, eta,
-                            fraction=0.0, _index=index, _detail=target.name):
+                            fraction=0.0, _index=index,
+                            _detail=_mod_where(target.name)):
                 stopping = map_dir.name in _STOPPING
                 share = max(0.0, min(1.0, float(fraction or 0)))
                 overall = ((_index - 1) + share) / len(affected)
@@ -4004,6 +4267,8 @@ def api_settings():
                   for f in fields(Settings)},
         "limits": {k: list(v) for k, v in LIMITS.items()},
         "presets": {name: s.to_dict() for name, s in PRESETS.items()},
+        "parallelMax": _parallel_cap(),
+        "memoryGb": _memory_gib(),
     })
 
 
@@ -4053,6 +4318,13 @@ def api_compile_status():
     state["cells"] = cells
     state["expected"] = _expected_cells(map_dir)
     state["tmx"] = tmx
+    # The estimate was taken when the last batch finished. Count it down on
+    # this poll so the page moves while the next batch is still inside WorldEd.
+    now = time.time()
+    marked = state.get("markedAt")
+    if state.get("eta") is not None and marked:
+        state["eta"] = max(0.0, float(state["eta"]) - (now - float(marked)))
+    state["now"] = now
     # Cells the last compile tried three times and could not do. It steps over
     # them rather than throwing away the hours already spent, so this is how
     # the window knows to offer them again instead of saying "done".
@@ -4101,7 +4373,11 @@ def api_compile():
     with _PROGRESS_LOCK:
         if _COMPILE.get(name, {}).get("state") == "running":
             return jsonify({"started": False, "state": "running"})
-        _COMPILE[name] = {"state": "running", "error": None}
+        _COMPILE[name] = {"state": "running", "error": None,
+                          "started": time.time(),
+                          "phase": "prepare",
+                          "phaseDetail": "Checking the project",
+                          "mods": len(targets)}
 
     def worker() -> None:
         """Compiling a town takes many minutes.
@@ -4113,31 +4389,214 @@ def api_compile():
         The work goes out in batches of cells, one short-lived WorldEd
         process each: a single process compiling a whole town never gives
         its memory back and took the machine down at 13.7 GB. See
-        tools/compile_map.py.
+        tools/compile_map.py. Each mod is its own project, so those mods
+        compile at the same time. Batches inside one mod stay in order,
+        because they rewrite that mod's project file.
         """
         from tools import compile_map as compiler
 
-        def note(done: int, total: int, cells: int) -> None:
+        def note(done: int, total: int, cells: int, skipped: bool = False, *,
+                 phase: str | None = None, detail: str | None = None,
+                 finished: bool = True) -> None:
+            # Time left is the average of the batches WorldEd actually ran,
+            # times the ones still to come. A batch already on disk is a skip:
+            # it moves the counter and must not be timed, or a resumed compile
+            # looks nearly finished and then takes hours.
+            # finished is false while a step is still going: that only names
+            # the step, and must not be counted as another batch.
+            now = time.time()
             with _PROGRESS_LOCK:
-                _COMPILE[name] = {"state": "running", "error": None,
-                                  "batch": done, "batches": total}
+                prev = _COMPILE.get(name) or {}
+                if prev.get("state") == "stopping":
+                    running = "stopping"
+                else:
+                    running = "running"
+                if not finished:
+                    update = {"state": running, "error": None,
+                              "started": prev.get("started") or t0}
+                    if phase:
+                        update["phase"] = phase
+                    if detail is not None:
+                        update["phaseDetail"] = detail
+                    if total:
+                        update["batches"] = total
+                        if done:
+                            update["batch"] = done
+                    _COMPILE[name] = {**prev, **update}
+                    return
+                if done <= 0:
+                    _COMPILE[name] = {**prev, "state": running, "error": None,
+                                      "mark": now, "eta": None, "markedAt": None,
+                                      "started": prev.get("started") or t0}
+                    return
+                worked = int(prev.get("worked") or 0)
+                work_s = float(prev.get("workSeconds") or 0.0)
+                mark = float(prev.get("mark") or prev.get("started") or now)
+                if not skipped:
+                    worked += 1
+                    work_s += max(0.0, now - mark)
+                remaining = max(0, int(total) - int(done))
+                eta = prev.get("eta")
+                marked_at = prev.get("markedAt")
+                if worked > 0 and work_s > 0:
+                    eta = 0.0 if remaining <= 0 else (work_s / worked) * remaining
+                    marked_at = now
+                _COMPILE[name] = {
+                    "state": running, "error": None,
+                    "batch": done, "batches": total,
+                    "worked": worked, "workSeconds": work_s,
+                    "mark": now, "markedAt": marked_at, "eta": eta,
+                    "started": prev.get("started") or t0,
+                    "phase": prev.get("phase"),
+                    "phaseDetail": prev.get("phaseDetail"),
+                }
 
         side = compiler.batch_side(COMPILE_BATCH)
-        log.info("compile %s: started (%d piece%s, batches of %d)", name,
-                 len(targets), "" if len(targets) == 1 else "s", side)
+        log.info("compile %s: started (%d piece%s, batches of %d%s)", name,
+                 len(targets), "" if len(targets) == 1 else "s", side,
+                 "" if len(targets) <= 1 else ", in parallel")
         t0 = time.time()
+        # One counter per mod. WorldEd batches inside a mod stay serial, and
+        # the window sees the sum: batches finished, and how many mods are
+        # still in a batch. Time left divides the remaining batches by how
+        # many mods are compiling, because those WorldEd processes overlap.
+        slots: dict[str, dict] = {}
+
+        def _publish_mods() -> None:
+            """Combine each mod's batch counter. Caller holds _PROGRESS_LOCK."""
+            prev = _COMPILE.get(name) or {}
+            running = "stopping" if prev.get("state") == "stopping" else "running"
+            done_n = sum(int(s.get("finished") or 0) for s in slots.values())
+            total_n = sum(int(s.get("total") or 0) for s in slots.values())
+            worked = sum(int(s.get("worked") or 0) for s in slots.values())
+            work_s = sum(float(s.get("workSeconds") or 0.0) for s in slots.values())
+            active = [
+                s for s in slots.values()
+                if not s.get("closed")
+                and (not int(s.get("total") or 0)
+                     or int(s.get("finished") or 0) < int(s["total"]))
+            ]
+            latest = max(slots.values(),
+                         key=lambda s: float(s.get("touched") or 0), default=None)
+            remaining = max(0, total_n - done_n)
+            eta = prev.get("eta")
+            marked_at = prev.get("markedAt")
+            now = time.time()
+            if worked > 0 and work_s > 0:
+                eta = 0.0 if remaining <= 0 else (
+                    (work_s / worked) * remaining / max(1, len(active)))
+                marked_at = now
+            detail = (latest or {}).get("detail") or prev.get("phaseDetail")
+            if len(active) > 1 and detail:
+                detail = f"{len(active)} mods · {detail}"
+            _COMPILE[name] = {
+                **prev,
+                "state": running, "error": None,
+                "batch": done_n, "batches": total_n,
+                "worked": worked, "workSeconds": work_s,
+                "mark": now, "markedAt": marked_at, "eta": eta,
+                "started": prev.get("started") or t0,
+                "mods": len(targets), "running": len(active),
+                "phase": (latest or {}).get("phase") or prev.get("phase"),
+                "phaseDetail": detail,
+            }
+
+        def _slot(piece_name: str, now: float) -> dict:
+            return slots.setdefault(piece_name, {
+                "finished": 0, "total": 0, "worked": 0, "workSeconds": 0.0,
+                "mark": now, "phase": "prepare", "detail": "", "touched": now,
+            })
+
+        def note_for(piece_name: str):
+            def on_piece(done: int, total: int, cells: int, skipped: bool = False, *,
+                         phase: str | None = None, detail: str | None = None,
+                         finished: bool = True) -> None:
+                now = time.time()
+                with _PROGRESS_LOCK:
+                    slot = _slot(piece_name, now)
+                    slot["touched"] = now
+                    if phase:
+                        slot["phase"] = phase
+                    if detail is not None:
+                        slot["detail"] = f"{piece_name}: {detail}"
+                    if total:
+                        slot["total"] = int(total)
+                    if finished:
+                        if done > 0:
+                            if not skipped:
+                                slot["worked"] = int(slot["worked"]) + 1
+                                slot["workSeconds"] = (
+                                    float(slot["workSeconds"])
+                                    + max(0.0, now - float(slot["mark"])))
+                            slot["finished"] = int(done)
+                        slot["mark"] = now
+                    _publish_mods()
+            return on_piece
+
+        def close_piece(piece_name: str) -> None:
+            now = time.time()
+            with _PROGRESS_LOCK:
+                slot = _slot(piece_name, now)
+                slot["closed"] = True
+                slot["touched"] = now
+                _publish_mods()
+
         try:
             produced = 0
+            todo = []
             for piece in targets:
                 only = ([item["cells"] for item in compiler.failed_cells(piece)]
                         if only_failed else None)
                 if only_failed and not only:
                     continue
-                produced += compiler.compile_map(str(piece), batch=side,
-                                                exe=str(exe), on_progress=note,
-                                                should_stop=_stopper(name),
-                                                only_cells=only)
-                mapstate.stamp(str(piece), "compile")
+                todo.append((piece, only))
+            if len(todo) <= 1:
+                for piece, only in todo:
+                    produced += compiler.compile_map(str(piece), batch=side,
+                                                    exe=str(exe), on_progress=note,
+                                                    should_stop=_stopper(name),
+                                                    only_cells=only)
+                    mapstate.stamp(str(piece), "compile")
+            else:
+                log.info("compile %s: %d mods at once", name, len(todo))
+                counts: list[int] = []
+                errors: list[BaseException] = []
+                gate = threading.Lock()
+
+                def run_piece(piece: Path, only) -> None:
+                    try:
+                        count = compiler.compile_map(
+                            str(piece), batch=side, exe=str(exe),
+                            on_progress=note_for(piece.name),
+                            should_stop=_stopper(name),
+                            only_cells=only)
+                        mapstate.stamp(str(piece), "compile")
+                        with gate:
+                            counts.append(count)
+                    except BaseException as exc:
+                        with gate:
+                            errors.append(exc)
+                    finally:
+                        close_piece(piece.name)
+
+                workers = [
+                    threading.Thread(target=run_piece, args=(piece, only),
+                                     name=f"compile-{piece.name}", daemon=True)
+                    for piece, only in todo
+                ]
+                for worker_thread in workers:
+                    worker_thread.start()
+                for worker_thread in workers:
+                    worker_thread.join()
+                produced = sum(counts)
+                failed_run = [exc for exc in errors
+                              if not isinstance(exc, knoxstop.Stopped)]
+                if failed_run:
+                    raise failed_run[0]
+                stopped_run = next((exc for exc in errors
+                                    if isinstance(exc, knoxstop.Stopped)), None)
+                if stopped_run:
+                    raise stopped_run
             if not produced:
                 eid = knoxlog.record(None, f"compile {name}: produced no cells")
                 with _PROGRESS_LOCK:
@@ -4152,6 +4611,8 @@ def api_compile():
             for piece in targets:
                 left.extend(compiler.failed_cells(str(piece)))
             try:
+                note(0, 0, 0, phase="copy", detail="Copying the compiled map",
+                     finished=False)
                 placed = _deliver_compiled(map_dir, output)
             except Exception as exc:
                 eid = knoxlog.record(exc, f"compile {name}: could not copy output")

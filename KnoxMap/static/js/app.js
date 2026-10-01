@@ -1033,9 +1033,52 @@ function isSwitch(key) {
   return type === 'int';
 }
 
+function applyParallelCap(max, memoryGb) {
+  const input = document.getElementById('parallelPieces');
+  const hint = document.getElementById('parallelHint');
+  if (!input) return 1;
+  const cap = Math.max(1, Math.floor(Number(max) || 1));
+  input.min = '1';
+  input.max = String(cap);
+  let value = input.dataset.ready ? Math.floor(Number(input.value)) : cap;
+  if (!Number.isFinite(value)) value = cap;
+  value = Math.max(1, Math.min(cap, value));
+  // Set the attribute as well as the property. A range whose old max is 1
+  // keeps a value of 1 if only the property is written in some builds.
+  input.setAttribute('max', String(cap));
+  input.setAttribute('value', String(value));
+  input.value = String(value);
+  input.dataset.ready = '1';
+  const shown = document.getElementById('parallelVal');
+  if (shown) shown.textContent = String(value);
+  const gb = Math.round(Number(memoryGb) || 0);
+  if (hint && gb > 0) {
+    hint.textContent = cap === 1
+      ? `This PC has ${gb} GB of memory, so one map piece at a time.`
+      : `This PC has ${gb} GB of memory, so up to ${cap} pieces at once. You can set it lower.`;
+  } else if (hint) {
+    hint.textContent = cap === 1
+      ? "This PC's memory can draw one map piece at a time."
+      : "How many map pieces to draw at the same time. The top of the slider is what this PC's memory can hold. You can set it lower.";
+  }
+  const setting = input.closest('.setting');
+  if (setting && window.fx && fx.wireSettings) fx.wireSettings(setting);
+  return cap;
+}
+
+function readParallel() {
+  const input = document.getElementById('parallelPieces');
+  if (!input) return 1;
+  const cap = Math.max(1, Math.floor(Number(input.max) || 1));
+  let value = Math.floor(Number(input.value));
+  if (!Number.isFinite(value)) value = cap;
+  return Math.max(1, Math.min(cap, value));
+}
+
 async function loadSettings() {
   const res = await fetch('/api/settings');
   settingsMeta = await res.json();
+  applyParallelCap(settingsMeta.parallelMax, settingsMeta.memoryGb);
   buildSettingsForm(settingsMeta.current);
   applyAreaSettings(settingsMeta.current);
   if (savedMapSettings) applySavedMapSettings(savedMapSettings);
@@ -1092,6 +1135,8 @@ function readSettings() {
   }
   const setSeed = document.getElementById('seedRandom');
   if (setSeed && !setSeed.checked) out.seed = 1;
+  const overture = document.getElementById('genOverture');
+  if (overture) out.fill_gaps = overture.checked ? 1 : 0;
   return out;
 }
 
@@ -1113,6 +1158,8 @@ function applyAreaSettings(values) {
     const el = document.querySelector(`#tabPanelArea input[data-key="${key}"]`);
     if (el && key in values) el.checked = Number(values[key]) === 1;
   }
+  const overture = document.getElementById('genOverture');
+  if (overture && 'fill_gaps' in values) overture.checked = Number(values.fill_gaps) === 1;
 }
 
 // Opening a saved map keeps the other knobs it was built with. Set seed stays
@@ -1771,6 +1818,7 @@ async function upgradeMap(data, button) {
           south: b.south, west: b.west, north: b.north, east: b.east,
           metersPerTile: data.metersPerTile, mapName: data.mapName,
           settings: data.settings, shape: data.shape,
+          parallel: readParallel(),
         });
       } else if (step === 'build') {
         say('Building the buildings again…');
@@ -1783,7 +1831,18 @@ async function upgradeMap(data, button) {
           const st = await (await fetch(
             `/api/compile-status?map=${encodeURIComponent(data.mapName)}`)).json();
           if (st.state === 'running') {
-            say(`Compiling… ${st.cells || 0} of ${st.expected || '?'} cells`);
+            const step = {
+              prepare: 'Checking the project',
+              convert: 'Converting cells to maps',
+              lots: 'Compiling lots',
+              skip: 'Skipping finished cells',
+              record: 'Recording converted cells',
+              copy: 'Copying the compiled map',
+            }[st.phase];
+            const left = formatLeft(st.eta);
+            say(['Compiling', step,
+                 `${st.cells || 0} of ${st.expected || '?'} cells`, left]
+              .filter(Boolean).join(' · '));
             continue;
           }
           if (st.error) throw new Error(st.error);
@@ -2998,8 +3057,11 @@ const generateOptions = { buildings: true, paperMap: true };
 function readGenerateOptions() {
   const buildings = document.getElementById('genBuildings');
   const paperMap = document.getElementById('genPaperMap');
+  const overture = document.getElementById('genOverture');
+  const fill = document.getElementById('fillGaps');
   if (buildings) generateOptions.buildings = buildings.checked;
   if (paperMap) generateOptions.paperMap = paperMap.checked;
+  if (overture && fill) fill.checked = overture.checked;
   const box = document.getElementById('ovBuildings');
   const root = document.getElementById('genOverlays');
   if (box && root && !root.hidden) {
@@ -3013,6 +3075,11 @@ function readGenerateOptions() {
 }
 
 document.getElementById('generateOptions').addEventListener('change', readGenerateOptions);
+document.getElementById('fillGaps').addEventListener('change', () => {
+  const overture = document.getElementById('genOverture');
+  const fill = document.getElementById('fillGaps');
+  if (overture && fill) overture.checked = fill.checked;
+});
 
 document.getElementById('generateBtn').addEventListener('click', async () => {
   if (!currentRect) return;
@@ -3035,6 +3102,7 @@ document.getElementById('generateBtn').addEventListener('click', async () => {
     mapName: chosen,
     settings: readSettings(),
     shape: selectionShape(),
+    parallel: readParallel(),
   };
 
   const btn = document.getElementById('generateBtn');
@@ -3202,24 +3270,48 @@ function startProgress(mapName) {
       updatePaintPieces(p.pieces);
       if (p.rotation != null) setPaintBearing(p.rotation);
       const status = document.getElementById('status');
-      if (p.view && (p.stage === 'mod' || p.stage === 'render')) {
-        status.textContent = p.view;
+      if (p.stage === 'mod') {
+        const sections = Array.isArray(p.sections) ? p.sections : [];
+        const lines = sections.length
+          ? sections.map((section) => (
+            section.where ? `${section.where} · ${section.step}` : section.step
+          ))
+          : [p.view || 'Drawing a map piece'];
+        const detail = document.getElementById('gen-detail');
+        const rest = detail ? detail.textContent : '';
+        status.textContent = rest ? `${lines.join('\n')}\n${rest}` : lines.join('\n');
+      } else if (p.view && p.stage === 'render') {
+        status.textContent = p.detail ? `${p.view} — ${p.detail}` : p.view;
       } else if (p.stage === 'osm') {
         const total = p.total || 1;
         status.textContent = total > 1
           ? `Querying OpenStreetMap — area ${(p.done || 0) + 1} of ${total}…`
           : 'Querying OpenStreetMap…';
       } else if (p.stage === 'overture') {
-        // A few minutes, nearly all of it Overture's own files being sifted
-        // for the handful that cover this box. Saying so beats a dead bar.
-        status.textContent = 'Looking up the buildings OpenStreetMap has not got '
-                           + '— this takes a few minutes the first time…';
+        const dl = p.download;
+        if (dl && dl.total > 0) {
+          const pct = Math.min(100, Math.round(100 * dl.done / dl.total));
+          const left = dl.speed > 0 && dl.total > dl.done
+            ? ` · ${Math.max(1, Math.round((dl.total - dl.done) / dl.speed))}s left`
+            : '';
+          const size = (n) => {
+            if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+            if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(n >= 10 * 1024 ** 2 ? 0 : 1)} MB`;
+            return `${Math.max(1, Math.round(n / 1024))} KB`;
+          };
+          status.textContent = `Fetching building footprints · ${size(dl.done)} of ${size(dl.total)}`
+                             + ` · ${pct}%${left}`;
+        } else {
+          status.textContent = p.detail
+            ? `${p.view || 'Finding where OpenStreetMap has no buildings'} — ${p.detail}`
+            : (p.view || 'Finding where OpenStreetMap has no buildings…');
+        }
       } else if (p.stage === 'render') {
         status.textContent = `Rendering ${p.features.toLocaleString()} features `
                            + 'into bitmaps…';
       }
     } catch (_) { /* the generate call is the source of truth */ }
-  }, 1500);
+  }, 800);
 }
 
 function stopProgress() {
@@ -4237,31 +4329,122 @@ function showFailedCells(failed, cells) {
 // The compile runs on the server's own thread; this just watches it. Blocking
 // the request instead froze the whole window for the length of a town.
 let compileTimer = null;
+let compilePaintTimer = null;
+let compileSnap = null;
+let compileSnapAt = 0;
+
+function compileSecondsLeft(p, sampledAt) {
+  if (!p || p.eta == null || Number.isNaN(Number(p.eta))) return null;
+  const extra = sampledAt ? (Date.now() - sampledAt) / 1000 : 0;
+  return Math.max(0, Number(p.eta) - extra);
+}
+
+function compileElapsed(p, sampledAt) {
+  const started = Number(p && p.started);
+  const now = Number(p && p.now);
+  if (!started || !now) return null;
+  const extra = sampledAt ? (Date.now() - sampledAt) / 1000 : 0;
+  return Math.max(0, now - started + extra);
+}
+
+const COMPILE_PHASES = [
+  ['prepare', 'Checking the project'],
+  ['convert', 'Converting cells to maps'],
+  ['lots', 'Compiling lots'],
+  ['record', 'Recording converted cells'],
+  ['copy', 'Copying the compiled map'],
+];
+
+function compilePhaseIndex(phase) {
+  const key = phase === 'skip' || phase === 'worlded' ? 'lots' : phase;
+  const index = COMPILE_PHASES.findIndex(([id]) => id === key);
+  return index < 0 ? 0 : index;
+}
+
+function paintCompileSteps(p) {
+  const list = document.getElementById('compileSteps');
+  if (!list) return;
+  if (!p || p.state !== 'running') {
+    list.hidden = true;
+    list.replaceChildren();
+    return;
+  }
+  const current = compilePhaseIndex(p.phase);
+  list.hidden = false;
+  list.replaceChildren(...COMPILE_PHASES.map(([, label], i) => {
+    const li = document.createElement('li');
+    li.className = i < current ? 'is-done' : i === current ? 'is-running' : 'is-wait';
+    const name = document.createElement('span');
+    name.textContent = label;
+    li.append(name);
+    if (i === current && p.phaseDetail) {
+      const detail = document.createElement('span');
+      detail.className = 'compile-step-detail';
+      detail.textContent = p.phaseDetail;
+      li.append(detail);
+    }
+    return li;
+  }));
+}
+
+function paintCompile(p, sampledAt) {
+  if (!p || p.state !== 'running') return;
+  const pct = p.expected ? Math.floor(100 * p.cells / p.expected) : 0;
+  // The batch counter is the honest one on a big map: cell files land in
+  // bursts and stay flat for minutes inside a batch, which reads as a hang.
+  // Batches tick over steadily. Time left uses that same counter.
+  // Several mods compile at once. `batch` is then how many batches have
+  // finished across all of them, so the bar is that share of the work.
+  const manyMods = (p.mods || 1) > 1;
+  const batchFrac = p.batches
+    ? (manyMods ? (p.batch || 0) / p.batches : (p.batch ? (p.batch - 1) / p.batches : 0))
+    : 0;
+  fx.progress('compile', p.batches ? Math.max(pct, 100 * batchFrac) : pct);
+  const left = formatLeft(compileSecondsLeft(p, sampledAt));
+  const elapsed = compileElapsed(p, sampledAt);
+  const clock = left || (elapsed == null ? '' : formatElapsed(elapsed));
+  const parts = [];
+  if (manyMods && p.batches) parts.push(`${p.batch || 0} of ${p.batches} batches`);
+  else if (p.batches && p.batch) parts.push(`Batch ${p.batch} of ${p.batches}`);
+  if (manyMods && p.running) parts.push(`${p.running} mods at once`);
+  else if (manyMods && p.running == null) parts.push(`${p.mods} mods at once`);
+  if (p.expected) parts.push(`${p.cells} of ${p.expected} cells compiled (${pct}%)`);
+  else if (p.cells) parts.push(`${p.cells} cells compiled`);
+  if (p.tmx) parts.push(`${p.tmx} converted`);
+  if (clock) parts.push(clock);
+  note('compileNote', parts.join(' · ') || 'Starting…');
+  paintCompileSteps(p);
+}
+
+function stopCompileWatch() {
+  clearInterval(compileTimer);
+  clearInterval(compilePaintTimer);
+  compileTimer = null;
+  compilePaintTimer = null;
+  compileSnap = null;
+  paintCompileSteps(null);
+}
 
 function pollCompile() {
-  clearInterval(compileTimer);
-  compileTimer = setInterval(async () => {
+  stopCompileWatch();
+  const tick = async () => {
     try {
       const res = await fetch(
         `/api/compile-status?map=${encodeURIComponent(currentMap)}`);
       const p = await res.json();
       if (p.state === 'stopping') {
+        compileSnap = null;
+        paintCompileSteps(null);
         note('compileNote', 'Stopping — waiting for WorldEd to close…');
         return;
       }
       if (p.state === 'running') {
-        const pct = p.expected ? Math.floor(100 * p.cells / p.expected) : 0;
-        // The batch counter is the honest one on a big map: cell files land in
-        // bursts and stay flat for minutes inside a batch, which reads as a
-        // hang. Batches tick over steadily.
-        const batch = p.batches ? ` — batch ${p.batch}/${p.batches}` : '';
-        fx.progress('compile', p.batches ? Math.max(pct, 100 * (p.batch - 1) / p.batches) : pct);
-        note('compileNote',
-             `Compiling${batch} — ${p.tmx} cells converted, `
-             + `${p.cells}/${p.expected || '?'} compiled (${pct}%)…`);
+        compileSnap = p;
+        compileSnapAt = Date.now();
+        paintCompile(p, compileSnapAt);
         return;
       }
-      clearInterval(compileTimer);
+      stopCompileWatch();
       showStop(null);
       if (p.state === 'stopped') {
         fx.progress('compile', 0);
@@ -4283,7 +4466,14 @@ function pollCompile() {
       }
       finishCompile(p);
     } catch (_) { /* keep watching */ }
-  }, 2000);
+  };
+  tick();
+  compileTimer = setInterval(tick, 2000);
+  compilePaintTimer = setInterval(() => {
+    if (compileSnap && compileSnap.state === 'running') {
+      paintCompile(compileSnap, compileSnapAt);
+    }
+  }, 1000);
 }
 
 // ---- links straight to a place ----------------------------------------------------

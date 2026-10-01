@@ -13,6 +13,7 @@
 
 0.5m2 = 0.5m2
 Add missing buildings = Add missing buildings
+Adds building footprints from Overture where OpenStreetMap has none. = Adds building footprints from Overture where OpenStreetMap has none.
 Builds every address as mapped. Off keeps the real roads, rivers, woods and terrain, leaves out half the houses, and grows the rest into proper homes with yards. Named places are always built, at the game's size. = Builds every address as mapped. Off keeps the real roads, rivers, woods and terrain, leaves out half the houses, and grows the rest into proper homes with yards. Named places are always built, at the game's size.
 Lays every road in straight runs along the tiles and on 45-degree diagonals, and stands every building upright beside them, like the game's own map. Off draws roads as they are. = Lays every road in straight runs along the tiles and on 45-degree diagonals, and stands every building upright beside them, like the game's own map. Off draws roads as they are.
 Guarantees that a rifle can spawn on the map. = Guarantees that a rifle can spawn on the map.
@@ -94,6 +95,7 @@ Export = Export
 Compile map = Compile map
 Compiles the map into a format PZ can use = Compiles the map into a format PZ can use
 Output location = Output location
+Overture = Overture
 Install to game = Install to game
 Automatically installs the compiled map mod into the games install location. = Automatically installs the compiled map mod into the games install location.
 Install location = Install location
@@ -196,7 +198,10 @@ Or do it yourself in WorldEd = Or do it yourself in WorldEd
 Other drives or folders (separated by ;) = Other drives or folders (separated by ;)
 Overlay Vanilla Map = Overlay Vanilla Map
 out on the street = out on the street
+Parallel pieces = Parallel pieces
 Performing first time setup = Performing first time setup
+How many map pieces to draw at the same time. The top of the slider is what this PC's memory can hold. You can set it lower. = How many map pieces to draw at the same time. The top of the slider is what this PC's memory can hold. You can set it lower.
+This PC's memory can draw one map piece at a time. = This PC's memory can draw one map piece at a time.
 People who made KnoxMap. = People who made KnoxMap.
 Population = Population
 press Compile to carry on from there. = press Compile to carry on from there.

@@ -127,6 +127,17 @@ const fx = (() => {
     return `${Math.floor(m / 60)} h ${m % 60} min`;
   }
 
+  function timeLeft(seconds) {
+    if (seconds == null || Number.isNaN(Number(seconds))) return null;
+    const s = Math.max(0, Math.round(Number(seconds)));
+    if (s < 5) return 'a few seconds left';
+    if (s < 60) return `${s}s left`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    if (m < 60) return r ? `${m}m ${r}s left` : `${m}m left`;
+    return `${Math.floor(m / 60)}h ${m % 60}m left`;
+  }
+
   let clockTimer = null;
   let hideTimer = null;
   let started = 0;
@@ -195,7 +206,7 @@ const fx = (() => {
     update(p) {
       const el = $('#gen-overlay');
       if (el && el.dataset.mode === 'buildings') return;
-      if (p.stage === 'osm' || p.stage === 'regions') {
+      if (p.stage === 'osm' || p.stage === 'regions' || p.stage === 'overture') {
         const total = p.total || 1;
         const done = p.done || 0;
         const dl = p.download;
@@ -224,13 +235,54 @@ const fx = (() => {
           detail = `${detail ? detail + ': ' : ''}${parts.join(' · ')}`;
         }
         $('#gen-detail').textContent = detail;
-        $('#gen-bar').style.width = `${Math.max(6, Math.round(8 + 40 * (done + share) / total))}%`;
+        const reading = p.stage === 'overture';
+        const base = reading ? 46 : 8;
+        const gain = reading ? 24 : 40;
+        $('#gen-bar').style.width = `${Math.max(base, Math.round(base + gain * (done + share) / total))}%`;
+        if (reading) showElapsedWord(true);
       } else if (p.stage === 'mod') {
         const total = p.total || 1;
         const done = p.done || 0;
-        $('#gen-stage').textContent = p.view || 'Drawing a map piece';
-        $('#gen-detail').textContent = p.detail || `Piece ${done + 1} of ${total}`;
-        $('#gen-bar').style.width = `${Math.max(48, Math.round(48 + 34 * done / total))}%`;
+        const frac = typeof p.fraction === 'number'
+          ? Math.max(0, Math.min(1, p.fraction))
+          : done / total;
+        const piece = typeof p.piece === 'number'
+          ? Math.max(0, Math.min(1, p.piece)) : null;
+        const wave = typeof p.wave === 'number'
+          ? Math.max(0, Math.min(1, p.wave)) : null;
+        const stage = $('#gen-stage');
+        const sections = Array.isArray(p.sections) ? p.sections : [];
+        if (sections.length) {
+          stage.replaceChildren();
+          for (const section of sections) {
+            const line = document.createElement('div');
+            line.className = 'gen-section';
+            const where = document.createElement('span');
+            where.className = 'gen-where';
+            where.textContent = section.where || '';
+            const step = document.createElement('span');
+            step.className = 'gen-step';
+            step.textContent = section.step || '';
+            if (section.where) line.append(where);
+            line.append(step);
+            stage.append(line);
+          }
+        } else {
+          stage.textContent = p.view || 'Drawing a map piece';
+        }
+        const parts = [];
+        if (p.detail) parts.push(p.detail);
+        if (piece != null) parts.push(`${Math.round(piece * 100)}% of this piece`);
+        else if (wave != null) parts.push(`${Math.round(wave * 100)}% of the pieces being drawn`);
+        parts.push(`${Math.round(frac * 100)}% of the map`);
+        if (frac >= 0.01 && frac < 1) {
+          const left = timeLeft(p.eta);
+          if (left) parts.push(left);
+        }
+        $('#gen-detail').textContent = parts.join(' · ');
+        const fill = piece != null ? piece : (wave != null ? wave : frac);
+        $('#gen-bar').style.width = `${Math.max(48, Math.round(48 + 48 * fill))}%`;
+        showElapsedWord(true);
       } else if (p.stage === 'render') {
         $('#gen-stage').textContent = p.view || 'Drawing the terrain';
         $('#gen-detail').textContent = `${(p.features || 0).toLocaleString()} features`;
