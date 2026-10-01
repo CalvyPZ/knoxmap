@@ -1688,9 +1688,8 @@ function wirePictures(mapName) {
   const note = document.getElementById('pictureNote');
   const shots = document.getElementById('pictureShots');
   if (!button) return;
-  button.hidden = false;
-  const options = document.getElementById('pictureOptions');
-  if (options) options.hidden = false;
+  const draw = document.getElementById('pictureDraw');
+  if (draw) draw.hidden = false;
   bindExportGroups();
   syncPictureButton();
   note.textContent = '';
@@ -3339,12 +3338,7 @@ function renderResults(data) {
         data-count="${data.cellsY}">0</span></div><div class="k">cells</div></div>
       ${fx.tile(data.featureCount, '', 'osm features')}
       ${data.modCount ? fx.tile(data.modCount, '', data.modCount === 1 ? 'mod' : 'mods') : ''}
-    </div>`
-      + (data.regions && data.regions.length
-        ? `<div class="stat-note">Daily extracts: ${data.regions.join(', ')}. `
-          + `Each mod is ${MOD_CELLS}×${MOD_CELLS} cells and lines up with the next `
-          + `when every mod is enabled.</div>`
-        : '');
+    </div>`;
     fx.countUp(info);
   }
 

@@ -478,38 +478,9 @@
               <figcaption>Preview</figcaption>
             </figure>
             <p class="export-map-title">Map: <span class="ph map-badge">—</span></p>
-            <div id="upgradeNote" class="upgrade-note" hidden></div>
             <div id="results-info"></div>
+            <div id="upgradeNote" class="upgrade-note" hidden></div>
             <div id="saveNote" class="hint"></div>
-            <div class="area-toggles" id="pictureOptions" hidden>
-              <label class="toggle">
-                <input type="checkbox" value="town" checked>
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-copy">
-                  <span class="toggle-name">The whole map</span>
-                  <span class="toggle-hint">One picture of the entire map.</span>
-                </span>
-              </label>
-              <label class="toggle">
-                <input type="checkbox" value="close" checked>
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-copy">
-                  <span class="toggle-name">Close up</span>
-                  <span class="toggle-hint">The middle of the map, close enough to see.</span>
-                </span>
-              </label>
-              <label class="toggle">
-                <input type="checkbox" value="inside" checked>
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-copy">
-                  <span class="toggle-name">With the roofs off</span>
-                  <span class="toggle-hint">That same middle, with the roofs off so the rooms show.</span>
-                </span>
-              </label>
-            </div>
-            <button id="makePictures" class="btn" type="button" hidden>Draw a picture of it</button>
-            <div id="pictureNote" class="hint"></div>
-            <div id="pictureShots" class="shots" hidden></div>
           </div>
           <div class="area-toggles" id="exportChoices">
             <label class="toggle">
@@ -562,6 +533,37 @@
           <div class="export-actions">
             <button id="exportBtn" class="btn" type="button">Export</button>
             <button class="btn btn-stop" data-stop hidden>Stop</button>
+          </div>
+          <div id="pictureDraw" class="picture-draw" hidden>
+            <div class="area-toggles" id="pictureOptions">
+              <label class="toggle">
+                <input type="checkbox" value="town" checked>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-copy">
+                  <span class="toggle-name">The whole map</span>
+                  <span class="toggle-hint">One picture of the entire map.</span>
+                </span>
+              </label>
+              <label class="toggle">
+                <input type="checkbox" value="close" checked>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-copy">
+                  <span class="toggle-name">Close up</span>
+                  <span class="toggle-hint">The middle of the map, close enough to see.</span>
+                </span>
+              </label>
+              <label class="toggle">
+                <input type="checkbox" value="inside" checked>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-copy">
+                  <span class="toggle-name">With the roofs off</span>
+                  <span class="toggle-hint">That same middle, with the roofs off so the rooms show.</span>
+                </span>
+              </label>
+            </div>
+            <button id="makePictures" class="btn" type="button">Draw a picture of it</button>
+            <div id="pictureNote" class="hint"></div>
+            <div id="pictureShots" class="shots" hidden></div>
           </div>
         </section>
       </div>

@@ -645,6 +645,12 @@ a.btn.is-disabled { opacity: 0.45; pointer-events: none; }
 .export-location { margin: 2px 0 8px; }
 .export-location[hidden] { display: none; }
 #tabPanelExport .export-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+.picture-draw {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line);
+}
+.picture-draw[hidden] { display: none; }
+.picture-draw .area-toggles { margin-top: 0; }
 #tabPanelExport .export-actions #exportBtn { flex: 1; }
 .location-choice { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .location-option { display: flex; align-items: center; gap: 8px; color: var(--text); cursor: pointer; }
