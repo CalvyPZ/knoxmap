@@ -185,25 +185,66 @@ def memory_status() -> tuple[int, int, int] | None:
 
     The last one is the address space: on a 32-bit Python it is about 2 GB
     however much memory the PC has, which is what a big map runs out of.
+    `total` is the RAM installed in the machine when Windows will say so,
+    which is a little higher than the memory left after the hardware reserve.
     """
     if os.name != "nt":
         return _memory_status_posix()
+    return _memory_status_windows()
+
+
+def _memory_status_windows() -> tuple[int, int, int] | None:
+    """Installed RAM, free RAM, and address space still free, in bytes.
+
+    The call has to be told it takes a pointer. Without that, a 64-bit
+    Python passes a truncated address, the call fails, and the machine
+    looks like it has no memory at all.
+    """
     try:
         import ctypes
+        from ctypes import wintypes
 
         class Status(ctypes.Structure):
-            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
-                        ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
-                        ("pagetotal", ctypes.c_ulonglong), ("pageavail", ctypes.c_ulonglong),
-                        ("virttotal", ctypes.c_ulonglong), ("virtavail", ctypes.c_ulonglong),
-                        ("extavail", ctypes.c_ulonglong)]
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(Status)]
+        kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+        kernel32.GetPhysicallyInstalledSystemMemory.argtypes = [
+            ctypes.POINTER(ctypes.c_ulonglong)]
+        kernel32.GetPhysicallyInstalledSystemMemory.restype = wintypes.BOOL
+
         st = Status()
-        st.length = ctypes.sizeof(Status)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
-            return int(st.total), int(st.avail), int(st.virtavail)
-    except Exception:  # noqa: BLE001 - not Windows
-        pass
-    return None
+        st.dwLength = ctypes.sizeof(Status)
+        total = free = room = 0
+        if kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            total = int(st.ullTotalPhys)
+            free = int(st.ullAvailPhys)
+            room = int(st.ullAvailVirtual)
+        installed_kb = ctypes.c_ulonglong()
+        if kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(installed_kb)):
+            installed = int(installed_kb.value) * 1024
+            if installed > total:
+                total = installed
+        if total <= 0:
+            return None
+        if free <= 0:
+            free = total
+        if room <= 0:
+            room = total
+        return total, free, room
+    except Exception:  # noqa: BLE001 - not Windows, or the calls are refused
+        return None
 
 
 def _memory_status_posix() -> tuple[int, int, int] | None:
