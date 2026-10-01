@@ -26,6 +26,25 @@ const fx = (() => {
     setTimeout(kill, ms);
   }
 
+  // The async clipboard is refused inside the app window. A selected textarea
+  // still copies, which is what the button needs when that refusal happens.
+  function writeClipboard(text) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.top = '0';
+    area.style.left = '0';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); }
+    finally { area.remove(); }
+    if (!ok) throw new Error('copy failed');
+  }
+
   // An error worth reporting: the message, its id in the log, and two ways to
   // pass it on - the details copied for a Discord message, or the whole
   // report zip saved into the logs folder and shown in Explorer.
@@ -43,10 +62,19 @@ const fx = (() => {
     el.querySelector('.eid').textContent = errorId ? `Error ${errorId}` : '';
     el.querySelector('.dismiss').addEventListener('click', () => el.remove());
     el.querySelector('.copy').addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
       const version = $('#appVersion')?.textContent || '';
       const text = [`KnoxMap ${version}: ${title}`, msg || '', errorId || ''].filter(Boolean).join('\n');
-      try { await navigator.clipboard.writeText(text); e.target.textContent = 'Copied'; }
-      catch (_) { e.target.textContent = 'Could not copy'; }
+      const button = e.currentTarget;
+      try {
+        if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+        else writeClipboard(text);
+        button.textContent = 'Copied';
+      } catch (_) {
+        try { writeClipboard(text); button.textContent = 'Copied'; }
+        catch (__) { button.textContent = 'Could not copy'; }
+      }
     });
     el.querySelector('.report').addEventListener('click', saveReport);
     box.appendChild(el);

@@ -704,8 +704,9 @@ if (gotLock) {
     installMenus();
     installToken();
     installDownloads();
-    session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => {
-      callback(false);
+    session.defaultSession.setPermissionRequestHandler((_contents, permission, callback) => {
+      // Copy details uses the clipboard. Everything else stays refused.
+      callback(permission === 'clipboard-sanitized-write' || permission === 'clipboard-write');
     });
     watchParent();
     createWindow();
