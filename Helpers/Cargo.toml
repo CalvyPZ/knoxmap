@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["ways"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# Not "abort". A panic in one building or one piece of ground must be caught
+# at that crate's boundary and reported as that job failing; it must never
+# take the host program down.
+panic = "unwind"
+strip = "debuginfo"
