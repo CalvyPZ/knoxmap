@@ -95,6 +95,13 @@ Source: [GPL-2.0](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
 | A binary comes with its complete corresponding source, including build scripts, from the same place (3a), or a written offer (3b). | Each compiler release carries `PZWorldEd_cli-source.zip` (the upstream tree at the pinned commit with the patch applied, plus build scripts), the licence text, and a written offer for three years. `KnoxMap/worlded/make_release.py` builds these. |
 | Qt (LGPL) sources for Qt binaries. | The release does not include Qt; it comes with PZ Mapping Tools, which gives its own source offer. |
 
+`compiler/` is the same GPL work in Rust: a modified version of that compile
+path (commit `4e86b80`), not part of the MIT helper library. `compiler/COPYING`
+and `compiler/NOTICE` travel with it. A release that ships the `knox-compile`
+binary has to ship the `compiler/` source beside it, the way a WorldEd release
+ships `PZWorldEd_cli-source.zip`. `KnoxMap/worlded/` remains the patch to the
+Qt editor.
+
 ## Code from other projects
 
 - **Knoxify** (arytek) has **no published licence**, so its author keeps all

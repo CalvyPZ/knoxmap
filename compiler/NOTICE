@@ -1,0 +1,21 @@
+knox-compile
+Copyright (C) Tim Baker (PZWorldEd / TileZed)
+Copyright (C) Unjammer and the PZ Mapping Tools contributors
+
+This program is a modified version of the compile path in PZ Mapping Tools
+(BMP to TMX and Generate Lots), translated to Rust. The Qt editor is not
+included.
+
+Upstream: https://github.com/Unjammer/PZ_Mapping_Tools
+Pinned commit: 4e86b80c505b3d77a2fb5f5675b752da966306f6
+Release label used by KnoxMap: 43.00B260909
+
+The GNU General Public License version 2 or later applies. See COPYING.
+There is NO WARRANTY, to the extent permitted by law.
+
+libtiled remains under the BSD-2-Clause licence. This program reads and writes
+TMX with its own code and does not include libtiled. The GPL covers what
+WorldEd does after a map is loaded.
+
+Rules.txt and Blends.txt are read from the mapping-tools directory. They are
+not copied into this tree.

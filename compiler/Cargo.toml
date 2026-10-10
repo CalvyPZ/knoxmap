@@ -1,0 +1,20 @@
+[package]
+name = "knox-compile"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "GPL-2.0-or-later"
+publish = false
+description = "GPL translation of PZWorldEd BMP-to-TMX and Generate Lots"
+
+[lib]
+name = "knox_compile"
+path = "src/lib.rs"
+
+[[bin]]
+name = "knox-compile"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1.0"
+quick-xml = "0.31"

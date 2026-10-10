@@ -294,11 +294,12 @@ def system_summary() -> str:
         pass
     try:
         import knoxpaths
+        from tools.compile_map import knox_compile_binary
         lines += [
             f"Game:     {knoxpaths.pz_install_dir() or 'not found'}"
             f" (Build 42: {knoxpaths.is_build42(knoxpaths.pz_install_dir())})",
             f"Tools:    {knoxpaths.mapping_tools_dir() or 'not installed'}",
-            f"Compiler: {'found' if knoxpaths.worlded_cli() else 'not found'}",
+            f"Compiler: {'found' if knox_compile_binary() else 'not found'}",
             f"Erika's Tiles: {'yes' if knoxpaths.erikas_tiles_ready() else 'no'}, "
             f"Elevators: {'yes' if knoxpaths.elevators_mod_installed() else 'no'}, "
             f"Spawn Selector: {'yes' if knoxpaths.spawn_selector_installed() else 'no'}",

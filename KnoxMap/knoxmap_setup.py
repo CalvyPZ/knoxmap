@@ -9,8 +9,7 @@ Safe to run again at any time; every step checks first and skips what is
 already done. What it does:
 
 1. Downloads PZ Mapping Tools (the community map editor, GPL) into vendor/.
-2. Downloads the patched PZWorldEd_cli.exe that lets KnoxMap compile maps
-   without clicking through WorldEd's menus, and checks its fingerprint.
+2. Checks that knox-compile, the map compiler, is next to the program.
 3. Finds your Project Zomboid install and extracts the tile artwork the map
    tools need from *your own copy of the game*. Game artwork is never
    downloaded or redistributed - it only ever comes from your install.
@@ -64,7 +63,7 @@ def _first_launch() -> bool:
     That is the first time it sets itself up. A later open finds them and
     leaves New map and Load map up while it rechecks.
     """
-    return knoxpaths.mapping_tools_dir() is None or knoxpaths.worlded_cli() is None
+    return knoxpaths.mapping_tools_dir() is None
 
 
 def _start_run_locked() -> None:
@@ -254,6 +253,19 @@ def _say_if_it_will_not_start() -> None:
         say("")
         say(f"      WARNING: {trouble}.")
         say("      Compile will fail until that is sorted; everything else works.")
+
+
+def ensure_knox_compile() -> bool:
+    """knox-compile is the only map compiler. It is built with the program."""
+    from tools.compile_map import knox_compile_binary
+    step(2, "Map compiler (knox-compile)")
+    native = knox_compile_binary()
+    if native is None:
+        say("      knox-compile was not found.")
+        say("      Build it with cargo build --release --manifest-path compiler/Cargo.toml")
+        return False
+    say(f"      found {native}")
+    return True
 
 
 def ensure_patched_cli(tools: Path) -> bool:
@@ -589,8 +601,8 @@ def continue_after_choice(download: bool, on_progress=None) -> None:
         tools = knoxpaths.mapping_tools_dir()
         if tools is None:
             return
-    progress("Installing WorldEd…")
-    cli_ok = ensure_patched_cli(tools)
+    progress("Checking the map compiler…")
+    cli_ok = ensure_knox_compile()
     game = find_game()
     progress("Setting up WorldEd…")
     configure_tools(tools, game)
@@ -641,7 +653,7 @@ def main() -> int:
         say("Cannot find WorldEd.")
         return 0
     tools = ensure_mapping_tools()
-    cli_ok = ensure_patched_cli(tools)
+    cli_ok = ensure_knox_compile()
     game = find_game()
     configure_tools(tools, game)
     finish(tools, game, cli_ok)

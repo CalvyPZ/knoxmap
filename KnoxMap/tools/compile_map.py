@@ -1,15 +1,6 @@
-"""Compile a Knoxify project to .lot files, a batch of cells at a time.
+"""Compile a Knoxify project to .lot files with knox-compile.
 
-    python tools/compile_map.py output/mytown [--batch 4]
-
-WorldEd's lot export never releases what it loads: every cell adds to the map
-and tileset caches, so one process compiling a whole town climbs without limit.
-A 572-cell map reached 13.7 GB and had done under a sixth of the work before the
-machine started thrashing.
-
-So the work is handed over in batches, each to a fresh PZWorldEd_cli process
-which exits and gives the memory back. Output accumulates in the same lots
-folder, because each batch only generates the cells it was given.
+    python tools/compile_map.py output/mytown
 """
 from __future__ import annotations
 
@@ -22,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -706,39 +698,123 @@ def _why(proc) -> str:
     return " | ".join((said or lines)[-3:])
 
 
-def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
-                on_progress=None, should_stop=None,
-                only_cells: list | None = None) -> int:
-    """Run every batch. Returns the number of compiled cells.
+def knox_compile_binary() -> Path | None:
+    """knox-compile, beside a packed program or under compiler/target."""
+    env = os.environ.get("KNOX_COMPILE", "").strip()
+    if env:
+        path = Path(env)
+        if path.is_file():
+            return path
+    names = ("knox-compile.exe", "knox-compile") if sys.platform == "win32" else (
+        "knox-compile", "knox-compile.exe")
+    places: list[Path] = []
+    frozen = getattr(sys, "_MEIPASS", None)
+    if frozen:
+        places.append(Path(frozen))
+    places.append(Path(sys.executable).resolve().parent)
+    here = Path(__file__).resolve()
+    # Packed copies of this tree (the Mac program) keep the binary beside the
+    # copy. A source checkout is one folder further up, under compiler/target.
+    if len(here.parents) > 1:
+        places.append(here.parents[1])
+    if len(here.parents) > 2:
+        built = here.parents[2] / "compiler" / "target"
+        places.append(built / "release")
+        places.append(built / "debug")
+    seen: set[str] = set()
+    for folder in places:
+        key = str(folder)
+        if key in seen:
+            continue
+        seen.add(key)
+        for name in names:
+            path = folder / name
+            if path.is_file():
+                return path
+    return None
 
-    A batch that fails is tried again (BATCH_ATTEMPTS) and, if it still will
-    not go, written down and stepped over: half a day's compiling should not
-    be thrown away because batch 23 of 48 hit a bad texture read. What could
-    not be done ends up in compile_failures.json and is offered again, and
-    `only_cells` - a list of [x0, y0, x1, y1] - compiles just those.
 
-    Some failures are not worth a second attempt because they are about this
-    machine rather than this batch: a Qt that cannot start fails every batch
-    in exactly the same way, and forty-eight batches of it is hours of
-    nothing. Those stop the run at once, with what to do about it.
+def native_jobs() -> int:
+    """How many cells knox-compile may hold at once.
 
-    on_progress(done, total, cells, skipped) fires when a batch is finished.
-    skipped is true when the cells were already on disk. done is 0 once,
-    before the first batch, so the clock can start after the batches are listed.
-    A call with finished=False only names the step in progress (phase, detail)
-    and does not count as a finished batch.
+    The same memory cap the WorldEd batches used: 150 MB a cell, 6 GB left
+    for the rest of the machine, and never more threads than the CPU has.
     """
+    cpus = os.cpu_count() or 1
+    status = knoxlog.memory_status()
+    if not status:
+        return max(1, cpus)
+    usable = min(int(status[1]), int(status[2]))
+    per = 150 * 1024 * 1024
+    reserve = 6 * 1024 * 1024 * 1024
+    room = max(1, (usable - reserve) // per)
+    return max(1, min(cpus, int(room)))
+
+
+class RunningCompile:
+    """One knox-compile process.
+
+    A held compile has already loaded the project and the tile catalog. It
+    waits on stdin until release(), then compiles. stop() ends it either way.
+    """
+
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self.finished = threading.Event()
+        self.proc = None
+        self.error: BaseException | None = None
+        self.count = 0
+        self.held = False
+
+    def release(self) -> None:
+        """Let a held compile start. A compile that was not held ignores this."""
+        proc = self.proc
+        if not self.held or proc is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write("\n")
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
+    def wait(self) -> int:
+        self.finished.wait()
+        if self.error is not None:
+            raise self.error
+        return self.count
+
+    def stop(self) -> None:
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            self.ready.set()
+            return
+        _end_batch(proc)
+
+
+def start_compile(project_dir: str, on_progress=None, should_stop=None,
+                  only_cells: list | None = None, hold: bool = False) -> RunningCompile:
+    """Start knox-compile for one mod.
+
+    hold=True loads the project and tile catalog, then waits. This returns
+    once that load has finished, so the caller can keep it in memory until
+    the mod already compiling is done. hold=False returns as soon as the
+    process is running.
+    """
+    import queue
+    import threading
+
     project = Path(project_dir).resolve()
     pzw = project / f"{project.name}.pzw"
     if not pzw.exists():
         raise FileNotFoundError(f"No {pzw.name} — generate the buildings first.")
-    exe_path = Path(exe) if exe else DEFAULT_EXE
-    if not exe_path.exists():
-        raise FileNotFoundError(f"PZWorldEd_cli not found at {exe_path}")
+    native = knox_compile_binary()
+    if native is None:
+        raise FileNotFoundError(
+            "knox-compile was not found. Build it with cargo build --release "
+            "--manifest-path compiler/Cargo.toml.")
 
-    # Every line of this run's log carries it, so two runs in one log file can
-    # be told apart - which is the first question to ask of any compile that
-    # looks like it did its batches out of order.
+    job = RunningCompile()
+    job.held = hold
     run = uuid.uuid4().hex[:8]
 
     def _phase(done: int, total: int, phase: str, detail: str = "") -> None:
@@ -746,175 +822,150 @@ def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
             on_progress(done, total, 0, False, phase=phase, detail=detail,
                         finished=False)
 
-    def _where(bx: int, by: int, x1: int, y1: int) -> str:
-        return f"cells {bx},{by} to {x1},{y1}"
-
-    with _only_one(project, run):
-        _phase(0, 0, "prepare", "Repairing the project")
-        clear_stale(project)
-        # Whatever wrote the project, one entry past the edge of the map must not
-        # stop the whole compile: WorldEd refuses a project over a single one.
-        from knoxbuild.repair import repair_project
+    def _drive() -> None:
+        proc = None
         try:
-            fixed = repair_project(pzw)
-        except Exception:  # noqa: BLE001 - a repair that fails leaves the project as it was
-            knoxlog.log.exception("compile %s: checking the project failed", project.name)
-        else:
-            if fixed["changed"]:
-                knoxlog.log.warning("compile %s: repaired the project before compiling - moved %d, "
-                                    "dropped %d%s", project.name, fixed["moved"],
-                                    len(fixed["dropped"]),
-                                    "".join(f"\n  dropped {what}: {why}"
-                                            for what, why in fixed["dropped"][:50]))
-        lots = project / "lots"
-        lots.mkdir(exist_ok=True)
-        (project / "tmx").mkdir(exist_ok=True)
-
-        _phase(0, 0, "prepare", "Listing cells")
-        w, h = world_size(pzw)
-        if not w or not h:
-            raise ValueError(f"Could not read the world size from {pzw.name}")
-
-        listed = compile_cells(project, pzw)
-
-        if only_cells:
-            batches = [tuple(int(v) for v in cells[:4]) for cells in only_cells]
-        else:
-            batches = [(x, y, min(x + batch - 1, w - 1), min(y + batch - 1, h - 1))
-                       for y in range(0, h, batch) for x in range(0, w, batch)]
-        if listed:
-            batches = [rect for rect in batches
-                       if any((cx, cy) in listed
-                              for cy in range(rect[1], rect[3] + 1)
-                              for cx in range(rect[0], rect[2] + 1))]
-        if not batches:
-            return len(list(lots.glob("*.lotheader"))) if lots.is_dir() else 0
-        started = time.time()
-        failures: list[dict] = []
-        # Batches are done one at a time, in this order, and the counter says
-        # so: this has always been a plain loop, but a compile that looked
-        # like it jumped from 25 to 18 is worth being able to rule out.
-        previous = 0
-        _phase(0, len(batches), "prepare", f"{len(batches)} batches")
-        if on_progress:
-            on_progress(0, len(batches), 0, True)
-        for i, (bx, by, x1, y1) in enumerate(batches, start=1):
-            if i != previous + 1:
-                raise RuntimeError(f"compile {project.name}: batch {i} followed {previous} "
-                                   f"- the batches are not being done in order")
-            previous = i
-            if only_cells is None and _batch_written(project, pzw, bx, by, x1, y1):
-                knoxlog.log.info("compile %s [%s]: batch %d/%d cells %d,%d..%d,%d "
-                                 "already written, skipping", project.name, run,
-                                 i, len(batches), bx, by, x1, y1)
-                _phase(i, len(batches), "skip",
-                       f"{_where(bx, by, x1, y1)} already compiled")
-                assign_converted_maps(pzw)
-                _phase(i, len(batches), "record", _where(bx, by, x1, y1))
-                cells = len(list(lots.glob("*.lotheader")))
-                if on_progress:
-                    on_progress(i, len(batches), cells, True)
+            with _only_one(project, run):
+                _phase(0, 0, "prepare", "Repairing the project")
+                clear_stale(project)
+                from knoxbuild.repair import repair_project
+                try:
+                    fixed = repair_project(pzw)
+                except Exception:  # noqa: BLE001
+                    knoxlog.log.exception(
+                        "compile %s: checking the project failed", project.name)
                 else:
-                    print(f"  batch {i}/{len(batches)} cells {bx},{by}..{x1},{y1} "
-                          f"already written  ({time.time() - started:.0f}s)", flush=True)
-                continue
-            cmd = knoxpaths.command_for(exe_path) + [
-                f"--generate-map={knoxpaths.tool_path(pzw)}",
-                f"--cells={bx},{by},{x1},{y1}"]
-            where = _where(bx, by, x1, y1)
-            lot_files = _batch_lot_files(project, pzw, bx, by, x1, y1) or []
-            lots_before = sum(1 for path in lot_files if path.is_file())
-            tmx_dir = project / "tmx"
-            for attempt in range(1, BATCH_ATTEMPTS + 1):
-                knoxstop.check(should_stop, "the compile")
-                attempt_started = time.time()
-                again = (f", attempt {attempt} of {BATCH_ATTEMPTS}"
-                         if attempt > 1 else "")
-                # A retry already has the maps from the attempt that died
-                # during lots. The project file is only updated afterwards,
-                # so the cell list still looks unconverted.
-                converting = not _conversion_done(pzw) and (
-                    attempt == 1 or not any(tmx_dir.glob("*.tmx")))
+                    if fixed["changed"]:
+                        knoxlog.log.warning(
+                            "compile %s: repaired the project before compiling - "
+                            "moved %d, dropped %d%s", project.name, fixed["moved"],
+                            len(fixed["dropped"]),
+                            "".join(f"\n  dropped {what}: {why}"
+                                    for what, why in fixed["dropped"][:50]))
+                lots = project / "lots"
+                lots.mkdir(exist_ok=True)
+                (project / "tmx").mkdir(exist_ok=True)
+                w, h = world_size(pzw)
+                if not w or not h:
+                    raise ValueError(f"Could not read the world size from {pzw.name}")
+                jobs = native_jobs()
+                cmd = [str(native), str(pzw), "--tmx", "--lots", f"--jobs={jobs}"]
+                if hold:
+                    cmd.append("--hold")
+                tools = knoxpaths.mapping_tools_dir()
+                if tools:
+                    for flag, name in (("--rules", "Rules.txt"), ("--blends", "Blends.txt"),
+                                       ("--map-base", "MapBaseXML.txt"),
+                                       ("--tilesets", "Tilesets.txt")):
+                        path = tools / "config" / name
+                        if path.is_file():
+                            cmd.extend([flag, str(path)])
+                if only_cells:
+                    for cells in only_cells:
+                        x0, y0, x1, y1 = (int(v) for v in list(cells)[:4])
+                        cmd.append(f"--cells={x0},{y0},{x1},{y1}")
+                _phase(0, 1, "prepare", "Loading" if hold else "knox-compile")
+                knoxlog.log.info("compile %s [%s]: knox-compile %s%s",
+                                 project.name, run, native,
+                                 " (held)" if hold else "")
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE if hold else subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace")
+                job.proc = proc
+                lines: queue.Queue = queue.Queue()
 
-                def on_tick(where=where, again=again, converting=converting,
-                            lots_before=lots_before, lot_files=lot_files):
-                    present = sum(1 for path in lot_files if path.is_file())
-                    if converting and present <= lots_before:
-                        written = len(list(tmx_dir.glob("*.tmx")))
-                        detail = f"{written} maps written" if written else "Reading the bitmaps"
-                        _phase(i, len(batches), "convert", f"{where}{again} · {detail}")
+                def _pump() -> None:
+                    if proc.stdout is not None:
+                        for line in proc.stdout:
+                            lines.put(line)
+                    lines.put(None)
+
+                err_box: list[str] = []
+
+                def _pump_err() -> None:
+                    if proc.stderr is not None:
+                        err_box.append(proc.stderr.read())
+
+                threading.Thread(target=_pump, daemon=True).start()
+                err_thread = threading.Thread(target=_pump_err, daemon=True)
+                err_thread.start()
+                try:
+                    while True:
+                        if should_stop is not None and should_stop():
+                            _end_batch(proc)
+                            knoxstop.check(should_stop, "the compile")
+                        try:
+                            line = lines.get(timeout=STOP_POLL_SECONDS)
+                        except queue.Empty:
+                            continue
+                        if line is None:
+                            break
+                        line = line.strip()
+                        if not line.startswith("{"):
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        done = int(msg.get("done") or 0)
+                        total = int(msg.get("total") or 0)
+                        skipped = bool(msg.get("skipped"))
+                        phase = str(msg.get("phase") or "")
+                        detail = str(msg.get("detail") or "")
+                        if phase == "ready":
+                            job.ready.set()
+                        if on_progress and (total or phase):
+                            on_progress(done, total, done if phase == "lots" else 0,
+                                        skipped, phase=phase, detail=detail,
+                                        finished=phase not in ("prepare", "ready"))
+                finally:
+                    if proc.poll() is None:
+                        _end_batch(proc)
+                    try:
+                        proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        _end_batch(proc)
+                err_thread.join(timeout=5)
+                code = proc.returncode if proc.returncode is not None else 1
+                err = "".join(err_box)
+                if code != 0:
+                    why = (err.strip().splitlines() or [f"exit {code}"])[-1]
+                    if only_cells:
+                        rects = [tuple(int(v) for v in list(cells)[:4])
+                                 for cells in only_cells]
                     else:
-                        _phase(i, len(batches), "lots", f"{where}{again}")
+                        rects = [(0, 0, max(0, w - 1), max(0, h - 1))]
+                    failures = [{"cells": list(rect), "exit": code, "why": why,
+                                 "log": "", "attempts": 1} for rect in rects]
+                    _record_failures(project, run, jobs, failures)
+                    raise RuntimeError(f"knox-compile failed (exit {code}): {why}")
+                _record_failures(project, run, jobs, [])
+                assign_converted_maps(pzw)
+                job.count = len(list(lots.glob("*.lotheader"))) if lots.is_dir() else 0
+        except BaseException as exc:
+            job.error = exc
+        finally:
+            job.ready.set()
+            job.finished.set()
 
-                on_tick()
-                proc = _run_batch(cmd, should_stop, attempt_started, on_tick)
-                # WorldEd's own account of the batch, kept whatever happened: when it
-                # crashes this is the only record of how far it got.
-                saved = knoxlog.save_tool_output("PZWorldEd_cli", project.name,
-                                                 f"cells_{bx}_{by}-{x1}_{y1}", proc.returncode,
-                                                 proc.stdout, proc.stderr)
-                again = f" (attempt {attempt}/{BATCH_ATTEMPTS})" if attempt > 1 else ""
-                knoxlog.log.info("compile %s [%s]: batch %d/%d cells %d,%d..%d,%d exit %d "
-                                 "(%s) in %.0fs%s", project.name, run, i, len(batches),
-                                 bx, by, x1, y1, proc.returncode,
-                                 knoxlog.explain_exit(proc.returncode),
-                                 time.time() - attempt_started, again)
-                if proc.returncode == 0:
-                    break
-                # Not this batch's fault, and every other batch would go the
-                # same way: stop now and say what to do about it.
-                trouble = knoxpaths.qt_trouble((proc.stderr or "") + (proc.stdout or ""))
-                if trouble:
-                    raise RuntimeError(f"Compile cannot run on this system: {trouble}.")
-                if attempt < BATCH_ATTEMPTS:
-                    knoxlog.log.warning("compile %s [%s]: batch %d/%d failed, trying again",
-                                        project.name, run, i, len(batches))
-            _phase(i, len(batches), "record", where)
-            assign_converted_maps(pzw)
-            cells = len(list(lots.glob("*.lotheader")))
-            # 65 used to be tolerated because the wait for WorldEd was a guess.
-            # It now waits for the lot manager's own completion, so 65 means a
-            # genuine stall or timeout and the batch's cells cannot be trusted.
-            if proc.returncode != 0:
-                where = f"logs/worlded/{saved.name}" if saved else ""
-                failures.append({"cells": [bx, by, x1, y1], "exit": proc.returncode,
-                                 "why": _why(proc), "log": where,
-                                 "attempts": BATCH_ATTEMPTS})
-                knoxlog.log.error("compile %s [%s]: giving up on batch %d/%d cells "
-                                  "%d,%d..%d,%d after %d attempts - carrying on with the "
-                                  "rest", project.name, run, i, len(batches),
-                                  bx, by, x1, y1, BATCH_ATTEMPTS)
-            if on_progress:
-                on_progress(i, len(batches), cells, False)
-            else:
-                elapsed = time.time() - started
-                state = "FAILED" if proc.returncode != 0 else f"-> {cells} compiled"
-                print(f"  batch {i}/{len(batches)} cells {bx},{by}..{x1},{y1} "
-                      f"{state}  ({elapsed:.0f}s)", flush=True)
+    threading.Thread(target=_drive, name=f"compile-{project.name}", daemon=True).start()
+    if hold:
+        job.ready.wait()
+    return job
 
-        # Asked for particular cells, the batches that were not in this run
-        # keep whatever the last full compile said about them - retrying two
-        # of five failures must not lose the other three.
-        this_run = list(failures)
-        if only_cells:
-            done = {tuple(b) for b in batches}
-            failures = [f for f in failed_cells(project)
-                        if tuple(f.get("cells") or ()) not in done] + failures
-        _record_failures(project, run, batch, failures)
-        if this_run and len(this_run) >= len(batches):
-            first = this_run[0]
-            where = f" - WorldEd's output is in {first['log']}" if first.get("log") else ""
-            at = (f"{first['cells'][0]},{first['cells'][1]}.."
-                  f"{first['cells'][2]},{first['cells'][3]}")
-            if only_cells:
-                raise RuntimeError(f"Those cells still will not compile. {at} "
-                                   f"(exit {first['exit']}): {first['why']}{where}")
-            raise RuntimeError(f"WorldEd failed on every batch. The first was cells "
-                               f"{at} (exit {first['exit']}): {first['why']}{where}")
-        if failures:
-            knoxlog.log.warning("compile %s [%s]: finished with %d of %d batches failed",
-                                project.name, run, len(failures), len(batches))
-        return len(list(lots.glob("*.lotheader")))
+
+def compile_map(project_dir: str, batch: int = 4, exe: str | None = None,
+                on_progress=None, should_stop=None,
+                only_cells: list | None = None) -> int:
+    """Compile the project with knox-compile. Returns the number of cells.
+
+    `only_cells` is a list of [x0, y0, x1, y1]. on_progress reports each step
+    knox-compile prints. A call with finished=False only names the step.
+    """
+    job = start_compile(project_dir, on_progress=on_progress,
+                        should_stop=should_stop, only_cells=only_cells, hold=False)
+    return job.wait()
 
 
 def main(argv: list[str] | None = None) -> int:

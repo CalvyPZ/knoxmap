@@ -47,6 +47,27 @@ made by `KnoxMap/worlded/make_release.py`), the licence text and a written sourc
 offer. See [worlded/README.md](../KnoxMap/worlded/README.md) and
 [LEGAL.md](LEGAL.md#the-map-compiler-gnu-gpl-version-2).
 
+`KnoxMap/worlded/` stays that patch. It is not the Rust compiler.
+
+## The Rust map compiler — GPL-2.0-or-later
+
+[`compiler/`](../compiler/) is a separate Cargo project (`license = "GPL-2.0-or-later"`,
+`publish = false`). It translates WorldEd's BMP-to-TMX and Generate Lots path
+from PZ Mapping Tools commit `4e86b80c505b3d77a2fb5f5675b752da966306f6`.
+`compiler/COPYING` is the GPL-2.0 text. `compiler/NOTICE` names Tim Baker's
+PZWorldEd, Unjammer's PZ Mapping Tools, that commit, and that this is a
+modified version. `knox-compile --version` prints the notice.
+
+It is not a member of [`Helpers/Cargo.toml`](../Helpers/Cargo.toml) and it is
+not linked into the MIT `helper` library. Python starts `knox-compile` as its
+own process, one mod at a time. `Rules.txt` and `Blends.txt` are read from the
+player's mapping-tools directory; they are not copied into this tree.
+
+A binary release of `knox-compile` has to carry this Rust source the same way
+`KnoxMap/worlded/make_release.py` carries `PZWorldEd_cli-source.zip` for the
+patched editor. libtiled stays BSD-2-Clause and is not translated; the GPL
+part is what WorldEd does after a map is loaded.
+
 ## Things this repository does not contain
 
 - **Project Zomboid artwork.** Setup extracts tile sheets from each player's

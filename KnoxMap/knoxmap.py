@@ -13,9 +13,9 @@ The window is Electron, packed inside the program file players download.
 A source checkout starts the Electron binary from desktop/. Set
 KNOXMAP_BROWSER=1 to use the browser instead.
 
-Compiling uses the patched PZWorldEd_cli.exe. The program file asks before
-downloading it when WorldEd is not beside the executable (see worlded/README.md);
-without it the app opens WorldEd on the project instead.
+Compiling uses knox-compile, packed beside the program. The helper library
+does terrain, buildings, ways and clipping. There is no Python or WorldEd
+stand-in for either.
 
 Run it with:  .venv\Scripts\pythonw.exe knoxmap.py   (from the KnoxMap folder, or double-click KnoxMap.exe)
 On Linux or macOS:  ./knoxmap.sh
