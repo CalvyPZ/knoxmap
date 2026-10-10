@@ -1,20 +1,24 @@
 """Map features from local Geofabrik dailies, one box at a time.
 
-The regional PBF stays on disk. A harbour such as Sydney Harbour is hundreds
-of open shore ways, and those relations sit at the end of the file. Their
-ids are collected on a second thread while this read fills the node index,
-so the shores are known before the first way and the file is not walked
-twice in a row. Untagged nodes are dropped in C++. A way that would not be
+The regional PBF stays on disk. When the helper library can read it, that
+read files the regional grid and cuts the selection in one call. Otherwise
+this module walks the file: a harbour such as Sydney Harbour is hundreds of
+open shore ways, and those relations sit at the end of the file. Their ids
+are collected on a second thread while this read fills the node index, so
+the shores are known before the first way and the file is not walked twice
+in a row. Untagged nodes are dropped in C++. A way that would not be
 painted, and is not one of those shores, is dropped before its nodes are
 read.
 
-Every remaining way is one bounding box, taken in one pass from the
-coordinates already packed on its nodes. A box that misses the selection
-is dropped there — a small area does not then inspect each vertex. A box
-that meets the selection keeps those same coordinates for the precise test,
-so a kept road is not read a second time. A water shore keeps the packed
-pairs. Its coordinate list is built only when that lake or harbour meets
-the selection, from the pairs still in memory at the end of this read.
+Every remaining way is one bounding box. When the helper library is
+present that measure, the hit or cover test, and the grid record run in
+the ways crate; otherwise they run here, from the coordinates already
+packed on the way's nodes. A box that misses the selection is dropped
+there — a small area does not then inspect each vertex. A box that meets
+the selection keeps those same coordinates for the precise test, so a kept
+road is not read a second time. A water shore keeps the packed pairs. Its
+coordinate list is built only when that lake or harbour meets the
+selection, from the pairs still in memory at the end of this read.
 
 The boxes, coordinates and tags are also stored in a grid for the whole
 region. The next selection in that daily reads the cells it touches and
@@ -43,6 +47,7 @@ from .geofabrik import Region, _Rate, ensure_pbf, load_index, cover
 from .osm import (
     FILTERS_VERSION, OSMFeature, OVERPASS_FILTERS, RAIL_GROUNDS, assemble_rings,
 )
+from . import clip_native, ways_native
 
 # Local clips older than this still used the closed-ring rule and dropped
 # open-sided water (Sydney Harbour stayed the climate's forest). The filter
@@ -1082,7 +1087,7 @@ class _ClipWriter:
         assert self._fh is not None
         fh = self._fh.get(name)
         if fh is None:
-            fh = open(os.path.join(self.folder, name), "w", encoding="utf-8", newline="\n")
+            fh = open(os.path.join(self.folder, name), "a", encoding="utf-8", newline="\n")
             self._fh[name] = fh
         return fh
 
@@ -1743,6 +1748,31 @@ _REL_REST = struct.Struct("<qiiiiBI")
 _MEM_HEAD = struct.Struct("<BqI")
 
 
+def _packed_ptr(nodes, count: int, layout):
+    """Address of the way's packed node records, or None when it cannot be read.
+
+    The same pointer walk as ``_measure_packed``. The ways crate measures from
+    here; this only finds the array.
+    """
+    if count < 2 or not layout:
+        return None
+    py_off, hop_off, data_off = layout
+    blob = nodes._list
+    if py_off < 0 or py_off + 8 > sys.getsizeof(blob):
+        return None
+    ptr = ctypes.c_uint64.from_address(id(blob) + py_off).value
+    if ptr < 0x10000 or ptr % 8 or ptr >= (1 << 57):
+        return None
+    if hop_off >= 0:
+        ptr = ctypes.c_uint64.from_address(ptr + hop_off).value
+        if ptr < 0x10000 or ptr % 8 or ptr >= (1 << 57):
+            return None
+    addr = ptr + data_off
+    if addr < 0x10000:
+        return None
+    return addr
+
+
 def _measure_packed(nodes, count: int, layout):
     """Bounding box and packed x/y, from the way's own coordinate array.
 
@@ -1795,6 +1825,18 @@ def _coords_from_xy(xy: bytes) -> list[tuple[float, float]]:
     lats = (buf[1::2] / scale).tolist()
     lons = (buf[0::2] / scale).tolist()
     return list(zip(lats, lons))
+
+
+def _classify_xy(xy: bytes, south: float, west: float, north: float, east: float) -> str:
+    """'hit', 'cover', or 'miss' from the packed pairs a span file stores."""
+    code = ways_native.classify(xy, south, west, north, east)
+    if code == ways_native.HIT:
+        return "hit"
+    if code == ways_native.COVER:
+        return "cover"
+    if code == ways_native.MISS:
+        return "miss"
+    raise RuntimeError(ways_native.reason() or "the ways library could not classify this way")
 
 
 def _classify_coords(coords: list[tuple[float, float]],
@@ -2172,6 +2214,106 @@ def _load_relations(path: str, limits, should_stop):
                members, water, embedded)
 
 
+def _node_rule_text() -> bytes:
+    """Node tag rules, one `key` or `key=value` a line, for the clip crate."""
+    lines = []
+    for kind, key, value in _rules():
+        if kind != "n":
+            continue
+        if value is None:
+            lines.append(key)
+        else:
+            lines.append(f"{key}={value}")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _emit_selection(writer, blob: bytes, extra: dict) -> None:
+    """Ways handed back when the native grid will not be published."""
+    if len(blob) < 4:
+        return
+    count = struct.unpack_from("<I", blob, 0)[0]
+    i = 4
+    for _ in range(count):
+        if i + 16 > len(blob):
+            return
+        wid, status, xy_len = struct.unpack_from("<qiI", blob, i)
+        i += 16
+        xy = blob[i:i + xy_len]
+        i += xy_len
+        if i + 4 > len(blob):
+            return
+        tag_len = struct.unpack_from("<I", blob, i)[0]
+        i += 4
+        tag_b = blob[i:i + tag_len]
+        i += tag_len
+        try:
+            tags = json.loads(tag_b)
+        except ValueError:
+            continue
+        if not isinstance(tags, dict):
+            continue
+        tags = {str(key): str(value) for key, value in tags.items()}
+        coords = _coords_from_xy(xy)
+        extra[int(wid)] = coords
+        _emit_way(writer, int(wid), tags, coords, "hit" if status == 1 else "cover")
+
+
+def _clip_sizes(folder: str) -> dict[str, int]:
+    """File lengths before a cut, so a failed cut can be unwound."""
+    sizes: dict[str, int] = {}
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return sizes
+    for name in names:
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            try:
+                sizes[name] = os.path.getsize(path)
+            except OSError:
+                pass
+    return sizes
+
+
+def _clip_rewind(folder: str, sizes: dict[str, int]) -> None:
+    """Put the clip directory back to the lengths in ``sizes``."""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        if name not in sizes:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        try:
+            if os.path.getsize(path) != sizes[name]:
+                with open(path, "r+b") as fh:
+                    fh.truncate(sizes[name])
+        except OSError:
+            pass
+
+
+def _clip_native(span_dir: str, out_dir: str,
+                 box: tuple[float, float, float, float],
+                 region_box: tuple[float, float, float, float],
+                 deg: float, rows: int, cols: int, parts: int) -> bool:
+    """True when the clip crate wrote this selection."""
+    out_rows, out_cols = _grid_shape(box)
+    code = clip_native.cut(
+        span_dir, out_dir, box, region_box, deg, rows, cols, _SPAN_WIDE,
+        out_rows, out_cols, FILTERS_VERSION, _CLIP_VERSION, parts,
+        _node_rule_text() if parts & clip_native.PART_NODES else b"")
+    if code != 0:
+        raise RuntimeError(clip_native.why(code))
+    return True
+
+
 def _clip_from_span(root: str, region: Region, source: str,
                     box: tuple[float, float, float, float],
                     should_stop) -> str:
@@ -2190,65 +2332,14 @@ def _clip_from_span(root: str, region: Region, source: str,
     if os.path.isdir(partial):
         shutil.rmtree(partial, ignore_errors=True)
     os.makedirs(partial, exist_ok=True)
-    south, west, north, east = box
-    limits = _envelope_limits(*box)
     rows_out, cols_out = _grid_shape(box)
     writer = _ClipWriter(partial, box, rows_out, cols_out)
     try:
         knoxstop.check(should_stop, "the download")
-        paths = [os.path.join(folder, "wide.bin")]
-        # A selection can sit on a grid line. The cells the box touches are
-        # enough; a way that spans more than a handful of cells is in wide.bin.
-        touched = _cells_touched(
-            (int(west * _LOC_SCALE) - 2, int(south * _LOC_SCALE) - 2,
-             int(east * _LOC_SCALE) + 2, int(north * _LOC_SCALE) + 2),
-            region_box, deg, rows, cols)
-        for row, col in touched or []:
-            paths.append(os.path.join(folder, f"r{row}c{col}.bin"))
-        # _cells_touched returns None for a huge box. Read every cell then.
-        if touched is None:
-            for name in os.listdir(folder):
-                if name.startswith("r") and name.endswith(".bin"):
-                    paths.append(os.path.join(folder, name))
-        ways: dict[int, tuple[bytes, dict]] = {}
-        nodes: list = []
-        node_rules = _rule_table(_rules())
-        _load_span_files(paths, limits, ways, nodes, should_stop)
-        stored: dict[int, list] = {}
-        for wid, (xy, tags) in ways.items():
-            coords = _coords_from_xy(xy)
-            stored[wid] = coords
-            status = _classify_coords(coords, south, west, north, east)
-            if status == "miss":
-                continue
-            _emit_way(writer, wid, tags, coords, status)
-        for nid, x, y, tags in nodes:
-            lat = y / _LOC_SCALE
-            lon = x / _LOC_SCALE
-            if not (south <= lat <= north and west <= lon <= east):
-                continue
-            if not _matches("n", tags, node_rules):
-                continue
-            writer.add("node", nid, tags,
-                       {"type": "Point", "coordinates": [lon, lat]},
-                       [(lat, lon)], False)
-        for rel_id, tags, members, water, embedded in _load_relations(
-                os.path.join(folder, "relations.bin"), limits, should_stop):
-            if not water and not any(
-                    kind == "w" and ref in stored for kind, ref, _role in members):
-                continue
-            if water:
-                rel_stored = {ref: _coords_from_xy(xy) for ref, xy in embedded.items()}
-            else:
-                rel_stored = stored
-            way_members = sum(kind == "w" for kind, _ref, _role in members)
-            made = _relation_geometry_plain(
-                tags, members, rel_stored, box, water, way_members)
-            if made is None:
-                continue
-            geometry, flat, cover = made
-            writer.add("relation", rel_id, tags, geometry, flat, cover)
-        writer.finish()
+        parts = (clip_native.PART_WAYS | clip_native.PART_NODES
+                 | clip_native.PART_RELATIONS)
+        _clip_native(folder, partial, box, region_box, deg, rows, cols, parts)
+        writer.abort()
         if os.path.isdir(dest):
             shutil.rmtree(dest, ignore_errors=True)
         os.replace(partial, dest)
@@ -2257,122 +2348,6 @@ def _clip_from_span(root: str, region: Region, source: str,
         shutil.rmtree(partial, ignore_errors=True)
         raise
     return dest
-
-
-class _WayGate:
-    """Drop ways inside the file reader, before the clip loop sees them.
-
-    A pyosmium handler filter returns True to drop the object and False to
-    keep it. Paint tags are tested before any node is touched. Water shores
-    are already listed (the other thread finished during the node index, or
-    this waits once, on the first way). Each remaining way is one bounding
-    box from the packed coordinates. A miss is dropped on that box. A hit
-    keeps those coordinates, so the clip loop does not walk the nodes again.
-    """
-
-    def __init__(self, table, box, stopper: _Stop, ids_event, ids_box, span):
-        self.ways = table.get("w", {})
-        self.south, self.west, self.north, self.east = box
-        self.limits = _envelope_limits(*box)
-        self.stopper = stopper
-        self._ids_event = ids_event
-        self._ids_box = ids_box
-        self.needed: set[int] = set()
-        self._ids_done = False
-        self.span = span
-        self.kept: dict[int, tuple[list, str]] = {}
-        self.water_coords: dict[int, list] = {}
-        self.water_xy: dict[int, bytes] = {}
-        self.water_bounds: dict[int, tuple] = {}
-        self.trusted = True
-        self._pulled = False
-        self._factory = None
-        self._use_all = None
-
-    def _abandon(self) -> None:
-        self.trusted = False
-        if self.span is not None:
-            self.span.trusted = False
-
-    def _ensure_ids(self) -> None:
-        if self._ids_done:
-            return
-        self._ids_event.wait()
-        self._ids_done = True
-        err = self._ids_box.get("error")
-        if err is not None:
-            raise err
-        self.needed = self._ids_box.get("ids") or set()
-
-    def pull_water(self, stored: dict) -> None:
-        """Shores collected on the way pass, still in memory for relations."""
-        if self._pulled:
-            return
-        self._ensure_ids()
-        stored.update(self.water_coords)
-        self._pulled = True
-
-    def way(self, way) -> bool:
-        self.stopper.tick()
-        self._ensure_ids()
-        wid = int(way.id)
-        needed = wid in self.needed
-        paint = _way_paint(way.tags, self.ways)
-        # A closed ring that is not painted and not a water shore was read
-        # and then thrown away. Drop it before the node array is touched.
-        if not paint and not needed:
-            return True
-        nodes = way.nodes
-        count = len(nodes)
-        if count < 2:
-            return True
-        learned = _learn_span(nodes, count)
-        if learned == "invalid":
-            return True
-        if learned != "ready":
-            # A real way could not be packed. The grid would be missing it.
-            self._abandon()
-            return self._slow(way, needed)
-        measured = _measure_packed(nodes, count, _span_layout)
-        if measured is False:
-            return True
-        if measured is None:
-            self._abandon()
-            return self._slow(way, needed)
-        minx, miny, maxx, maxy, xy = measured
-        bounds = (minx, miny, maxx, maxy)
-        if needed:
-            # Keep the packed pairs. The coordinate list is built later, and
-            # only for a water relation whose box meets this selection.
-            self.water_bounds[wid] = bounds
-            self.water_xy[wid] = xy
-        tags = _tag_dict(way.tags) if paint else None
-        if paint and self.span is not None and self.trusted and tags is not None:
-            self.span.add_way(wid, bounds, xy, tags)
-        if not _span_overlaps(minx, miny, maxx, maxy, self.limits):
-            return True
-        if not paint or tags is None:
-            return True
-        coords = self.water_coords.get(wid) or _coords_from_xy(xy)
-        status = _classify_coords(coords, self.south, self.west, self.north, self.east)
-        if status == "miss":
-            return True
-        self.kept[wid] = (coords, status, tags)
-        return False
-
-    def _slow(self, way, needed: bool) -> bool:
-        """Packed coordinates could not be read. The old envelope test."""
-        if needed:
-            return False
-        if self._factory is None:
-            lib = _require()
-            self._factory = lib.geom.WKBFactory()
-            self._use_all = lib.geom.ALL
-        if not _way_paint(way.tags, self.ways) and not _closed_ring(way):
-            return True
-        return _envelope_misses(
-            way, self._factory, self._use_all,
-            self.south, self.west, self.north, self.east, self.limits)
 
 
 def _water_way_ids(source: str, table, should_stop, threads: int) -> set[int]:
@@ -2435,186 +2410,76 @@ def _union_bounds(ids, boxes):
     return minx, miny, maxx, maxy
 
 
-def _build_clip(root: str, region: Region, source: str,
-                box: tuple[float, float, float, float],
-                should_stop, threads: int) -> str:
-    """Tagged nodes and the ways that meet the box, in one read.
+def _kind_rule_text() -> bytes:
+    """Tag rules as ``kind/key`` or ``kind/key=value`` lines for the daily walk."""
+    lines = []
+    for kind, key, value in _rules():
+        if value is None:
+            lines.append(f"{kind}/{key}")
+        else:
+            lines.append(f"{kind}/{key}={value}")
+    return "\n".join(lines).encode("utf-8")
 
-    Untagged nodes never enter Python: the key filter drops them after the
-    C++ location index has recorded their coordinates. Water-shore ids are
-    collected on another thread while that index fills, and the way gate
-    waits for them once. A way that is not painted and not a shore is dropped
-    before its nodes are read. Anything else is one bounding box from the
-    packed coordinates; a miss stops there. Relations come last, and a
-    harbour is assembled from the shore coordinates still in memory.
+
+def _try_rust_walk(root: str, region: Region, source: str,
+                   box: tuple[float, float, float, float],
+                   partial: str, dest: str, should_stop, on_note=None) -> bool:
+    """True when the helper read the daily and this clip is in ``dest``.
+
+    ``on_note(phase, done, total, speed)`` is called about five times a
+    second. phase 1 is the harbour pass, 2 the roads, 3 the cut. done and
+    total restart at each phase, so a second pass does not stay at 100%.
     """
-    dest = _clip_dir(root, region, source, box)
-    if os.path.isdir(dest):
-        shutil.rmtree(dest, ignore_errors=True)
-    partial = dest + ".part"
-    if os.path.isdir(partial):
-        shutil.rmtree(partial, ignore_errors=True)
-    os.makedirs(partial, exist_ok=True)
-    south, west, north, east = box
-    rows, cols = _grid_shape(box)
-    lib = _require()
-    rules = _rules()
-    table = _rule_table(rules)
-    keys = sorted({key for _kind, key, _value in rules})
-    # Nodes and relations must carry one of the keys KnoxMap paints. Ways are
-    # not in this filter: KeyFilter is a conjunction, and an untagged ring
-    # would never reach the multipolygon that uses it. A C++ drop in front of
-    # the way callback would also hide those ways from _Stop. _WayGate does
-    # the tag-or-ring test and the envelope, and ticks every way. Nodes are
-    # not given a Python callback; the location index stays in C++.
-    keep = lib.filter.KeyFilter(*keys).enable_for(lib.osm.NODE | lib.osm.RELATION)
-    writer = _ClipWriter(partial, box, rows, cols)
-    stopper = _Stop(should_stop)
-    stored: dict[int, list[tuple[float, float]]] = {}
-    proc = None
-    pool = None
-    gate = None
-    span = _SpanOut(region.bbox)
+    if not clip_native.walk_ready():
+        raise RuntimeError("the clip library is not next to the program")
     span_folder = _span_dir(root, region, source)
-    # The shore list and the node index both read the daily. Running them
-    # together means the way pass does not wait out a finished first walk.
-    water_threads = max(1, threads // 4)
-    main_threads = max(1, threads - water_threads)
-    ids_box: dict = {"ids": set(), "error": None}
-    ids_event = threading.Event()
+    rows, cols = _grid_shape(box)
+    flag = ctypes.c_uint32(0)
+    note = clip_native.WalkNote(1, 0, 0)
+    done = threading.Event()
+    state = {"phase": 0, "rate": _Rate()}
 
-    def _shores():
-        try:
-            ids_box["ids"] = _water_way_ids(source, table, should_stop, water_threads)
-        except Exception as exc:
-            ids_box["error"] = exc
-        finally:
-            ids_event.set()
+    def watch() -> None:
+        while not done.wait(0.2):
+            if should_stop is not None and should_stop():
+                flag.value = 1
+            if on_note is None:
+                continue
+            phase = int(note.phase)
+            got = int(note.done)
+            size = int(note.total)
+            if phase != state["phase"]:
+                state["phase"] = phase
+                state["rate"] = _Rate()
+            speed = state["rate"].add(time.monotonic(), got) if size > 0 else 0.0
+            on_note(phase, got, size, speed)
 
-    threading.Thread(target=_shores, name="knox-water", daemon=True).start()
+    watcher = threading.Thread(target=watch, name="knox-walk-stop", daemon=True)
+    watcher.start()
+    if on_note is not None:
+        on_note(1, 0, 0, 0.0)
     try:
-        knoxstop.check(should_stop, "the download")
-        pool = lib.io.ThreadPool(max(1, main_threads))
-        storage = _location_storage(source, partial)
-        gate = _WayGate(table, box, stopper, ids_event, ids_box, span)
-        proc = (lib.FileProcessor(source, thread_pool=pool)
-                .with_locations(storage)
-                .with_filter(keep)
-                .with_filter(gate))
-        for obj in proc:
-            stopper.tick()
-            kind = obj.type_str()
-            if kind == "n":
-                if not _matches("n", obj.tags, table):
-                    continue
-                tags = _tag_dict(obj.tags)
-                loc = obj.location
-                try:
-                    nx = int(loc.x)
-                    ny = int(loc.y)
-                except Exception:
-                    nx = ny = _INVALID_X
-                if span.trusted and nx != _INVALID_X and ny != _INVALID_X:
-                    span.add_node(int(obj.id), nx, ny, tags)
-                if not _in_box(loc, south, west, north, east):
-                    continue
-                lat = loc.lat
-                lon = loc.lon
-                writer.add(
-                    "node", int(obj.id), tags,
-                    {"type": "Point", "coordinates": [lon, lat]},
-                    [(lat, lon)], False)
-                continue
-            if kind == "w":
-                osm_id = int(obj.id)
-                kept = gate.kept.get(osm_id)
-                if kept is None:
-                    # Packed coordinates were unreadable for this way. The
-                    # gate left it for the same test the clip used to run.
-                    if osm_id in gate.needed and osm_id not in gate.water_coords:
-                        coords = _way_coords(obj)
-                        if coords is not None:
-                            stored[osm_id] = coords
-                    if not _matches("w", obj.tags, table):
-                        continue
-                    status, coords = _classify_way(obj, south, west, north, east)
-                    if coords is None:
-                        continue
-                    stored[osm_id] = coords
-                    _emit_way(writer, osm_id, _tag_dict(obj.tags), coords, status)
-                    continue
-                coords, status, tags = kept
-                stored[osm_id] = coords
-                _emit_way(writer, osm_id, tags, coords, status)
-                continue
-            if kind != "r":
-                continue
-            gate.pull_water(stored)
-            if not _matches("r", obj.tags, table):
-                continue
-            rel_type = obj.tags["type"] if "type" in obj.tags else ""
-            if rel_type not in ("multipolygon", "boundary"):
-                continue
-            members = _plain_members(obj)
-            water = obj.tags.get("natural") == "water"
-            way_refs = [ref for kind_m, ref, _role in members if kind_m == "w"]
-            bounds = _union_bounds(way_refs, gate.water_bounds) if water else None
-            if span.trusted:
-                span.add_relation(int(obj.id), _tag_dict(obj.tags), members,
-                                  water, bounds, gate.water_xy)
-            # A lake in another part of the state never becomes a coordinate
-            # list. Its shores stay packed until a selection meets the lake.
-            if water and bounds is not None and not _span_overlaps(
-                    bounds[0], bounds[1], bounds[2], bounds[3], gate.limits):
-                continue
-            if water:
-                for ref in way_refs:
-                    if ref in stored:
-                        continue
-                    xy = gate.water_xy.get(ref)
-                    if xy:
-                        stored[ref] = _coords_from_xy(xy)
-            made = _relation_geometry_plain(
-                obj.tags, members, stored, box, water,
-                sum(kind_m == "w" for kind_m, _ref, _role in members))
-            if made is None:
-                continue
-            geometry, flat, cover = made
-            writer.add("relation", int(obj.id), _tag_dict(obj.tags), geometry, flat, cover)
-        if gate is not None:
-            gate.pull_water(stored)
-            gate.water_xy.clear()
-            gate.water_bounds.clear()
-            gate.water_coords.clear()
-        stored.clear()
-        del proc
-        del pool
-        proc = None
-        pool = None
-        store = os.path.join(partial, "nodes.store")
-        if os.path.isfile(store):
-            try:
-                os.remove(store)
-            except OSError:
-                pass
-        writer.finish()
-        os.replace(partial, dest)
-    except Exception:
-        writer.abort()
-        # Drop the reader before removing its scratch file, or Windows keeps
-        # the directory locked until this function returns.
-        proc = None
-        pool = None
-        shutil.rmtree(partial, ignore_errors=True)
+        code = clip_native.walk(
+            source, span_folder, partial, box, region.bbox, _SPAN_DEG, _SPAN_WIDE,
+            rows, cols, FILTERS_VERSION, _CLIP_VERSION, _SPAN_VERSION,
+            _mtime_ms(source), _kind_rule_text(), flag, note)
+    except clip_native.Unavailable:
+        done.set()
+        watcher.join(timeout=1.0)
         raise
     finally:
-        ids_event.wait()
-    if span.trusted and (gate is None or gate.trusted):
-        try:
-            span.finish(span_folder, source)
-        except Exception:
-            span.trusted = False
-    return dest
+        done.set()
+        watcher.join(timeout=1.0)
+    if code == clip_native.STOPPED:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise knoxstop.Stopped("the download")
+    if code != 0:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise RuntimeError(clip_native.why(code))
+    if os.path.isdir(dest):
+        shutil.rmtree(dest, ignore_errors=True)
+    os.replace(partial, dest)
+    return True
 
 
 def _ensure_clip(root: str, region: Region, source: str,
@@ -2626,7 +2491,7 @@ def _ensure_clip(root: str, region: Region, source: str,
         return folder
     span_folder = _span_dir(root, region, source)
     if _span_ready(span_folder, source):
-        _report(progress, region.name, index, total, "filter")
+        _report(progress, region.name, index, total, "cut")
         try:
             folder = _clip_from_span(root, region, source, box, should_stop)
         except knoxstop.Stopped:
@@ -2636,21 +2501,24 @@ def _ensure_clip(root: str, region: Region, source: str,
         else:
             _remember(root, region, source, box, folder)
             return folder
-    _report(progress, region.name, index, total, "filter")
+    dest = folder
+    partial = dest + ".part"
+    if os.path.isdir(dest):
+        shutil.rmtree(dest, ignore_errors=True)
+    if os.path.isdir(partial):
+        shutil.rmtree(partial, ignore_errors=True)
+    os.makedirs(partial, exist_ok=True)
+    steps = {1: "shores", 2: "filter", 3: "cut"}
 
-    def on_bytes(done, total_bytes, speed, name=region.name, index=index, total=total):
-        _report(progress, name, index, total, "filter", (done, total_bytes, speed))
+    def on_note(phase, done, total_bytes, speed, name=region.name, index=index, total=total):
+        step = steps.get(int(phase), "filter")
+        shown = (done, total_bytes, speed) if total_bytes > 0 else (0, 0, 0.0)
+        _report(progress, name, index, total, step, shown)
 
-    meter = _ScanMeter(source, on_bytes if progress else None)
-    meter.start()
-    try:
-        folder = _build_clip(root, region, source, box, should_stop, threads)
-    except Exception:
-        meter.stop()
-        raise
-    meter.stop(complete=True)
-    _remember(root, region, source, box, folder)
-    return folder
+    _try_rust_walk(root, region, source, box, partial, dest, should_stop,
+                   on_note if progress else None)
+    _remember(root, region, source, box, dest)
+    return dest
 
 
 def _cells_for_query(meta: dict, box: tuple[float, float, float, float]):
@@ -2678,7 +2546,8 @@ def _cells_for_query(meta: dict, box: tuple[float, float, float, float]):
             yield row, col
 
 
-def _iter_clip(folder: str, box: tuple[float, float, float, float], highways_only: bool):
+def _iter_clip(folder: str, box: tuple[float, float, float, float], highways_only: bool,
+               on_bytes=None):
     meta = _read_meta(folder) or {}
     try:
         clip_box = tuple(float(v) for v in meta["box"])
@@ -2700,13 +2569,32 @@ def _iter_clip(folder: str, box: tuple[float, float, float, float], highways_onl
                 paths.append(path)
     merged: dict[tuple[str, int], OSMFeature] = {}
     south, west, north, east = box
-    for path in paths:
-        for feature in _read_geojsonseq(path):
+    sizes = []
+    if on_bytes is not None:
+        for path in paths:
+            try:
+                sizes.append(os.path.getsize(path))
+            except OSError:
+                sizes.append(0)
+    else:
+        sizes = [0] * len(paths)
+    total_bytes = sum(sizes)
+    base = 0
+    for path, size in zip(paths, sizes):
+        def on_line(index, nlines, base=base, size=size, total_bytes=total_bytes):
+            if on_bytes is None or nlines <= 0 or total_bytes <= 0:
+                return
+            on_bytes(base + size * index // nlines, total_bytes, 0.0)
+
+        for feature in _read_geojsonseq(path, on_line if on_bytes else None):
             if highways_only and "highway" not in feature.tags:
                 continue
             if not whole and not _feature_hits(feature, south, west, north, east):
                 continue
             merged[(feature.kind, feature.osm_id)] = feature
+        base += size
+        if on_bytes is not None and total_bytes > 0:
+            on_bytes(min(base, total_bytes), total_bytes, 0.0)
     # Cached features stay as read. A later pass replaces geometry on the
     # objects it was given, so each read hands out its own copies.
     for feature in merged.values():
@@ -2719,12 +2607,11 @@ def ensure_regions(root: str, south: float, west: float, north: float, east: flo
 
     progress(name, index, count, step, download) is called with step "check"
     as each region starts, "download" with download = (bytes done, bytes
-    total, bytes a second) while its file comes down, and "filter" while the
-    roads and buildings inside the box are picked out of a daily that is new
-    or not yet cut to this box. During that pick, download is how far through
-    the daily the reader has got, in the same shape, so the page can show a
-    percent and a time left. A later map inside the same cached area reuses
-    that cut.
+    total, bytes a second) while its file comes down, "shores" on the first
+    pass of a new daily, "filter" while roads are picked, and "cut" while the
+    selection is written out. During a pass, download is how far through that
+    pass the reader has got, and it starts again when the next pass begins.
+    A later map inside the same cached area reuses that cut.
     """
     knoxstop.check(should_stop, "the download")
     _require()
@@ -2783,36 +2670,15 @@ def ensure_regions(root: str, south: float, west: float, north: float, east: flo
 def _is_area_way(tags: dict, closed: bool) -> bool:
     """A closed building is a footprint. A closed roundabout is still a road.
 
-    area=yes / area=no wins. Otherwise a highway, railway, barrier, coastline
-    or a linear waterway stays a line, and every other closed way is filled.
+    The ways library makes that decision.
     """
-    if not closed or not tags:
-        return False
-    area = tags.get("area")
-    if area == "yes":
-        return True
-    if area == "no":
-        return False
-    # A station, platform or yard is an area even though railway=* is
-    # otherwise a centre line. The rails themselves stay lines.
-    if tags.get("railway") in RAIL_GROUNDS:
-        return True
-    if tags.get("natural") == "coastline":
-        return False
-    if any(key in tags for key in _LINE_KEYS):
-        return False
-    if tags.get("man_made") in ("pier", "breakwater", "groyne"):
-        return False
-    waterway = tags.get("waterway")
-    if waterway in _LINE_WATERWAYS:
-        return False
-    return True
+    return ways_native.is_area(tags, closed)
 
 
 def features_for_bbox(root: str, regions: list[Region],
                       south: float, west: float, north: float, east: float,
                       highways_only: bool = False,
-                      should_stop=None) -> list[OSMFeature]:
+                      should_stop=None, on_bytes=None) -> list[OSMFeature]:
     """Features inside this box, from the cut made for the regions' daily.
 
     The cut is the box ensure_regions walked. A smaller piece, or highways
@@ -2828,7 +2694,7 @@ def features_for_bbox(root: str, regions: list[Region],
             folder = _ensure_clip(
                 root, region, source, box, should_stop, None, 1, 1,
                 os.cpu_count() or 1)
-        for feature in _iter_clip(folder, box, highways_only):
+        for feature in _iter_clip(folder, box, highways_only, on_bytes):
             merged[(feature.kind, feature.osm_id)] = feature
     return list(merged.values())
 
@@ -2889,7 +2755,7 @@ def _rings(coords) -> list[tuple[float, float]]:
         return out
 
 
-def _parse_geojsonseq(path: str) -> list[OSMFeature]:
+def _parse_geojsonseq(path: str, on_line=None) -> list[OSMFeature]:
     loads = json.loads
     to_feature = _to_feature
     features: list[OSMFeature] = []
@@ -2899,7 +2765,10 @@ def _parse_geojsonseq(path: str) -> list[OSMFeature]:
         text = fh.read()
     lines = text.split("\n")
     del text
-    for line in lines:
+    nlines = len(lines)
+    for index, line in enumerate(lines):
+        if on_line is not None and index % 8192 == 0:
+            on_line(index, nlines)
         line = line.lstrip("\x1e").strip()
         if not line or line.startswith("{") and '"FeatureCollection"' in line[:40]:
             continue
@@ -2913,10 +2782,12 @@ def _parse_geojsonseq(path: str) -> list[OSMFeature]:
         if feature.osm_id < 0:
             next_id -= 1
         add(feature)
+    if on_line is not None:
+        on_line(nlines, nlines)
     return features
 
 
-def _read_geojsonseq(path: str) -> list[OSMFeature]:
+def _read_geojsonseq(path: str, on_line=None) -> list[OSMFeature]:
     """Features in this file, in order. Reused while the file is unchanged.
 
     Several map pieces read the same cut at once. One of them parses it;
@@ -2925,12 +2796,14 @@ def _read_geojsonseq(path: str) -> list[OSMFeature]:
     try:
         st = os.stat(path)
     except OSError:
-        return _parse_geojsonseq(path)
+        return _parse_geojsonseq(path, on_line)
     token = (st.st_mtime_ns, st.st_size)
     while True:
         with _READ_LOCK:
             hit = _SEQ_CACHE.get(path)
             if hit is not None and (hit[0], hit[1]) == token:
+                if on_line is not None:
+                    on_line(1, 1)
                 return hit[2]
             slot = _SEQ_WAIT.get(path)
             if slot is None:
@@ -2943,7 +2816,7 @@ def _read_geojsonseq(path: str) -> list[OSMFeature]:
             slot.wait()
             continue
         try:
-            features = _parse_geojsonseq(path)
+            features = _parse_geojsonseq(path, on_line)
             try:
                 st = os.stat(path)
             except OSError:
