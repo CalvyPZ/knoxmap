@@ -1,5 +1,5 @@
 # A program file built in the repo root. Player downloads are written to
-# releases/ by build_releases.bat.
+# releases/ by build_windows.bat, build_linux.bat, and build_macos.bat.
 /KnoxMap.exe
 
 # Electron dependencies. install_requirements.bat runs npm install here.
@@ -10,7 +10,7 @@ desktop/node_modules/
 desktop/out/
 desktop/pybuild/
 
-# Local builds of the player downloads (build_releases.bat).
+# Local builds of the player downloads (build_windows.bat, build_linux.bat, build_macos.bat).
 # releases/ is the directory builders use. release/ and released/ are older
 # names, still ignored so leftover output stays untracked.
 /release/*
@@ -29,6 +29,13 @@ venv/
 # Generated packaging trees (pyinstaller, setuptools, and similar)
 dist/
 build/
+
+# Rust build output for Helpers (room layout and terrain, one helper library).
+# Each release builds the library for that system and bundles it; nothing here
+# is committed. desktop/native-macos holds the arm64 dylib while
+# build_macos.bat is packing the Mac download.
+/Helpers/target/
+/desktop/native-macos/
 
 # Generated maps, OpenStreetMap downloads and compiled lots. Large, and built
 # from OSM data rather than source. debug_run.bat creates this folder on
