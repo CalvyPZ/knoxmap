@@ -312,6 +312,10 @@ def _wait_for_shell_quit() -> None:
 
 
 def main() -> int:
+    # A layout worker is this same program, started again. It inherits the
+    # flag from the pool and must not open a server of its own.
+    if os.environ.get("KNOXMAP_WORKER") == "1":
+        return 0
     if os.environ.get("KNOXMAP_SERVE") == "1":
         return serve_for_shell()
 
@@ -453,6 +457,8 @@ if __name__ == "__main__":
     # A frozen Windows build re-enters this file in each worker. This has to
     # run before main(), and only under the guard, or those workers start the app.
     multiprocessing.freeze_support()
+    if os.environ.get("KNOXMAP_WORKER") == "1":
+        raise SystemExit(0)
     try:
         raise SystemExit(main())
     except SystemExit:

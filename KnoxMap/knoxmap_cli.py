@@ -14,6 +14,7 @@ folder the window uses when both files sit together.
 from __future__ import annotations
 
 import multiprocessing
+import os
 import sys
 
 # (help, module, how that module reads argv)
@@ -64,4 +65,6 @@ if __name__ == "__main__":
     # A frozen Windows build re-enters this file in each worker. This has to
     # run before main(), and only under the guard, or those workers start the app.
     multiprocessing.freeze_support()
+    if os.environ.get("KNOXMAP_WORKER") == "1":
+        raise SystemExit(0)
     raise SystemExit(main())

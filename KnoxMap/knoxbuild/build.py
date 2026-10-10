@@ -40,6 +40,8 @@ from .population import build_spawn_map, official_population, save_footprints
 from .settings import PRESETS, Settings
 from .tbx import render_tbx
 from .world import Placement, project_cells, render_pzw
+from . import layoutwork
+from . import native
 from . import worldmap
 
 # OSM building tags that should get a commercial room mix rather than a house.
@@ -826,6 +828,10 @@ def _detect_zones(landscape_path: str, placements, rng_seed: int = 7,
 
     from generator import pz_colors as C
 
+    from .bmpio import (
+        GROUND_CARRIAGEWAY, GROUND_CONCRETE, GROUND_PARKING, GROUND_PLAZA,
+        class_mask, load_ground_class,
+    )
     from .grids import colour_mask
     from .world import Zone
 
@@ -842,10 +848,17 @@ def _detect_zones(landscape_path: str, placements, rng_seed: int = 7,
     zones: list[Zone] = []
     taken: set[tuple[int, int]] = set()
 
-    rgb = np.asarray(Image.open(landscape_path).convert("RGB"))
-    height, width = rgb.shape[:2]
-    asphalt = colour_mask(rgb, asphalt_colours)
-    hard = colour_mask(rgb, hard_colours)
+    classes = load_ground_class(landscape_path)
+    if classes is not None:
+        height, width = classes.shape
+        asphalt = class_mask(classes, (GROUND_CARRIAGEWAY, GROUND_PARKING))
+        hard = class_mask(classes, (GROUND_CARRIAGEWAY, GROUND_PARKING,
+                                    GROUND_CONCRETE, GROUND_PLAZA))
+    else:
+        rgb = np.asarray(Image.open(landscape_path).convert("RGB"))
+        height, width = rgb.shape[:2]
+        asphalt = colour_mask(rgb, asphalt_colours)
+        hard = colour_mask(rgb, hard_colours)
 
     # A car on most drives, as in Knox County. These draws come first so the
     # rest of the stream stays in one order whatever the thread pool does.
@@ -968,6 +981,7 @@ def _street_finder(out_dir: str, map_name: str):
 
     from generator import pz_colors as PC
 
+    from .bmpio import GROUND_CARRIAGEWAY, GROUND_CONCRETE, class_mask, load_ground_class
     from .grids import colour_mask
 
     path = os.path.join(out_dir, f"{map_name}_ground_base.bmp")
@@ -975,9 +989,13 @@ def _street_finder(out_dir: str, map_name: str):
         path = os.path.join(out_dir, f"{map_name}.bmp")
     if not os.path.exists(path):
         return lambda *a: None
-    ground = np.asarray(Image.open(path).convert("RGB"))
-    paved = colour_mask(ground, (PC.PALE_CONCRETE, PC.MEDIUM_ASPHALT,
-                                 PC.DARKEST_ASPHALT))
+    classes = load_ground_class(path)
+    if classes is not None:
+        paved = class_mask(classes, (GROUND_CONCRETE, GROUND_CARRIAGEWAY))
+    else:
+        ground = np.asarray(Image.open(path).convert("RGB"))
+        paved = colour_mask(ground, (PC.PALE_CONCRETE, PC.MEDIUM_ASPHALT,
+                                     PC.DARKEST_ASPHALT))
     height, width = paved.shape
     dist_n, dist_s, dist_w, dist_e = _directional_distances(paved)
     sent = STREET_LOOK_TILES + 1
@@ -1013,15 +1031,23 @@ def _street_finder(out_dir: str, map_name: str):
 def _road_weight(out_dir: str, map_name: str, proj) -> np.ndarray | None:
     """2 on carriageway, 1 on pavement, 0 elsewhere, from the ground as the
     renderer drew it."""
-    from PIL import Image
-
-    from generator import pz_colors as C
+    from .bmpio import GROUND_CARRIAGEWAY, load_ground_class
 
     path = os.path.join(out_dir, f"{map_name}_ground_base.bmp")
     if not os.path.exists(path):
         path = os.path.join(out_dir, f"{map_name}.bmp")
     if not os.path.exists(path):
         return None
+    classes = load_ground_class(path, width=proj.width, height=proj.height)
+    if classes is not None:
+        weight = classes.astype(np.int8)
+        weight[weight > GROUND_CARRIAGEWAY] = 0
+        return weight
+
+    from PIL import Image
+
+    from generator import pz_colors as C
+
     ground = np.array(Image.open(path).convert("RGB"))[:proj.height, :proj.width]
     weight = np.zeros(ground.shape[:2], dtype=np.int8)
     for colour in (C.PALE_CONCRETE,):
@@ -1121,66 +1147,51 @@ def _party_walls(owner: np.ndarray, me: int, x0: int, y0: int, mask: np.ndarray,
         return out
 
     # Same edges as the four neighbour masks: a tile whose neighbour is not
-    # in the footprint, including the side that falls off the array. One
-    # walk, then one owner read per direction. max() makes visit order
-    # irrelevant when one edge is seen twice.
-    rows = mask.tolist()
-    north_x: list[int] = []
-    north_y: list[int] = []
-    north_wx: list[int] = []
-    north_wy: list[int] = []
-    west_x: list[int] = []
-    west_y: list[int] = []
-    west_wx: list[int] = []
-    west_wy: list[int] = []
-    for y in range(h):
-        row = rows[y]
-        above = rows[y - 1] if y else None
-        below = rows[y + 1] if y + 1 < h else None
-        for x in range(w):
-            if not row[x]:
-                continue
-            if above is None or not above[x]:
-                north_x.append(x)
-                north_y.append(y)
-                north_wx.append(x0 + x)
-                north_wy.append(y0 + y - 1)
-            if below is None or not below[x]:
-                north_x.append(x)
-                north_y.append(y + 1)
-                north_wx.append(x0 + x)
-                north_wy.append(y0 + y + 1)
-            if x == 0 or not row[x - 1]:
-                west_x.append(x)
-                west_y.append(y)
-                west_wx.append(x0 + x - 1)
-                west_wy.append(y0 + y)
-            if x + 1 == w or not row[x + 1]:
-                west_x.append(x + 1)
-                west_y.append(y)
-                west_wx.append(x0 + x + 1)
-                west_wy.append(y0 + y)
+    # in the footprint, including the side that falls off the array. Found
+    # for the whole footprint at once, then one owner read per direction.
+    # (This was a Python loop over every tile of every building, on the main
+    # thread.) max() makes visit order irrelevant when one edge is seen twice.
+    #
+    # Each tile can own two edges on an axis. `north[y, x, 0]` is the edge
+    # above it and `[.., 1]` the edge below; `west[y, x, 0]` the edge on its
+    # left and `[.., 1]` on its right. Flattened, they come out tile by tile,
+    # first edge then second: the order the old walk appended them in.
+    pad = np.zeros((h + 2, w + 2), dtype=bool)
+    pad[1:-1, 1:-1] = mask
+    north = np.stack((mask & ~pad[:-2, 1:-1], mask & ~pad[2:, 1:-1]), axis=-1)
+    west = np.stack((mask & ~pad[1:-1, :-2], mask & ~pad[1:-1, 2:]), axis=-1)
 
-    def commit(ex, ey, wx, wy, side):
-        if not ex:
+    def commit(edges, vertical, side):
+        hit = np.flatnonzero(edges)
+        if hit.size == 0:
             return
-        wx_a = np.asarray(wx, dtype=np.int32)
-        wy_a = np.asarray(wy, dtype=np.int32)
-        ok = (wx_a >= 0) & (wx_a < mw) & (wy_a >= 0) & (wy_a < mh)
+        which = hit & 1                # 0: the first edge, 1: the second
+        cell = hit >> 1
+        ty = cell // w
+        tx = cell - ty * w
+        step = 2 * which - 1           # the neighbour is one tile back, or one on
+        if vertical:
+            ex, ey = tx, ty + which
+            wx, wy = x0 + tx, y0 + ty + step
+        else:
+            ex, ey = tx + which, ty
+            wx, wy = x0 + tx + step, y0 + ty
+        ok = (wx >= 0) & (wx < mw) & (wy >= 0) & (wy < mh)
         if not ok.any():
             return
-        other = owner[wy_a[ok], wx_a[ok]]
+        other = owner[wy[ok], wx[ok]]
         good = (other >= 0) & (other != me) & (other < level_of.shape[0])
         if not good.any():
             return
         kept = np.flatnonzero(ok)[good]
         storeys = level_of[other[good]]
-        for i, storey in zip(kept.tolist(), storeys.tolist()):
-            key = (ex[i], ey[i], side)
+        for a, b, storey in zip(ex[kept].tolist(), ey[kept].tolist(),
+                                storeys.tolist()):
+            key = (a, b, side)
             out[key] = max(out.get(key, 0), storey)
 
-    commit(north_x, north_y, north_wx, north_wy, "N")
-    commit(west_x, west_y, west_wx, west_wy, "W")
+    commit(north, True, "N")
+    commit(west, False, "W")
     return out
 
 
@@ -1257,114 +1268,8 @@ def _prefetch_thin_kinds(order, features, areas, m2_per_tile) -> dict:
     return dict(zip(idxs, kinds))
 
 
-# Set in each layout process. The parent flips it the moment Stop is asked,
-# and terminates anything that does not notice.
-_WORKER_STOP = None
-
-
-def _bind_worker_stop(event) -> None:
-    global _WORKER_STOP
-    _WORKER_STOP = event
-
-
-def _init_layout_worker(event, import_lock) -> None:
-    """Import layout, tbx and the catalog once per worker, then watch Stop.
-
-    Workers inherit the window's output pipe. Filling that pipe waits forever,
-    and nothing reads it while rooms are laid out. SciPy's libraries also wait
-    forever if every worker loads them at the same moment, so one worker
-    imports at a time.
-    """
-    _bind_worker_stop(event)
-    devnull = open(os.devnull, "w", encoding="utf-8")
-    sys.stdout = devnull
-    sys.stderr = devnull
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    with import_lock:
-        from . import catalog, layout, tbx
-        catalog.HOUSE_STYLES
-        layout.build_building
-        tbx.render_tbx
-
-
-def _worker_stopped() -> bool:
-    event = _WORKER_STOP
-    return event is not None and event.is_set()
-
-
-def _make_one(job: tuple, should_stop=None) -> tuple:
-    """Lay out one building and write its .tbx. Returns (storeys, rooms,
-    furniture, error): a building that cannot be laid out is left out with the
-    reason, instead of stopping the other two thousand."""
-    stop = should_stop if should_stop is not None else _worker_stopped
-    if stop():
-        raise knoxstop.Stopped("the buildings")
-    (w, h, levels, commercial, seed, kind, mask, settings, style, label, path, street, retail,
-     uses, hotel, party) = job
-    try:
-        plan = build_building(w, h, levels=levels, commercial=commercial, seed=seed,
-                              kind=kind, mask=mask, settings=settings, street=street,
-                              retail=retail, uses=uses, hotel=hotel, party=party,
-                              should_stop=stop)
-        text = render_tbx(plan, label, style)
-    except knoxstop.Stopped:
-        raise
-    except Exception:  # noqa: BLE001
-        import traceback
-        return (0, 0, 0, f"{os.path.basename(path)} ({kind or 'house'}, {w}x{h}, "
-                         f"{levels} storeys): {traceback.format_exc()}")
-    if stop():
-        raise knoxstop.Stopped("the buildings")
-    partial = path + ".part"
-    with open(partial, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(partial, path)
-    return (len(plan.storeys), len(plan.rooms),
-            sum(len(s.furniture) for s in plan.storeys), None)
-
-
-def _make_batch(batch: list) -> list:
-    """Several buildings in one process task. Stop is still per building."""
-    return [_make_one(job) for job in batch]
-
-
-def _timed_batch(batch: list):
-    """One queue task, and how long the worker spent inside it.
-
-    The third value is Stop. The elapsed time is what the feeder uses to
-    decide whether the queue already holds five seconds of work per core.
-    """
-    t0 = time.perf_counter()
-    try:
-        made = _make_batch(batch)
-    except knoxstop.Stopped:
-        return None, 0.0, True
-    return made, time.perf_counter() - t0, False
-
-
 # Below this many buildings, starting workers costs more than it saves.
 PARALLEL_FROM = 60
-
-# How long to wait for the first finished building. Packed workers have sat
-# at no CPU and finished nothing; past this the same layout runs here.
-# A mall is one building and can take a couple of minutes, so this has to
-# be longer than that or the pool is thrown away and the town is laid out
-# on a single core.
-_LAYOUT_STALL_S = 300
-
-# After the largest buildings have been handed out one at a time, the rest
-# travel in tasks of this many. A house finishes faster than the round trip
-# to a worker, so a bigger task is what keeps the cores busy. The largest
-# stay alone: one task of sixteen malls would leave every other core idle.
-_LAYOUT_TAIL = 16
-_LAYOUT_HEAD_WAVES = 4
-
-# The progress picture waits until the queue holds this many seconds of
-# layout for every core. Feeding the cores comes first; a frame is drawn
-# only once that cushion is already sitting in the queue.
-_PREVIEW_BACKLOG_S = 5.0
 
 # Share of a mod's building pass. Used only to turn elapsed time into an ETA;
 # the estimate corrects itself as each stage actually finishes.
@@ -1399,10 +1304,11 @@ def _worker_count() -> int:
     """How many buildings to lay out at once.
 
     KNOXBUILD_WORKERS=1 forces one worker. The room layout is pure Python, so
-    it runs in processes (threads cannot share that work across cores). The
-    footprint scan and the shared-wall pass run on threads. By default every
-    logical processor is available; the environment override can reserve
-    capacity on machines that need to stay responsive during a build.
+    it runs in processes (threads cannot share that work across cores); see
+    layoutwork.py. The footprint scan and the shared-wall pass run on a few
+    threads (`_stage_threads`). By default every logical processor is
+    available; the environment override can reserve capacity on machines
+    that need to stay responsive during a build.
     """
     raw = os.environ.get("KNOXBUILD_WORKERS")
     if raw:
@@ -1414,10 +1320,37 @@ def _worker_count() -> int:
 
 
 def _pool_size(count: int) -> int:
-    workers = _worker_count()
+    workers = _stage_threads()
     if workers <= 1 or count < PARALLEL_FROM:
         return 1
     return max(1, min(workers, count))
+
+
+def _stage_threads() -> int:
+    """Threads for the stages that run inside this process.
+
+    Reading footprints and matching walls are Python that holds the
+    interpreter lock for part of their time and release it in Shapely and
+    NumPy, so a few threads per piece keep the processors busy; many more
+    only fight over the lock (and over it with every other piece).
+    """
+    return max(1, min(8, _worker_count()))
+
+
+def layout_process_budget() -> int:
+    """How many layout workers this PC can use at once, for every piece.
+
+    The app also uses it to decide how many pieces to build together.
+    See layoutwork.budget: the processors, held back by free memory.
+    """
+    return layoutwork.budget()
+
+
+def _layout_pool_size(count: int, cap: int | None = None) -> int:
+    """The workers a piece of `count` buildings will have, for the progress line."""
+    if count <= 1:
+        return 1
+    return max(1, min(count, layoutwork.budget()))
 
 
 def _trace(message: str) -> None:
@@ -1553,11 +1486,11 @@ def _shutdown(pool, wait: bool, cancel: bool) -> None:
 def _run_ordered(fn, items, workers: int, should_stop, on_done, *, processes: bool):
     """Run `fn` over `items` on threads, results in input order.
 
-    Room layout does not come through here. It uses `LayoutPool`, one process
-    pool for the whole buildings run.
+    Room layout does not come through here. It runs on the layout workers
+    (knoxbuild/layoutwork.py), shared by every piece.
     """
     if processes:
-        raise RuntimeError("layout processes use LayoutPool")
+        raise RuntimeError("layout processes are in layoutwork")
     items = list(items)
     n = len(items)
     if n == 0:
@@ -1647,276 +1580,6 @@ def _drain(pool, fn, items, results, pool_size, should_stop, on_done, event,
     return False
 
 
-def _make_serial(jobs, should_stop, on_done, on_state=None) -> list:
-    out = []
-    n = len(jobs)
-    for i, job in enumerate(jobs, 1):
-        knoxstop.check(should_stop, "the buildings")
-        if on_state is not None:
-            on_state({i - 1}, set(range(i - 1)))
-        out.append(_make_one(job, should_stop=should_stop))
-        on_done(i, n, 1, 1)
-        if on_state is not None:
-            on_state(set(), set(range(i)))
-    return out
-
-
-class LayoutPool:
-    """One process pool for every mod in a single buildings run.
-
-    The buildings route creates it, passes it into each `build`, and closes
-    it when the run ends. Stop kills the workers. A killed or broken pool is
-    not reused; the next run constructs a new one.
-    """
-
-    def __init__(self, should_stop=None):
-        self.should_stop = should_stop
-        self.mp = None
-        self.event = None
-        self.workers = 0
-        self.broken = False
-        self._closed = False
-        self._watch_done = None
-
-    def ensure(self, workers: int) -> bool:
-        if self.broken or self._closed:
-            return False
-        if self.mp is not None:
-            return True
-        _blas_one_thread()
-        import multiprocessing
-
-        self.workers = max(1, int(workers))
-        self.event = multiprocessing.Event()
-        self._import_lock = multiprocessing.Lock()
-        self._watch_done = threading.Event()
-        stop = self.should_stop
-        event = self.event
-        done = self._watch_done
-
-        def watch() -> None:
-            while not done.wait(0.2):
-                try:
-                    if stop is not None and stop():
-                        event.set()
-                        return
-                except Exception:  # noqa: BLE001
-                    return
-
-        threading.Thread(target=watch, name="knoxbuild-stop", daemon=True).start()
-        try:
-            # Pool's task queue is unbounded, so the feeder can stack enough
-            # buildings for every core to stay busy while a progress frame
-            # is drawn. A process-pool executor only keeps one spare task.
-            self.mp = multiprocessing.Pool(
-                processes=self.workers,
-                initializer=_init_layout_worker,
-                initargs=(self.event, self._import_lock),
-            )
-            _trace(f"layout pool ready ({self.workers} workers)")
-        except OSError:
-            self.broken = True
-            self.mp = None
-            if self._watch_done is not None:
-                self._watch_done.set()
-            return False
-        return True
-
-    def kill(self) -> None:
-        """Cancel queued work and terminate workers. Do not submit again."""
-        self.broken = True
-        if self._watch_done is not None:
-            self._watch_done.set()
-        mp = self.mp
-        self.mp = None
-        if mp is None:
-            return
-        event = self.event
-        if event is not None:
-            event.set()
-        mp.terminate()
-        mp.join()
-
-    def close(self) -> None:
-        """Wait for workers to finish. A pool that was killed stays dead."""
-        if self._closed and self.mp is None:
-            return
-        self._closed = True
-        if self.broken or self.mp is None:
-            if self.mp is not None:
-                self.kill()
-            elif self._watch_done is not None:
-                self._watch_done.set()
-            return
-        if self._watch_done is not None:
-            self._watch_done.set()
-        mp = self.mp
-        self.mp = None
-        mp.close()
-        mp.join()
-
-
-def _layout_batches(jobs, workers: int) -> tuple[list, list]:
-    """Tasks of buildings, and the job index each slot in a task came from.
-
-    The biggest footprints go out alone, a few waves of them, so sixteen
-    workers can each be inside a mall at once. Everything after that is
-    striped: task 0 gets the next-largest and then every Nth smaller one,
-    instead of a solid run of the buildings that are still big.
-    """
-    n = len(jobs)
-    workers = max(1, int(workers))
-    head_n = min(n, workers * _LAYOUT_HEAD_WAVES)
-    groups = [[i] for i in range(head_n)]
-    rest_n = n - head_n
-    if rest_n:
-        nbatches = max(workers, (rest_n + _LAYOUT_TAIL - 1) // _LAYOUT_TAIL)
-        tails: list[list[int]] = [[] for _ in range(nbatches)]
-        for n_i, i in enumerate(range(head_n, n)):
-            tails[n_i % nbatches].append(i)
-        groups.extend(t for t in tails if t)
-    batches = [[jobs[i] for i in group] for group in groups]
-    return batches, groups
-
-
-def _layout_on_pool(pool: LayoutPool, jobs, should_stop, on_done,
-                    on_state=None) -> list:
-    """Lay out every building. The task queue is filled before any preview.
-
-    A frame is drawn only when the tasks not yet started will keep every
-    core busy for `_PREVIEW_BACKLOG_S` seconds. Until a worker has reported
-    how long a task takes, nothing is drawn and the queue keeps growing.
-    """
-    batches, groups = _layout_batches(jobs, pool.workers)
-    weights = [len(batch) for batch in batches]
-    n = len(batches)
-    workers = max(1, pool.workers)
-    results: list = [None] * n
-    pending: dict = {}
-    completed: set[int] = set()
-    next_i = 0
-    finished = 0
-    done_n = 0
-    avg = None
-    started = time.monotonic()
-    last_paint = 0.0
-    _trace(f"layout tasks {n} for {len(jobs)} buildings ({workers} workers)")
-
-    def backlog_s() -> float:
-        if not avg:
-            return 0.0
-        queued = max(0, len(pending) - workers)
-        return queued * avg
-
-    def feed() -> None:
-        nonlocal next_i
-        while next_i < n:
-            queued = max(0, len(pending) - workers)
-            # No pace yet: give every core one waiting task, then wait for
-            # a time. Do not draw, and do not pickle the whole town blind.
-            if avg is None:
-                if queued >= workers:
-                    return
-            elif queued * avg >= _PREVIEW_BACKLOG_S * workers:
-                return
-            pending[next_i] = pool.mp.apply_async(_timed_batch, (batches[next_i],))
-            next_i += 1
-
-    def paint() -> None:
-        if on_state is None:
-            return
-        unfinished = [i for i in range(next_i) if i not in completed]
-        active = {j for b in unfinished[:workers] for j in groups[b]}
-        done = {j for b in completed for j in groups[b]}
-        on_state(active, done)
-
-    def asked_stop() -> bool:
-        if pool.event is not None and pool.event.is_set():
-            return True
-        return should_stop is not None and should_stop()
-
-    while finished < n:
-        ready = [i for i, ar in pending.items() if ar.ready()]
-        for idx in ready:
-            made, elapsed, stopped = pending.pop(idx).get()
-            if stopped or asked_stop():
-                raise knoxstop.Stopped("the buildings")
-            results[idx] = made
-            completed.add(idx)
-            finished += 1
-            done_n += weights[idx]
-            if elapsed > 0:
-                avg = elapsed if avg is None else (0.8 * avg + 0.2 * elapsed)
-            try:
-                on_done(done_n, len(jobs),
-                        min(workers, len(pending)) or 1, workers)
-            except knoxstop.Stopped:
-                raise knoxstop.Stopped("the buildings")
-        feed()
-        if asked_stop():
-            raise knoxstop.Stopped("the buildings")
-        if finished == 0 and next_i > 0 and (
-                time.monotonic() - started >= _LAYOUT_STALL_S):
-            raise LayoutWorkersStalled()
-        now = time.monotonic()
-        if (avg and backlog_s() >= _PREVIEW_BACKLOG_S * workers
-                and now - last_paint >= _PREVIEW_BACKLOG_S):
-            last_paint = now
-            paint()
-        if finished < n and not ready:
-            time.sleep(0.02)
-    out: list = [None] * len(jobs)
-    for group, part in zip(groups, results):
-        for i, stats in zip(group, part):
-            out[i] = stats
-    return out
-
-
-def _make_all(jobs: list[tuple], should_stop=None, on_done=None,
-              pool: LayoutPool | None = None, on_state=None) -> list:
-    """Every building, in order. Room layout runs in processes; Stop cancels
-    the ones not started and terminates the one in progress.
-
-    `pool`, when given, is reused across mods. This function does not close
-    a pool it did not create. A pool that breaks or is stopped is killed and
-    left unusable.
-    """
-    from concurrent.futures.process import BrokenProcessPool
-
-    if on_done is None:
-        on_done = lambda done, total, busy, pool_n: None
-    n = len(jobs)
-    if n == 0 or _pool_size(n) <= 1:
-        return _make_serial(jobs, should_stop, on_done, on_state)
-
-    own = pool is None
-    if own:
-        pool = LayoutPool(should_stop)
-    if not pool.ensure(_worker_count()):
-        print("  (worker processes unavailable: could not start; "
-              "building in one process)")
-        if own:
-            pool.close()
-        return _make_serial(jobs, should_stop, on_done, on_state)
-    try:
-        return _layout_on_pool(pool, jobs, should_stop, on_done, on_state)
-    except knoxstop.Stopped:
-        pool.kill()
-        raise
-    except LayoutWorkersStalled:
-        _trace("layout workers produced no rooms; laying out in this process")
-        print("  (layout workers produced no rooms; laying out in this process)")
-        pool.kill()
-        return _make_serial(jobs, should_stop, on_done, on_state)
-    except (BrokenProcessPool, OSError) as exc:
-        print(f"  (worker processes unavailable: {exc}; building in one process)")
-        pool.kill()
-        return _make_serial(jobs, should_stop, on_done, on_state)
-    finally:
-        if own:
-            pool.close()
-
-
 def _ground_preview(out_dir: str, map_name: str):
     """The ground bitmap with trees on it, for the window. None if it is not drawn yet."""
     bmp = os.path.join(out_dir, f"{map_name}.bmp")
@@ -1924,13 +1587,58 @@ def _ground_preview(out_dir: str, map_name: str):
         return None
     from PIL import Image
 
-    from generator.renderer import _build_preview
+    from generator.renderer import _build_preview, _fence_file_lines, _ink_preview_lines
 
     land = Image.open(bmp).convert("RGB")
+    _ink_preview_lines(land, _fence_file_lines(out_dir, map_name))
     veg_path = os.path.join(out_dir, f"{map_name}_veg.bmp")
     if not os.path.exists(veg_path):
         return land
     return _build_preview(land, Image.open(veg_path).convert("RGB"))
+
+
+def _tbx_stats(path: str) -> tuple | None:
+    """Room counts read back from a .tbx a pass already finished writing.
+
+    The placements csv is only written at the end of the piece, so a restart
+    in the middle of the rooms has the files and not the rows. The roof floor
+    is an extra ``<floor>``, and a pitched roof adds one more above it.
+    """
+    floors = 0
+    rooms = 0
+    furniture = 0
+    pitched = False
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith(" <floor>"):
+                    floors += 1
+                elif line.startswith(" <room "):
+                    rooms += 1
+                elif 'type="furniture"' in line:
+                    furniture += 1
+                elif 'type="roof"' in line and 'RoofType="FlatTop"' not in line:
+                    pitched = True
+    except OSError:
+        return None
+    storeys = floors - 1 - (1 if pitched else 0)
+    if storeys < 1 or rooms < 1:
+        return None
+    return (storeys, rooms, furniture, None)
+
+
+def _remember_tbx(folder: str, saved: dict[str, tuple]) -> dict[str, tuple]:
+    """Add room counts for .tbx files the placements csv does not list yet."""
+    if not os.path.isdir(folder):
+        return saved
+    found = dict(saved)
+    for name in os.listdir(folder):
+        if not name.endswith(".tbx") or name in found:
+            continue
+        stats = _tbx_stats(os.path.join(folder, name))
+        if stats is not None:
+            found[name] = stats
+    return found
 
 
 def _saved_layouts(path: str) -> dict[str, tuple]:
@@ -1958,12 +1666,50 @@ def _saved_layouts(path: str) -> dict[str, tuple]:
     return saved
 
 
+def _kept_cell_set(keep) -> set[tuple[int, int]] | None:
+    """Local cells a drawn selection kept, or None when every cell stays."""
+    if not isinstance(keep, list) or not keep:
+        return None
+    allowed: set[tuple[int, int]] = set()
+    for item in keep:
+        try:
+            allowed.add((int(item[0]), int(item[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return allowed or None
+
+
+def _cell_kept(px, keep) -> bool:
+    """Whether a footprint's middle lies in a cell the selection kept."""
+    allowed = _kept_cell_set(keep)
+    if allowed is None or not px:
+        return True
+    from generator.pz_colors import CELL_SIZE
+    sx = sum(point[0] for point in px)
+    sy = sum(point[1] for point in px)
+    count = len(px)
+    return (int(sx / count) // CELL_SIZE, int(sy / count) // CELL_SIZE) in allowed
+
+
+def _without_dropped_cells(placements, zones, keep):
+    """Lots and zones that sit in cells the selection kept."""
+    allowed = _kept_cell_set(keep)
+    if allowed is None:
+        return placements, zones
+    placements = [item for item in placements
+                  if (item.cell_x, item.cell_y) in allowed]
+    zones = [item for item in (zones or [])
+             if (item.cell_x, item.cell_y) in allowed]
+    return placements, zones
+
+
 def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
           max_size: int | None = None, settings: Settings | None = None,
           should_stop=None, on_progress=None, on_view=None,
-          on_overlay=None, pool: LayoutPool | None = None,
+          on_overlay=None, pool=None,
           relayout_ids: set[str] | None = None,
-          paper_map: bool = True, on_phase=None) -> int:
+          paper_map: bool = True, on_phase=None,
+          resume: bool = False, layout_workers: int | None = None) -> int:
     """Generate every building for a rendered map.
 
     The explicit seed/min_size/max_size arguments are kept so the command line
@@ -1973,6 +1719,10 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     previous .tbx files. Passed a set, only those feature ids are laid out
     (plus any whose .tbx or placements row is already gone); the rest keep
     their files and their room counts are read back from the placements csv.
+
+    `resume` keeps every .tbx already written and lays out only the rooms
+    that are missing. A piece that was stopped halfway is continued, and a
+    piece that finished is not sent here at all.
     """
     settings = settings or Settings()
     overrides = {k: v for k, v in (("seed", seed), ("min_size", min_size),
@@ -2064,9 +1814,13 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     # earlier run sit in the folder looking like part of the map. A relayout
     # keeps the files it is not regenerating; deleting them would send every
     # building through layout, which is the slow part.
-    if relayout_ids is None:
+    if relayout_ids is None and not resume:
         for stale in os.listdir(bdir):
             if stale.endswith(".tbx") or stale.endswith(".part"):
+                os.remove(os.path.join(bdir, stale))
+    elif resume:
+        for stale in os.listdir(bdir):
+            if stale.endswith(".part"):
                 os.remove(os.path.join(bdir, stale))
     # WorldEd writes into these but will not create them: BMP to TMX fails with
     # "Could not open file for writing" if the export directory is absent.
@@ -2153,6 +1907,8 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
         if offset:
             dx, dy = offset
             px = [(x + dx, y + dy) for x, y in px]
+        if not _cell_kept(px, info.get("keep_cells")):
+            return ("outside",)
         if (tags.get("building") or "").strip().lower() in NOT_BUILDINGS:
             canopy = None
             if tags.get("amenity") == "fuel":
@@ -2171,7 +1927,7 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     reporter.start("index", len(features), "Reading footprints",
                    _pool_size(len(features)))
     measured = _run_ordered(
-        _measure, list(enumerate(features)), _worker_count(), should_stop,
+        _measure, list(enumerate(features)), _stage_threads(), should_stop,
         lambda done, total, busy, pool: reporter.advance(done, busy),
         processes=False)
     for rec in measured:
@@ -2179,6 +1935,9 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
             continue
         if rec[0] == "removed":
             skipped["removed"] += 1
+            continue
+        if rec[0] == "outside":
+            skipped["outside"] += 1
             continue
         if rec[0] == "skip":
             skipped["not a building"] += 1
@@ -2263,8 +2022,28 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     layout_canvas = None
     layout_scale = 1.0
     layout_open = True
+    # One layout picture is queued, as the terrain pass queues one. A newer
+    # tick does not start a second draw, and it does not cancel the draw
+    # already running: cancelling it was what froze the window, because the
+    # next tick arrived before the rectangles were finished.
+    layout_armed = False
+    # Set when room layout starts. Later ticks keep this token, so a draw
+    # of the footprints is allowed to finish. The token changes when the
+    # stage changes (the waiting frame, then paths and yards), which is what
+    # drops a picture that has been overtaken.
+    layout_token = None
+    # A newer stage invalidates one already queued. The all-red waiting
+    # frame is submitted before room layout, and the preview thread can still
+    # be on the terrain files, so that frame used to land after layout had
+    # moved on and the status had reached the paper map.
+    view_token = 0
 
-    def _paint_build_view(stage: str, reload: bool, boxes, states) -> None:
+    def _take_view() -> int:
+        nonlocal view_token
+        view_token += 1
+        return view_token
+
+    def _paint_build_view(stage: str, reload: bool, boxes, states, token: int) -> None:
         nonlocal view_image
         if view_image is None or reload:
             fresh = _ground_preview(out_dir, map_name)
@@ -2292,7 +2071,13 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
                 overlay = Image.new("RGBA", view_image.size, (0, 0, 0, 0))
                 shade = ImageDraw.Draw(overlay)
             painted = False
-            for (x, y, w, h), state in zip(boxes, states):
+            for n, ((x, y, w, h), state) in enumerate(zip(boxes, states)):
+                # The pool's threads need the interpreter between tasks.
+                # A picture of the whole town must not hold it the whole time.
+                if n and n % 400 == 0:
+                    time.sleep(0)
+                    if token != view_token:
+                        return
                 box = [x, y, x + max(int(w), 1) - 1, y + max(int(h), 1) - 1]
                 # Filled, not stroked: a one-tile outline disappears once the
                 # window scales the bitmap down.
@@ -2305,6 +2090,8 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
             frame = view_image.copy() if on_view is not None else None
             overlay = None
             painted = False
+        if token != view_token:
+            return
         if on_view is not None and frame is not None:
             on_view(frame, stage)
         if on_overlay is not None and overlay is not None and painted:
@@ -2321,10 +2108,11 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
         view_last = now
         boxes = list(view_boxes)
         states = list(view_states)
+        token = _take_view()
         import knoxpreview
         knoxpreview.submit(
             f"{map_name}:build",
-            lambda: _paint_build_view(stage, reload, boxes, states),
+            lambda token=token: _paint_build_view(stage, reload, boxes, states, token),
         )
     placed_rows = []
     kind_x, kind_y, kind_tiles = [], [], []
@@ -2523,25 +2311,17 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     # tiles: no window, shop window or door goes in one, up to the height of
     # the neighbour. Laid out on its own footprint, a terrace of shops had
     # glass shop fronts and windows looking into the next shop.
-    owner = np.full((proj.height, proj.width), -1, dtype=np.int32)
-    for j, d in enumerate(decided):
-        dx0, dy0, dw, dh, dfp = d[2], d[3], d[4], d[5], d[6]
-        view = owner[dy0:dy0 + dh, dx0:dx0 + dw]
-        view[dfp.mask[:view.shape[0], :view.shape[1]]] = j
-    storeys_of = [job[2] for job in jobs]
-
-    def _one_party(j):
-        d = decided[j]
-        return _party_walls(owner, j, d[2], d[3], d[6].mask, storeys_of)
-
-    reporter.start("walls", len(decided), "Matching shared walls",
-                   _pool_size(len(decided)))
-    parties = _run_ordered(
-        _one_party, range(len(decided)), _worker_count(), should_stop,
-        lambda done, total, busy, pool: reporter.advance(done, busy),
-        processes=False)
+    # The building library matches the walls: every footprint of the piece is
+    # already in the buffer it is given, and it finds the buildings next door
+    # from those.
+    if not native.ready():
+        raise native.Unavailable(
+            native.reason() or "the building library is not next to the program")
+    reporter.start("walls", 1, "Matching shared walls", 1)
+    parties = [() for _ in decided]
+    reporter.advance(1, 0)
     for j, party in enumerate(parties):
-        # The feature id rides after the layout arguments. _make_one unpacks
+        # The feature id rides after the layout arguments. make_one unpacks
         # a fixed tuple and never sees it; the .tbx name stays the feature index.
         jobs[j] = jobs[j] + (party, decided[j][-1])
 
@@ -2554,15 +2334,20 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     # A relayout skips a building whose file is already there and whose id was
     # not selected. Its room counts come back from the placements csv, matched
     # on the file name; a missing row is laid out anyway.
-    saved_layouts = (_saved_layouts(os.path.join(out_dir, f"{map_name}_placements.csv"))
-                     if relayout_ids is not None else {})
+    saved_layouts: dict[str, tuple] = {}
+    if relayout_ids is not None or resume:
+        saved_layouts = _saved_layouts(
+            os.path.join(out_dir, f"{map_name}_placements.csv"))
+        if resume:
+            saved_layouts = _remember_tbx(bdir, saved_layouts)
     layout_jobs = []
     layout_at = []
     reused: dict[int, tuple] = {}
     for j, job in enumerate(jobs):
         fid = job[16]
         fname = decided[j][0]
-        if (relayout_ids is not None and fid not in relayout_ids
+        selected = relayout_ids is not None and fid in relayout_ids
+        if ((resume or relayout_ids is not None) and not selected
                 and os.path.isfile(job[10]) and fname in saved_layouts):
             reused[j] = saved_layouts[fname]
             continue
@@ -2570,6 +2355,9 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
         layout_at.append(j)
     for j in reused:
         view_states[j] = "complete"
+    if resume and reused:
+        _trace(f"{map_name}: keeping {len(reused)} rooms already written, "
+               f"laying out {len(layout_jobs)}")
 
     def _ensure_layout_canvas():
         nonlocal view_image, layout_canvas, layout_scale
@@ -2593,7 +2381,11 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
         layout_scale = scale
         return canvas, scale
 
-    def _draw_layout(boxes, states) -> None:
+    def _draw_layout(boxes, states, token: int | None = None) -> None:
+        if token is None:
+            token = _take_view()
+        elif token != view_token:
+            return
         canvas, scale = _ensure_layout_canvas()
         if canvas is None or (on_view is None and on_overlay is None):
             return
@@ -2611,7 +2403,11 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
             overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
             shade = ImageDraw.Draw(overlay)
         painted = False
-        for (x, y, w, h), state in zip(boxes, states):
+        for n, ((x, y, w, h), state) in enumerate(zip(boxes, states)):
+            if n and n % 400 == 0:
+                time.sleep(0)
+                if token != view_token:
+                    return
             x1 = x + max(int(w), 1)
             y1 = y + max(int(h), 1)
             box = [int(x * scale), int(y * scale),
@@ -2622,33 +2418,69 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
             if shade is not None and state == "complete":
                 painted = True
                 shade.rectangle(box, fill=(205, 48, 43, 170))
+        if token != view_token:
+            return
+        # Hand the pool a gap before the encode. Saving the picture is the
+        # long hold; the cores should already have their next buildings.
+        time.sleep(0)
         if on_view is not None and frame is not None:
             on_view(frame, "Laying out rooms")
         if on_overlay is not None and overlay is not None and painted:
             on_overlay(overlay)
 
     def _kick_layout_paint() -> None:
-        if not layout_open:
+        nonlocal layout_armed, layout_token
+        if not layout_open or layout_armed:
             return
-        boxes = list(view_boxes)
-        states = list(view_states)
+        if on_view is None and on_overlay is None:
+            return
+        if layout_token is None:
+            layout_token = _take_view()
+        token = layout_token
+        layout_armed = True
         import knoxpreview
 
-        def run() -> None:
-            if not layout_open:
+        def run(token=token) -> None:
+            nonlocal layout_armed
+            # Cleared before the draw, so the next tick can queue while this
+            # one paints. The colours are read here, when the preview thread
+            # actually starts, not when the tick was posted.
+            layout_armed = False
+            if not layout_open or token != view_token:
                 return
             try:
-                _draw_layout(boxes, states)
+                _draw_layout(list(view_boxes), list(view_states), token)
             except Exception:  # noqa: BLE001 - the picture is not the build
                 _trace("layout preview failed")
 
-        knoxpreview.submit(f"{map_name}:layout", run)
+        # Same key as the waiting frame, so this picture replaces the
+        # all-red one still sitting in the queue.
+        knoxpreview.submit(f"{map_name}:build", run)
+
+    def _submit_layout_frame() -> None:
+        """The finished footprints, on the preview thread."""
+        if on_view is None and on_overlay is None:
+            return
+        boxes = list(view_boxes)
+        states = list(view_states)
+        token = layout_token if layout_token is not None else _take_view()
+        import knoxpreview
+
+        def run(token=token, boxes=boxes, states=states) -> None:
+            try:
+                _draw_layout(boxes, states, token)
+            except Exception:  # noqa: BLE001 - the picture is not the build
+                _trace("layout preview failed")
+
+        knoxpreview.submit(f"{map_name}:build", run)
 
     def _stop_layout_paint() -> None:
-        nonlocal layout_open
+        nonlocal layout_open, layout_armed
         layout_open = False
+        layout_armed = False
         import knoxpreview
         knoxpreview.discard(f"{map_name}:layout")
+        knoxpreview.discard(f"{map_name}:build")
 
     def show_layout_state(active, completed):
         active = set(active)
@@ -2659,14 +2491,33 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
                                       "pending")
         _kick_layout_paint()
 
-    reporter.start("layout", len(layout_jobs), "Laying out rooms",
-                   _pool_size(len(layout_jobs)))
+    if resume and reused and not layout_jobs:
+        layout_label = "Rooms already laid out"
+    elif resume and reused:
+        layout_label = f"Laying out rooms, {len(reused)} already done"
+    else:
+        layout_label = "Laying out rooms"
+    reporter.start("layout", len(layout_jobs), layout_label,
+                   _layout_pool_size(len(layout_jobs), layout_workers))
+    show_layout_state(set(), set())
     try:
-        fresh = _make_all(
-            layout_jobs, should_stop=should_stop,
-            on_done=lambda done, total, busy, pool_n: reporter.advance(
-                done, busy, pool_n),
-            pool=pool, on_state=show_layout_state)
+        fresh = []
+        if layout_jobs:
+            # Every building of the piece in one pool, laid out and written by
+            # native threads that share one copy of the catalog. The walls each
+            # building shares with its neighbours are worked out in there, which
+            # is why the piece's own size goes with it.
+            native_jobs = [tuple(job[:15]) + (0, decided[j][2], decided[j][3])
+                           for job, j in zip(layout_jobs, layout_at)]
+            fresh = native.run(
+                native_jobs, [(proj.width, proj.height)],
+                should_stop=should_stop,
+                on_done=lambda done, total, busy, pool_n:
+                    reporter.advance(done, busy, pool_n),
+                on_state=show_layout_state)
+            # Cancelling leaves the buildings it never reached marked
+            # stopped rather than failed; Stop is what the caller is owed.
+            knoxstop.check(should_stop, "the buildings")
     finally:
         _stop_layout_paint()
     laid: list = [None] * len(jobs)
@@ -2675,11 +2526,17 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     for j, stats in zip(layout_at, fresh):
         laid[j] = stats
     failed_buildings = []
+    # The doors of each house, found by the worker in the text it wrote. A
+    # building kept from an earlier run has no entry and is read from disk.
+    doors_by_file: dict[str, list] = {}
     for (fname, label, x0, y0, w, h, fp, px, special, measured, commercial,
-         style, mask, real_name, _fid), (storeys, rooms, furniture, error) in zip(decided, laid):
+         style, mask, real_name, _fid), stats in zip(decided, laid):
+        storeys, rooms, furniture, error = stats[:4]
         if error:
             failed_buildings.append(error)
             continue
+        if len(stats) > 4 and stats[4] is not None:
+            doors_by_file[fname] = stats[4]
         p = Placement(f"buildings/{fname}", x0, y0, w, h)
         placements.append(p)
         peopled.append((x0, y0, fp.mask, storeys, special or "house"))
@@ -2702,7 +2559,7 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     rows.sort(key=lambda r: r["file"])
     for j, stats in enumerate(laid):
         view_states[j] = "complete" if stats and not stats[3] else "pending"
-    _draw_layout(list(view_boxes), list(view_states))
+    _submit_layout_frame()
 
     # One military rifle somewhere on the map, whatever this town turned out
     # to be: an army building, else the police station, else a gun shop, else
@@ -2720,7 +2577,8 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     drives: list = []
     porch_lights: list = []
     paths, yard_fences = paint_paths(out_dir, map_name, rows, occupied, drives,
-                                     porch_lights)
+                                     porch_lights, doors_by_file=doors_by_file)
+    doors_by_file.clear()
     # The lights stand outside the houses, past the edge of their own .tbx.
     from .structures import pack_loose
     light_placements = pack_loose(bdir, map_name, "lights", porch_lights,
@@ -2817,7 +2675,6 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
                 name = pending.pop(future)
                 final_results[name] = future.result()
                 done_n += 1
-                reporter.message = f"Finished {name}"
                 reporter.advance(done_n, len(pending))
 
     population = final_results["Population and zombie map"]
@@ -2829,11 +2686,16 @@ def build(out_dir: str, seed: int | None = None, min_size: int | None = None,
     # not into town-zone detection: their lots can span a whole cell.
     placements = (placements + fence_placements + structure_placements +
                   pump_placements + prop_placements + light_placements)
+    placements, zones = _without_dropped_cells(
+        placements, zones, info.get("keep_cells"))
 
     reporter.start("write", 1, "Writing the project", 1)
     from .mapped_cells import cells_to_build
 
     build_cells = cells_to_build(out_dir, map_name, info, placements, zones, proj)
+    allowed = _kept_cell_set(info.get("keep_cells"))
+    if allowed is not None:
+        build_cells &= allowed
     total_cells = int(info["cells_x"]) * int(info["cells_y"])
     omitted = total_cells - len(build_cells)
     pzw_path = os.path.join(out_dir, f"{map_name}.pzw")
