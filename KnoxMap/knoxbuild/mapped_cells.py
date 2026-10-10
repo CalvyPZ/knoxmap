@@ -12,6 +12,8 @@ import os
 import numpy as np
 
 from generator import pz_colors as C
+
+from .bmpio import GROUND_DARK_GRASS, load_ground_class
 from .world import CELL_SIZE, Placement, Zone
 
 # Open country and clip-outside shape both use dark grass on the landscape
@@ -22,6 +24,13 @@ _FOREST_VEG = frozenset({
     C.TREES, C.TREES_DARK_GRASS, C.SPARSE_TREES,
     C.LOT_OF_GRASS_AND_TREES, C.BUSHES_TREES_DARK_GRASS,
 })
+
+
+def _cell_dark_grass(classes: np.ndarray, x0: int, y0: int) -> bool:
+    tile = classes[y0:y0 + CELL_SIZE, x0:x0 + CELL_SIZE]
+    if tile.size == 0:
+        return True
+    return bool(np.all(tile == GROUND_DARK_GRASS))
 
 
 def _cell_grass_only(land: np.ndarray, x0: int, y0: int) -> bool:
@@ -71,9 +80,14 @@ def cells_to_build(out_dir: str, map_name: str, info: dict,
     if not os.path.isfile(land_path) or not os.path.isfile(veg_path):
         return all_cells
 
-    land = np.asarray(Image.open(land_path).convert("RGB"))
     veg = np.asarray(Image.open(veg_path).convert("RGB"))
-    height, width = land.shape[:2]
+    height, width = veg.shape[:2]
+    classes = load_ground_class(land_path, width=width, height=height)
+    land = None
+    if classes is None or classes.shape != (height, width):
+        land = np.asarray(Image.open(land_path).convert("RGB"))
+        classes = None
+        height, width = land.shape[:2]
 
     keep: set[tuple[int, int]] = set()
     for cy in range(cells_y):
@@ -84,7 +98,11 @@ def cells_to_build(out_dir: str, map_name: str, info: dict,
             x0, y0 = cx * CELL_SIZE, cy * CELL_SIZE
             if x0 >= width or y0 >= height:
                 continue
-            if not _cell_procedural(land, veg, x0, y0):
+            if classes is not None:
+                open_country = _cell_dark_grass(classes, x0, y0)
+            else:
+                open_country = _cell_grass_only(land, x0, y0)
+            if not (open_country and _cell_forest_only(veg, x0, y0)):
                 keep.add((cx, cy))
 
     return keep

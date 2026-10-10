@@ -128,12 +128,21 @@ def _grid_path(points: list[tuple[float, float]]) -> list[tuple[int, int]]:
 
 def _tarmac_mask(bmp_path: str, width: int, height: int):
     """True where the ground is a road, service lane or car park."""
+    from .bmpio import (
+        GROUND_CARRIAGEWAY, GROUND_GRAVEL, GROUND_PARKING, class_mask,
+        load_ground_class,
+    )
+
+    if not os.path.exists(bmp_path):
+        return None
+    classes = load_ground_class(bmp_path, width=width, height=height)
+    if classes is not None and classes.shape == (height, width):
+        return class_mask(classes, (GROUND_CARRIAGEWAY, GROUND_PARKING, GROUND_GRAVEL))
+
     from PIL import Image
 
     from generator import pz_colors as C
 
-    if not os.path.exists(bmp_path):
-        return None
     ground = np.asarray(Image.open(bmp_path).convert("RGB"))
     if ground.shape[:2] != (height, width):
         return None

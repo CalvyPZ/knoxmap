@@ -29,6 +29,10 @@ from scipy import ndimage
 
 from generator import pz_colors as C
 
+from .bmpio import (
+    GROUND_CARRIAGEWAY, GROUND_CONCRETE, GROUND_GRAVEL, GROUND_PARKING,
+    GROUND_PLAZA, GROUND_WATER, class_mask, load_ground_class,
+)
 from .grids import colour_mask
 
 CHUNK = C.SPAWN_MAP_SCALE     # tiles per spawn-map pixel, each way
@@ -74,6 +78,8 @@ STREET_PEOPLE_PER_CHUNK = 1.3
 STREET_COLOURS = (C.MEDIUM_ASPHALT, C.DARKEST_ASPHALT, C.DARK_ASPHALT,
                   C.LIGHT_ASPHALT, C.DARK_POTHOLE, C.LIGHT_POTHOLE,
                   C.PALE_CONCRETE, C.PAVING)
+STREET_CLASSES = (GROUND_CARRIAGEWAY, GROUND_PARKING, GROUND_GRAVEL,
+                  GROUND_CONCRETE, GROUND_PLAZA)
 # Rows of the map measured at a time, so a town's bitmap is never held in
 # memory twice over (see renderer.BOX_STRIP_ROWS).
 GROUND_STRIP_CHUNKS = 64
@@ -83,6 +89,13 @@ def _ground_shares(path: str, gw: int, gh: int) -> tuple[np.ndarray, np.ndarray]
     """(paved share, water share) of every chunk, 0..1."""
     paved = np.zeros((gh, gw), dtype=float)
     water = np.zeros((gh, gw), dtype=float)
+    wide, high = gw * CHUNK, gh * CHUNK
+    classes = load_ground_class(path, width=wide, height=high)
+    if classes is not None and classes.shape == (high, wide):
+        shape = (gh, CHUNK, gw, CHUNK)
+        paved[:] = class_mask(classes, STREET_CLASSES).reshape(shape).mean(axis=(1, 3))
+        water[:] = (classes == GROUND_WATER).reshape(shape).mean(axis=(1, 3))
+        return paved, water
     with Image.open(path) as img:
         ground = img.convert("RGB")
         for top in range(0, gh, GROUND_STRIP_CHUNKS):

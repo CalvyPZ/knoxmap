@@ -27,6 +27,11 @@ from PIL import Image
 
 from generator import pz_colors as C
 
+from .bmpio import (
+    GROUND_CARRIAGEWAY, GROUND_WATER, class_mask, load_ground_class, load_pair,
+    load_rgb,
+)
+from .grids import colour_mask
 from .structures import CELL, render_tiles_tbx
 
 # location_community_cemetary_01: headstones, wooden crosses and the angel on
@@ -66,10 +71,7 @@ BLOCKED = ROAD | {C.WATER}
 
 
 def _blocked_mask(ground: np.ndarray) -> np.ndarray:
-    out = np.zeros(ground.shape[:2], dtype=bool)
-    for colour in BLOCKED:
-        out |= np.all(ground == colour, axis=2)
-    return out
+    return colour_mask(ground, list(BLOCKED))
 
 
 def _cells_inside(poly, xs, ys, rows: int = 128):
@@ -114,12 +116,17 @@ def place_props(out_dir: str, map_name: str, bdir: str, occupied: np.ndarray,
     if not cemeteries and not bases:
         return [], counts
 
-    ground = np.array(Image.open(bmp).convert("RGB"))
-    height, width = ground.shape[:2]
-    blocked = _blocked_mask(ground)
-    blocked |= occupied[:height, :width]
     veg_path = os.path.join(out_dir, f"{map_name}_veg.bmp")
-    veg = np.array(Image.open(veg_path).convert("RGB")) if os.path.exists(veg_path) else None
+    classes = load_ground_class(bmp)
+    veg = load_rgb(veg_path) if os.path.exists(veg_path) else None
+    if classes is not None and (veg is None or classes.shape == veg.shape[:2]):
+        height, width = classes.shape
+        blocked = class_mask(classes, (GROUND_CARRIAGEWAY, GROUND_WATER))
+    else:
+        ground, veg = load_pair(bmp, veg_path)
+        height, width = ground.shape[:2]
+        blocked = _blocked_mask(ground)
+    blocked |= occupied[:height, :width]
     rng = random.Random(seed)
     tiles: list[tuple[int, int, int, str, str]] = []
 

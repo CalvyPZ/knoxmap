@@ -25,6 +25,12 @@ from PIL import Image
 
 from generator import pz_colors as C
 
+from .bmpio import (
+    GROUND_CARRIAGEWAY, GROUND_CONCRETE, GROUND_DARK_GRASS, GROUND_DIRT,
+    GROUND_GRASS, GROUND_PARKING, class_mask, load_ground_class, load_pair,
+    save_pair,
+)
+from .doors import outside_doors_from_text
 from .grids import colour_mask
 
 PATH_MAX_TILES = 40
@@ -72,40 +78,25 @@ _SIDE = {(0, -1): "N", (0, 1): "S", (-1, 0): "W", (1, 0): "E"}
 
 def _outside_doors(tbx_path: str) -> list[tuple[int, int, int, int]]:
     """(outside x, y, inside x, y) of each ground-floor outside door, front first."""
-    text = open(tbx_path, encoding="utf-8").read()
-    first = text.split("<floor>", 2)
-    if len(first) < 2:
-        return []
-    floor = first[1]
-    grid_text = re.search(r"<rooms>(.*?)</rooms>", floor, re.S)
-    if not grid_text:
-        return []
-    grid = [[int(v) for v in row.strip().strip(",").split(",")]
-            for row in grid_text.group(1).strip().splitlines() if row.strip()]
-    h, w = len(grid), len(grid[0])
-
-    def inside(x, y):
-        return 0 <= x < w and 0 <= y < h and grid[y][x] != 0
-
-    found = []
-    for m in re.finditer(r'type="door"[^>]*? x="(\d+)" y="(\d+)" dir="([NW])"', floor):
-        x, y, d = int(m.group(1)), int(m.group(2)), m.group(3)
-        a, b = ((x, y - 1), (x, y)) if d == "N" else ((x - 1, y), (x, y))
-        if inside(*a) != inside(*b):
-            out, into = (a, b) if inside(*b) else (b, a)
-            found.append((out[0], out[1], into[0], into[1]))
-    return found
+    with open(tbx_path, encoding="utf-8") as handle:
+        text = handle.read()
+    return outside_doors_from_text(text)
 
 
 def paint_paths(out_dir: str, map_name: str, rows: list[dict], occupied,
                 drives: list | None = None,
-                lights: list | None = None) -> tuple[int, list]:
+                lights: list | None = None,
+                doors_by_file: dict | None = None) -> tuple[int, list]:
     """Dress every house in `rows`. Returns (houses dressed, back-yard fence lines).
 
     Each drive's parking space, (x, y, width, height) at its house end, is
     added to `drives` when it is given: the car belongs there. Porch lights
     are added to `lights` the same way, as (x, y, level, layer, tile) for
-    whoever writes them into a .tbx."""
+    whoever writes them into a .tbx.
+
+    `doors_by_file` is the doors each layout worker already found in the text
+    it wrote, keyed by .tbx name. A house that is not in it is read from disk,
+    as every house used to be."""
     bmp = os.path.join(out_dir, f"{map_name}.bmp")
     base = os.path.join(out_dir, f"{map_name}_ground_base.bmp")
     veg_path = os.path.join(out_dir, f"{map_name}_veg.bmp")
@@ -116,15 +107,18 @@ def paint_paths(out_dir: str, map_name: str, rows: list[dict], occupied,
         shutil.copyfile(bmp, base)
     if os.path.exists(veg_path) and not os.path.exists(veg_base):
         shutil.copyfile(veg_path, veg_base)
-    ground = np.array(Image.open(base).convert("RGB"))
-    veg = np.array(Image.open(veg_base).convert("RGB")) if os.path.exists(veg_base) else None
+    ground, veg = load_pair(base, veg_base)
     h, w = ground.shape[:2]
-
-    def match(colours):
-        return colour_mask(ground, colours)
-
-    paved = match(PAVED)
-    crossable = match(CROSSABLE) & ~occupied
+    # The bitmap is still loaded: the paths are painted into it. Which tiles
+    # are already pavement or lawn comes from the class file when it is there.
+    classes = load_ground_class(base, width=w, height=h)
+    if classes is not None and classes.shape == (h, w):
+        paved = class_mask(classes, (GROUND_CONCRETE, GROUND_CARRIAGEWAY, GROUND_PARKING))
+        crossable = class_mask(classes, (GROUND_DARK_GRASS, GROUND_GRASS, GROUND_DIRT))
+        crossable &= ~occupied
+    else:
+        paved = colour_mask(ground, PAVED)
+        crossable = colour_mask(ground, CROSSABLE) & ~occupied
     claimed = np.zeros((h, w), dtype=bool)     # painted for some house already
 
     def free(x, y):
@@ -147,7 +141,9 @@ def paint_paths(out_dir: str, map_name: str, rows: list[dict], occupied,
     for row in rows:
         if row.get("kind") != "house":
             continue
-        doors = _outside_doors(os.path.join(out_dir, "buildings", row["file"]))
+        doors = doors_by_file.get(row["file"]) if doors_by_file else None
+        if doors is None:
+            doors = _outside_doors(os.path.join(out_dir, "buildings", row["file"]))
         if not doors:
             continue
         ox, oy, ix, iy = doors[0]
@@ -372,7 +368,5 @@ def paint_paths(out_dir: str, map_name: str, rows: list[dict], occupied,
                         veg[y, x] = frame[(col, row)]
         dressed += 1
 
-    Image.fromarray(ground).save(bmp, format="BMP")
-    if veg is not None:
-        Image.fromarray(veg).save(veg_path, format="BMP")
+    save_pair(ground, bmp, veg, veg_path)
     return dressed, fences

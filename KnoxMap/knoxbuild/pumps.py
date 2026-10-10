@@ -22,6 +22,11 @@ from PIL import Image
 
 from generator import pz_colors as C
 
+from .bmpio import (
+    GROUND_CARRIAGEWAY, GROUND_CONCRETE, GROUND_PARKING, GROUND_WATER,
+    class_mask, load_ground_class, load_pair, save_pair,
+)
+from .grids import colour_mask
 from .structures import CELL, render_tiles_tbx
 
 # One tile each, holding 20000 units of fuel. The pump facing south stands in
@@ -73,14 +78,16 @@ def place_pumps(out_dir: str, map_name: str, bdir: str, occupied: np.ndarray,
     canopies = canopies or []
     if not (stations or points or canopies) or not os.path.exists(bmp):
         return [], 0
-    ground = np.array(Image.open(bmp).convert("RGB"))
     veg_path = os.path.join(out_dir, f"{map_name}_veg.bmp")
-    veg = np.array(Image.open(veg_path).convert("RGB")) if os.path.exists(veg_path) else None
+    ground, veg = load_pair(bmp, veg_path)
     H, W = ground.shape[:2]
+    classes = load_ground_class(bmp, width=W, height=H)
 
     blocked = occupied[:H, :W].copy()
-    for colour in ROAD | NOT_GROUND:
-        blocked |= np.all(ground == colour, axis=2)
+    if classes is not None and classes.shape == (H, W):
+        blocked |= class_mask(classes, (GROUND_CARRIAGEWAY, GROUND_WATER))
+    else:
+        blocked |= colour_mask(ground, list(ROAD | NOT_GROUND))
 
     def clear(x, y, w, h):
         return (x >= 0 and y >= 0 and x + w <= W and y + h <= H
@@ -89,9 +96,10 @@ def place_pumps(out_dir: str, map_name: str, bdir: str, occupied: np.ndarray,
     tiles: list[tuple[int, int, int, str, str]] = []
     pumps = 0
 
-    paved = np.zeros((H, W), dtype=bool)
-    for colour in ROAD | {C.PALE_CONCRETE, C.DARK_ASPHALT}:
-        paved |= np.all(ground == colour, axis=2)
+    if classes is not None and classes.shape == (H, W):
+        paved = class_mask(classes, (GROUND_CARRIAGEWAY, GROUND_CONCRETE, GROUND_PARKING))
+    else:
+        paved = colour_mask(ground, list(ROAD | {C.PALE_CONCRETE, C.DARK_ASPHALT}))
 
     def reach(x, y, w, h, side):
         """The forecourt run on out to the pavement or road when that is a
@@ -226,9 +234,7 @@ def place_pumps(out_dir: str, map_name: str, bdir: str, occupied: np.ndarray,
 
     if not tiles:
         return [], 0
-    Image.fromarray(ground).save(bmp, format="BMP")
-    if veg is not None:
-        Image.fromarray(veg).save(veg_path, format="BMP")
+    save_pair(ground, bmp, veg, veg_path)
 
     by_cell: dict[tuple[int, int], list] = {}
     for t in tiles:
