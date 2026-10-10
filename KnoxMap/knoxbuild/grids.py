@@ -8,6 +8,7 @@ SciPy is required. There is no second implementation.
 """
 from __future__ import annotations
 
+import os
 from typing import NamedTuple
 
 import numpy as np
@@ -305,26 +306,53 @@ def erode(mask: np.ndarray, structure: np.ndarray | None = None) -> np.ndarray:
         np.asarray(mask), structure=structure, border_value=0)
 
 
+_MASK_BAND_ROWS = 256
+_MASK_THREADS = max(1, min(8, os.cpu_count() or 1))
+
+
 def colour_mask(rgb: np.ndarray, colours) -> np.ndarray:
     """True where an ``(H, W, 3)`` uint8 image matches one of ``colours``.
 
     Each pixel and each ``(r, g, b)`` tuple is packed into uint32 as
     ``(r << 16) | (g << 8) | b`` before ``np.isin``. The result is a bool
     array of shape ``(H, W)``.
+
+    The image is walked in bands of rows. A whole 9000 x 9000 picture packed
+    in one go held four uint32 copies of itself (over a gigabyte); a band
+    holds a few megabytes, and the bands run on a few threads because NumPy
+    lets go of the interpreter for this arithmetic.
     """
     image = np.asarray(rgb)
-    packed = (
-        image[..., 0].astype(np.uint32) << 16
-        | image[..., 1].astype(np.uint32) << 8
-        | image[..., 2].astype(np.uint32)
-    )
     palette = np.asarray(colours, dtype=np.uint32)
     if palette.size == 0:
-        return np.zeros(packed.shape, dtype=bool)
+        return np.zeros(image.shape[:2], dtype=bool)
     if palette.ndim == 1:
         palette = palette.reshape(1, -1)
-    keys = palette[..., 0] << 16 | palette[..., 1] << 8 | palette[..., 2]
-    return np.isin(packed, keys.ravel())
+    keys = (palette[..., 0] << 16 | palette[..., 1] << 8 | palette[..., 2]).ravel()
+    height = image.shape[0]
+    out = np.empty(image.shape[:2], dtype=bool)
+
+    def band(y0: int) -> None:
+        part = image[y0:y0 + _MASK_BAND_ROWS]
+        packed = (
+            part[..., 0].astype(np.uint32) << 16
+            | part[..., 1].astype(np.uint32) << 8
+            | part[..., 2].astype(np.uint32)
+        )
+        out[y0:y0 + part.shape[0]] = np.isin(packed, keys)
+
+    starts = range(0, height, _MASK_BAND_ROWS)
+    threads = min(_MASK_THREADS, len(starts))
+    if threads <= 1:
+        for y0 in starts:
+            band(y0)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=threads,
+                                thread_name_prefix="knox-colour") as pool:
+            for _ in pool.map(band, starts):
+                pass
+    return out
 
 
 def rooms_text(g: np.ndarray) -> str:
