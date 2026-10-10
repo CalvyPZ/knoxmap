@@ -529,16 +529,34 @@ def _posts(plan: Plan, tiles: set, footprint: set, z: int) -> None:
         plan.posts.append((x, y, z))
 
 
-def rail_water(plan: Plan, landscape, water_colour) -> None:
+def rail_water(plan: Plan, landscape, water_colour, on_progress=None) -> None:
     """Railings along the sides of bridges over water, and posts that would
-    stand in a road taken back out."""
+    stand in a road taken back out.
+
+    ``on_progress`` is called with a fraction from 0 to 1. This pass walks
+    every tile of each bridge, which on a river town is a large share of
+    the piece, and the window's clock needs to see it move.
+    """
     px = landscape.load()
     w, h = landscape.size
-    for shape in plan.water_rails:
+    rails = plan.water_rails
+    nrails = len(rails)
+    for ri, shape in enumerate(rails):
         x0, y0, x1, y1 = (int(math.floor(v)) for v in shape.bounds)
-        tiles = {(x, y) for y in range(max(0, y0), min(h, y1 + 1))
-                 for x in range(max(0, x0), min(w, x1 + 1))
-                 if shape.contains(Point(x + 0.5, y + 0.5))}
+        y_lo, y_hi = max(0, y0), min(h, y1 + 1)
+        x_lo, x_hi = max(0, x0), min(w, x1 + 1)
+        tiles = set()
+        rows = max(1, y_hi - y_lo)
+        seen = 0
+        for y in range(y_lo, y_hi):
+            for x in range(x_lo, x_hi):
+                if shape.contains(Point(x + 0.5, y + 0.5)):
+                    tiles.add((x, y))
+            seen += 1
+            if on_progress is not None and seen % 8 == 0:
+                on_progress((ri + seen / rows) / max(1, nrails))
+        if on_progress is not None:
+            on_progress((ri + 1) / max(1, nrails))
         for x, y in tiles:
             for (nx, ny), (ex, ey, side) in (((x - 1, y), (x, y, "W")), ((x + 1, y), (x + 1, y, "W")),
                                              ((x, y - 1), (x, y, "N")), ((x, y + 1), (x, y + 1, "N"))):
