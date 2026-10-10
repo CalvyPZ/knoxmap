@@ -1,5 +1,5 @@
 @echo off
-rem Install what this checkout needs before debug_run.bat or build_releases.bat:
+rem Install what this checkout needs before debug_run.bat or build_windows.bat:
 rem   KnoxMap\.venv          Python packages from KnoxMap\requirements.txt
 rem   desktop\node_modules   Electron window
 rem

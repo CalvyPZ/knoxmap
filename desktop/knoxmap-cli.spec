@@ -2,6 +2,7 @@
 # The command-line KnoxMap. One console program, no window.
 #   pyinstaller --noconfirm --distpath releases/temp --workpath releases/temp/work-cli desktop/knoxmap-cli.spec
 import os
+import sys
 
 REPO = os.path.abspath(os.path.join(SPECPATH, ".."))
 ROOT = os.path.join(REPO, "KnoxMap")
@@ -60,9 +61,55 @@ def bundle_osmium():
     return bins, data, mods
 
 
+def bundle_knox_compile():
+    # Same binary the window packs. The command-line program compiles too.
+    if sys.platform == "win32":
+        name = "knox-compile.exe"
+    else:
+        name = "knox-compile"
+    built = os.path.join(REPO, "compiler", "target", "release", name)
+    if not os.path.isfile(built):
+        raise SystemExit(
+            f"Missing {built}. Build it with cargo build --release "
+            "--manifest-path compiler/Cargo.toml before packing."
+        )
+    return [(built, ".")]
+
+
+def bundle_compiler_source():
+    # GPL: a release that ships knox-compile ships the compiler source with it.
+    root = os.path.join(REPO, "compiler")
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "target"]
+        rel = os.path.relpath(dirpath, REPO)
+        for name in filenames:
+            found.append((os.path.join(dirpath, name), rel))
+    return found
+
+
+def bundle_rust_dll():
+    # The one library built for this system. Windows is helper.dll, Linux
+    # libhelper.so, macOS libhelper.dylib. Room layout and terrain are both
+    # inside it. A pack without it is not a release.
+    if sys.platform == "win32":
+        name = "helper.dll"
+    elif sys.platform == "darwin":
+        name = "libhelper.dylib"
+    else:
+        name = "libhelper.so"
+    built = os.path.join(REPO, "Helpers", "target", "release", name)
+    if not os.path.isfile(built):
+        raise SystemExit(
+            f"Missing {built}. Build Helpers with cargo build --release before packing."
+        )
+    return [(built, ".")]
+
+
 osmium_bins, osmium_data, osmium_mods = bundle_osmium()
 hidden += osmium_mods
 datas += osmium_data
+datas += bundle_compiler_source()
 # SciPy's hooks collect the rest of the package. These are reached through
 # a lazy or private name, so a frozen build misses them unless named here.
 hidden += [
@@ -75,7 +122,7 @@ hidden += [
 a = Analysis(
     [os.path.join(ROOT, "knoxmap_cli.py")],
     pathex=[ROOT],
-    binaries=osmium_bins,
+    binaries=osmium_bins + bundle_rust_dll() + bundle_knox_compile(),
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],

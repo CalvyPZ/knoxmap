@@ -1,25 +1,17 @@
 @echo off
-rem Build the player downloads into releases\ (gitignored):
+rem Build the Windows downloads into releases\ (gitignored):
 rem   KnoxMap-v…-windows.exe       window
 rem   KnoxMap-v…-windows-cli.exe   command line, no window
-rem   KnoxMap-v…-linux.AppImage
-rem   KnoxMap-v…-linux-cli
-rem   KnoxMap-v…-macos.zip     (KnoxMap.app, plus knoxmap-cli beside it)
 rem
-rem Windows is packed on this PC. Linux and Mac are packed in Docker.
-rem PyInstaller scratch is releases\temp. The window packager's files are
-rem moved to releases\dist. Needs 64-bit Python 3.10+, Node.js, and Docker.
+rem Packed on this PC. PyInstaller scratch is releases\temp. The window
+rem packager's files are moved to releases\dist. Needs 64-bit Python 3.10+,
+rem Node.js, and Rust.
 setlocal
 cd /d "%~dp0"
 set PYTHONUTF8=1
 
 where node >nul 2>nul || (
   echo Node.js is not installed. Install Node 22 or newer, then run this again.
-  exit /b 1
-)
-where docker >nul 2>nul || (
-  echo Docker is not installed. Install Docker Desktop, then run this again.
-  echo Linux and Mac cannot be packed by Windows itself.
   exit /b 1
 )
 
@@ -36,6 +28,30 @@ findstr /i /c:"python3.14t" /c:"freethreaded" "KnoxMap\.venv\pyvenv.cfg" >nul 2>
 if not exist "KnoxMap\.venv\Scripts\python.exe" (
   echo Creating the Python environment with python3...
   python3 -m venv KnoxMap\.venv || exit /b 1
+)
+
+rem The Windows helper library: room layout and terrain in one DLL. A release
+rem without it stops.
+where cargo >nul 2>nul || (
+  echo Rust is not installed. A release needs it for the building and terrain libraries.
+  echo Install it from https://rustup.rs and run this again.
+  exit /b 1
+)
+echo Building the Windows helper library...
+pushd Helpers
+cargo build --release -p helper
+set ERR=%ERRORLEVEL%
+popd
+if not "%ERR%"=="0" (
+  echo The helper library did not build.
+  exit /b %ERR%
+)
+
+echo Building the map compiler...
+cargo build --release --manifest-path compiler\Cargo.toml
+if errorlevel 1 (
+  echo The map compiler did not build.
+  exit /b 1
 )
 
 if not exist "releases\temp" mkdir "releases\temp"
@@ -76,10 +92,6 @@ for /f "tokens=2" %%v in ('findstr /b /c:"## " docs\CHANGELOG.md') do (
 copy /y "releases\temp\knoxmap-cli.exe" "releases\KnoxMap-v%VER%-windows-cli.exe" >nul
 echo Built %~dp0releases\KnoxMap-v%VER%-windows-cli.exe
 
-echo Packing the Linux and Mac programs...
-docker run --rm -v "%CD%":/knoxmap -w /knoxmap node:22-bookworm bash desktop/build-foreign.sh
-if errorlevel 1 exit /b 1
-
 rem Packager scripts still drop the window build in desktop\out and may copy
 rem named downloads to release\ or released\. Keep all of that under releases\.
 if exist "desktop\out" (
@@ -93,5 +105,5 @@ for %%d in (release released) do if exist "%%d" for %%f in ("%%d\*") do (
 
 echo.
 echo Built:
-dir /b releases
+dir /b releases\*windows*
 endlocal

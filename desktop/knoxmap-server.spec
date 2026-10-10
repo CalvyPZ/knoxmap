@@ -4,6 +4,7 @@
 # Build with:
 #   pyinstaller --noconfirm --distpath releases/temp --workpath releases/temp/work desktop/knoxmap-server.spec
 import os
+import sys
 
 REPO = os.path.abspath(os.path.join(SPECPATH, ".."))
 ROOT = os.path.join(REPO, "KnoxMap")
@@ -73,6 +74,54 @@ def bundle_duckdb():
             collect_submodules("duckdb"))
 
 
+def bundle_knox_compile():
+    # knox-compile is its own process. The frozen server's files are not the
+    # source tree, so compile_map only finds this when it is packed beside
+    # the server. Compile has no other implementation.
+    if sys.platform == "win32":
+        name = "knox-compile.exe"
+    else:
+        name = "knox-compile"
+    built = os.path.join(REPO, "compiler", "target", "release", name)
+    if not os.path.isfile(built):
+        raise SystemExit(
+            f"Missing {built}. Build it with cargo build --release "
+            "--manifest-path compiler/Cargo.toml before packing."
+        )
+    return [(built, ".")]
+
+
+def bundle_compiler_source():
+    # GPL: a release that ships knox-compile ships the compiler source with it.
+    root = os.path.join(REPO, "compiler")
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "target"]
+        rel = os.path.relpath(dirpath, REPO)
+        for name in filenames:
+            found.append((os.path.join(dirpath, name), rel))
+    return found
+
+
+def bundle_rust_dll():
+    # The one library built for this system, sitting beside the program so
+    # knoxbuild/native.py and generator/terrain_native.py find it. Windows is
+    # helper.dll, Linux libhelper.so, macOS libhelper.dylib. Room layout and
+    # terrain are both inside it.
+    if sys.platform == "win32":
+        name = "helper.dll"
+    elif sys.platform == "darwin":
+        name = "libhelper.dylib"
+    else:
+        name = "libhelper.so"
+    built = os.path.join(REPO, "Helpers", "target", "release", name)
+    if not os.path.isfile(built):
+        raise SystemExit(
+            f"Missing {built}. Build Helpers with cargo build --release before packing."
+        )
+    return [(built, ".")]
+
+
 osmium_bins, osmium_data, osmium_mods = bundle_osmium()
 hidden += osmium_mods
 datas += osmium_data
@@ -80,7 +129,8 @@ duckdb_bins, duckdb_data, duckdb_mods = bundle_duckdb()
 hidden += duckdb_mods
 hidden.append("duckdb")
 datas += duckdb_data
-bins = osmium_bins + duckdb_bins
+datas += bundle_compiler_source()
+bins = osmium_bins + duckdb_bins + bundle_rust_dll() + bundle_knox_compile()
 # SciPy's hooks collect the rest of the package. These are reached through
 # a lazy or private name, so a frozen build misses them unless named here.
 hidden += [

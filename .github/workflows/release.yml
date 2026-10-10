@@ -118,9 +118,16 @@ jobs:
         run: |
           set -eu
           sudo apt-get update
+          sudo apt-get install -y build-essential
           sudo apt-get install -y libnss3 libgtk-3-0 libasound2 || \
             sudo apt-get install -y libnss3 libgtk-3-0t64 libasound2t64
           sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Native libraries
+        shell: bash
+        run: bash desktop/build-native.sh
 
       - name: Python server
         shell: bash

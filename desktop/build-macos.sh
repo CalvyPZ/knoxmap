@@ -1,60 +1,23 @@
 #!/bin/bash
-# Linux and macOS programs, built inside Docker so a Windows PC can produce them.
-# The Mac file is a zip of KnoxMap.app. A dmg needs Apple's tools, which this
-# machine does not have. Python for Mac is a relocatable build plus wheels;
-# it is not run here.
+# macOS program, built inside Docker so a Windows PC can produce it.
+# The file is a zip of KnoxMap.app. A dmg needs Apple's tools, which this
+# machine does not have. Python for Mac is a relocatable build plus wheels.
+# The arm64 helper library must already be in desktop/native-macos.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y python3 python3-pip python3-venv python3-dev build-essential curl ca-certificates zip
+apt-get install -y python3 python3-pip python3-venv python3-dev curl ca-certificates zip
 
-rm -rf /tmp/build
-mkdir -p /tmp/build /knoxmap/release /knoxmap/releases
-tar -C /knoxmap -cf - \
-  --exclude=.git \
-  --exclude=.venv \
-  --exclude=node_modules \
-  --exclude=pybuild \
-  --exclude=release \
-  --exclude=releases \
-  --exclude=released \
-  --exclude=output \
-  --exclude=cache \
-  --exclude=logs \
-  --exclude=vendor \
-  --exclude=KnoxMap/worlded/src \
-  --exclude=KnoxMap/worlded/build \
-  --exclude=__pycache__ \
-  . | tar -C /tmp/build -xf -
+# shellcheck disable=SC1091
+. /knoxmap/desktop/stage-tree.sh
+stage_tree
 
 cd /tmp/build
 python3 -m venv /tmp/venv
 /tmp/venv/bin/pip install --upgrade pip
-/tmp/venv/bin/pip install -r KnoxMap/requirements.txt pyinstaller
-
-echo "Packing the Linux Python server..."
-/tmp/venv/bin/pyinstaller --noconfirm \
-  --distpath releases/temp --workpath releases/temp/work \
-  desktop/knoxmap-server.spec
-
-cd /tmp/build/desktop
-npm ci
-
-echo "Packing the Linux program..."
-node build.mjs --platform linux --arch x64
-cp -f /tmp/build/releases/KnoxMap-v*-linux.AppImage /knoxmap/releases/
-
-echo "Packing the Linux command line..."
-/tmp/venv/bin/pyinstaller --noconfirm \
-  --distpath /tmp/build/releases/temp --workpath /tmp/build/releases/temp/work-cli \
-  /tmp/build/desktop/knoxmap-cli.spec
-ver=$(awk '/^## [0-9]/{gsub(/\r/, ""); print $2; exit}' /tmp/build/docs/CHANGELOG.md)
-cp -f /tmp/build/releases/temp/knoxmap-cli "/knoxmap/releases/KnoxMap-v${ver}-linux-cli"
-chmod 755 "/knoxmap/releases/KnoxMap-v${ver}-linux-cli"
 
 echo "Packing the Mac Python tree..."
-rm -rf /tmp/build/releases/temp /tmp/build/releases/dist
 dest=/tmp/build/releases/temp/knoxmap-server
 mkdir -p "$dest"
 url=$(node << 'JS'
@@ -119,6 +82,26 @@ export PYTHONPATH="$ROOT:$SITE${PYTHONPATH:+:$PYTHONPATH}"
 exec "$ROOT/python/bin/python3" "$ROOT/knoxmap_cli.py" "$@"
 EOF
 chmod 755 "$dest/knoxmap-cli"
+src=/tmp/build/desktop/native-macos/libhelper.dylib
+if [ ! -f "$src" ]; then
+  echo "Missing the macOS library ${src}."
+  echo "build_macos.bat builds it before this script runs."
+  exit 1
+fi
+cp -f "$src" "$dest/libhelper.dylib"
+src_compile=/tmp/build/desktop/native-macos/knox-compile
+if [ ! -f "$src_compile" ]; then
+  echo "Missing the macOS compiler ${src_compile}."
+  echo "build_macos.bat builds it before this script runs."
+  exit 1
+fi
+cp -f "$src_compile" "$dest/knox-compile"
+chmod 755 "$dest/knox-compile"
+mkdir -p "$dest/compiler"
+tar -C /tmp/build/compiler -cf - --exclude=target . | tar -C "$dest/compiler" -xf -
+
+cd /tmp/build/desktop
+npm ci
 
 echo "Packing the Mac program..."
 node build.mjs --platform darwin --arch arm64
@@ -133,4 +116,4 @@ chmod 755 "$wrap/knoxmap-cli"
 for z in /knoxmap/releases/KnoxMap-v*-macos.zip; do
   (cd "$wrap" && zip -u "$z" knoxmap-cli)
 done
-echo "Linux and Mac files are in releases/"
+echo "Mac files are in releases/"

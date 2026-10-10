@@ -348,9 +348,9 @@ without opening a window (run these from the `KnoxMap` directory):
 ```
 
 `knoxmap_cli.py --help` lists `render-lots` and `validate` as well. The same
-build step is `python -m knoxbuild`. `build_releases.bat` packs a command-line
-program next to the window; the GitHub release of the window is the `.exe`,
-AppImage, or dmg.
+build step is `python -m knoxbuild`. `build_windows.bat`, `build_linux.bat`, and `build_macos.bat` each pack a
+command-line program next to that system's window. The GitHub release of the
+window is the `.exe`, AppImage, or dmg.
 
 The release file packs an Electron window together with Python. A checkout
 opens that window when `desktop/main.js` is present: `cd desktop`, `npm install`,
