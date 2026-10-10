@@ -417,8 +417,79 @@ def _area(box: tuple[float, float, float, float]) -> float:
     return max(0.0, north - south) * max(0.0, east - west)
 
 
+# A cell-rounded selection can clip a county line. This is the same slack
+# _uncovered already allowed when several children share a box.
+_COVER_SHARE = 0.98
+
+
+def _outline(region: Region):
+    """The published polygon, or None when this region is only a box."""
+    if getattr(region, "_outline_ready", False):
+        return region._outline
+    region._outline_ready = True
+    region._outline = None
+    region._prepared = None
+    raw = region.geometry
+    if not raw:
+        return None
+    try:
+        from shapely.geometry import shape
+        from shapely.prepared import prep
+
+        geom = shape(raw)
+        if not geom.is_valid:
+            geom = geom.buffer(0)
+        if geom.is_empty:
+            geom = None
+        region._outline = geom
+        if geom is not None:
+            region._prepared = prep(geom)
+    except Exception:
+        region._outline = None
+        region._prepared = None
+    return region._outline
+
+
+def _on_ground(region: Region, lat: float, lon: float) -> bool:
+    """True when this point is inside the extract, not merely its box."""
+    if not _contains_point(region.bbox, lat, lon):
+        return False
+    prepared = getattr(region, "_prepared", None) if getattr(region, "_outline_ready", False) else None
+    if not getattr(region, "_outline_ready", False):
+        _outline(region)
+        prepared = region._prepared
+    if prepared is None:
+        return True
+    from shapely.geometry import Point
+
+    return bool(prepared.covers(Point(lon, lat)))
+
+
+def _cover_share(region: Region, query: tuple[float, float, float, float]) -> float:
+    """How much of a coarse grid over the query this extract actually contains."""
+    if not _intersects(region.bbox, query):
+        return 0.0
+    qs, qw, qn, qe = query
+    if qn <= qs or qe <= qw:
+        return 0.0
+    steps = 8
+    hit = 0
+    total = steps * steps
+    for i in range(steps):
+        for j in range(steps):
+            lat = qs + (qn - qs) * (i + 0.5) / steps
+            lon = qw + (qe - qw) * (j + 0.5) / steps
+            if _on_ground(region, lat, lon):
+                hit += 1
+    return hit / total
+
+
+def _covers(region: Region, query: tuple[float, float, float, float]) -> bool:
+    return _cover_share(region, query) >= _COVER_SHARE
+
+
 def _uncovered(query: tuple[float, float, float, float], kids: list[Region]) -> float:
-    """Share of a coarse grid over the query that no child box contains."""
+    """Share of a coarse grid over the query that no child extract contains."""
     qs, qw, qn, qe = query
     if qn <= qs or qe <= qw or not kids:
         return 1.0
@@ -428,17 +499,21 @@ def _uncovered(query: tuple[float, float, float, float], kids: list[Region]) -> 
         for j in range(steps):
             lat = qs + (qn - qs) * (i + 0.5) / steps
             lon = qw + (qe - qw) * (j + 0.5) / steps
-            if not any(_contains_point(kid.bbox, lat, lon) for kid in kids):
+            if not any(_on_ground(kid, lat, lon) for kid in kids):
                 miss += 1
     return miss / (steps * steps)
 
 
 def cover(regions: list[Region],
           south: float, west: float, north: float, east: float) -> list[Region]:
-    """The smallest published regions whose boxes cover this selection.
+    """The smallest published regions whose extracts cover this selection.
 
-    One region when the box fits inside it. The children, each followed down
-    the same way, when the selection crosses them and they actually cover it.
+    The rectangular box around a county can contain the next county. Cheshire's
+    box contains Stoke-on-Trent, and the Cheshire extract does not, so a map
+    there came out as empty grass. Coverage is the published outline.
+
+    One region when the selection fits inside it. The children, each followed
+    down the same way, when the selection crosses them and they actually cover it.
     """
     query = (south, west, north, east)
     by_id = {region.id: region for region in regions}
@@ -447,9 +522,11 @@ def cover(regions: list[Region],
         if region.parent and region.parent in by_id:
             children.setdefault(region.parent, []).append(region)
 
-    containers = [region for region in regions if _contains(region.bbox, query)]
+    containers = [region for region in regions if _covers(region, query)]
     if not containers:
-        touching = [region for region in regions if _intersects(region.bbox, query)]
+        touching = [region for region in regions if _cover_share(region, query) > 0]
+        if not touching:
+            touching = [region for region in regions if _intersects(region.bbox, query)]
         if not touching:
             raise RuntimeError("No Geofabrik region covers that selection.")
         touching.sort(key=lambda region: _area(region.bbox))
@@ -462,7 +539,7 @@ def cover(regions: list[Region],
 
     def descend(node: Region) -> None:
         kids = [kid for kid in children.get(node.id, []) if _intersects(kid.bbox, query)]
-        holders = [kid for kid in kids if _contains(kid.bbox, query)]
+        holders = [kid for kid in kids if _covers(kid, query)]
         if holders:
             holders.sort(key=lambda region: _area(region.bbox))
             descend(holders[0])
