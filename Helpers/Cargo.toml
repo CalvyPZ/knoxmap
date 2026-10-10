@@ -1,6 +1,32 @@
 [workspace]
 resolver = "2"
-members = ["ways", "clip", "terrain", "buildings"]
+members = [".", "buildings", "terrain", "ways", "clip"]
+
+[package]
+name = "helper"
+version = "0.1.0"
+edition = "2021"
+# The oldest toolchain this builds with. Nothing here needs a newer one, so a
+# packager on an older rustup still produces the library.
+rust-version = "1.70"
+license = "MIT"
+publish = false
+
+[lib]
+# One shared library for the crates: helper.dll on Windows, libhelper.so on
+# Linux, libhelper.dylib on macOS. Python loads it from knoxbuild/native.py,
+# generator/terrain_native.py, generator/ways_native.py, and
+# generator/clip_native.py. The crates stay separate; this package only
+# exports their calls, because a shared library publishes symbols that are
+# defined in the library crate itself.
+name = "helper"
+crate-type = ["cdylib"]
+
+[dependencies]
+knox_buildings = { path = "buildings" }
+knox_terrain = { path = "terrain" }
+knox_ways = { path = "ways" }
+knox_clip = { path = "clip" }
 
 [profile.release]
 opt-level = 3
