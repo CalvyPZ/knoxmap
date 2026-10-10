@@ -1,0 +1,21 @@
+[package]
+name = "knox_buildings"
+version = "0.1.0"
+edition = "2021"
+# The oldest toolchain this builds with. Nothing here needs a newer one, so a
+# packager on an older rustup still produces the library.
+rust-version = "1.70"
+license = "MIT"
+publish = false
+
+[lib]
+# Linked into Helpers' helper.dll (libhelper.so, libhelper.dylib). The calls
+# Python uses are exported from that library, not from a second one.
+name = "knox_buildings"
+crate-type = ["rlib"]
+
+# No dependencies, on purpose. The release packager must build this offline on
+# whatever machine it runs on, and anything from crates.io is one more thing
+# that can be unreachable or yanked on the day a release is cut. Threads,
+# atomics and files are all in the standard library.
+[dependencies]
