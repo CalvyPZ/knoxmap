@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ways", "clip"]
+members = ["ways", "clip", "terrain"]
 
 [profile.release]
 opt-level = 3
