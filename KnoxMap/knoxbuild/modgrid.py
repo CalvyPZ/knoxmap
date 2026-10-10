@@ -59,6 +59,49 @@ def plan(width: int, height: int) -> list[ModTile]:
     return mods
 
 
+def fit_tiles(tiles: list[ModTile],
+              kept: set[tuple[int, int]] | None
+              ) -> list[tuple[ModTile, list[list[int]] | None]]:
+    """Drop mods the selection misses, and shrink the rest to whole cells.
+
+    `kept` is None when the selection is a rectangle: every cell stays.
+    Otherwise a cell is included only when it is wholly inside the shape, so
+    a diagonal that clips a cell does not pull that cell into the map. The
+    second value is the local cells to keep when the shrunk mod is not a
+    solid rectangle, and None when every cell of that mod is kept.
+    """
+    side = CELL_SIZE
+    out: list[tuple[ModTile, list[list[int]] | None]] = []
+    for tile in tiles:
+        cx0 = tile.x0 // side
+        cy0 = tile.y0 // side
+        ncx = max(1, tile.tiles_w // side)
+        ncy = max(1, tile.tiles_h // side)
+        if kept is None:
+            out.append((tile, None))
+            continue
+        inside = [(cx, cy)
+                  for cy in range(cy0, cy0 + ncy)
+                  for cx in range(cx0, cx0 + ncx)
+                  if (cx, cy) in kept]
+        if not inside:
+            continue
+        min_x = min(cx for cx, _cy in inside)
+        max_x = max(cx for cx, _cy in inside) + 1
+        min_y = min(cy for _cx, cy in inside)
+        max_y = max(cy for _cx, cy in inside) + 1
+        shrunk = ModTile(
+            row=tile.row, col=tile.col,
+            x0=min_x * side, y0=min_y * side,
+            tiles_w=(max_x - min_x) * side,
+            tiles_h=(max_y - min_y) * side,
+        )
+        local = [[cx - min_x, cy - min_y] for cx, cy in inside]
+        solid = len(local) == shrunk.cells_x * shrunk.cells_y
+        out.append((shrunk, None if solid else local))
+    return out
+
+
 def mod_name(parent: str, row: int, col: int) -> str:
     return f"{parent}__r{row}_c{col}"
 

@@ -1885,14 +1885,14 @@ def check_memory_guard(check) -> None:
 
         was, knoxapp.sys = knoxapp.sys, Small
         try:
-            big = knoxapp._too_big_for_memory(5400, 6000)
+            big = knoxapp._too_big_for_memory(24000, 24000)
             small = knoxapp._too_big_for_memory(1200, 1200)
         finally:
             knoxapp.sys = was
         check(big and "32-bit" in big and not small,
               "a map too big for a 32-bit Python is warned about, with a way out")
         knoxlog.memory_status = lambda: (15_000_000_000, 900_000_000, 140_000_000_000)
-        tight = knoxapp._too_big_for_memory(5400, 6000)
+        tight = knoxapp._too_big_for_memory(24000, 24000)
         check(tight and "free" in tight,
               "and so is one too big for the memory that is free")
     finally:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+import math
 import os
 # Before numpy or SciPy. See knoxmap.py: a worker pool deadlocks the draw.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -336,12 +337,19 @@ SAFE_NAME = re.compile(r"[^A-Za-z0-9_-]+")
 # Source cells per side handed to one WorldEd process. 4x4 keeps its peak
 # memory around a gigabyte; larger batches are faster per cell but climb.
 COMPILE_BATCH = 4
+# One WorldEd at a time for every 12 GB of installed memory, and never more
+# than two. A machine with less than 12 GB still runs one.
+COMPILE_GIB_PER_INSTANCE = 12
+COMPILE_MAX_AT_ONCE = 2
 
 # Big maps take minutes, so generation reports where it has got to and the page
 # polls /api/progress. Keyed by map name; the generate call owns its entry.
 _PROGRESS: dict[str, dict] = {}
 _COMPILE: dict[str, dict] = {}
 _PROGRESS_LOCK = threading.Lock()
+# Pace of the bar for the time-left figure. Kept off the progress dict so a
+# poll does not send the sample list to the window.
+_ETA_CLOCK: dict[str, dict] = {}
 # Compile (and anything else that outlives the request) so closing the window
 # can wait for PZWorldEd_cli to be killed instead of leaving it running.
 _JOB_THREADS: list[threading.Thread] = []
@@ -413,7 +421,10 @@ def _save_paint_view(image, name: str, max_longest: int = 2048) -> None:
     PAINT_DIR.mkdir(parents=True, exist_ok=True)
     path = PAINT_DIR / f"{name}.png"
     tmp = path.with_suffix(".png.tmp")
-    image.save(tmp, format="PNG")
+    # Fast compression. The picture is thrown away on the next frame, and a
+    # slow encode on the preview thread keeps the layout pool from handing
+    # the next building to a free core.
+    image.save(tmp, format="PNG", compress_level=1)
     tmp.replace(path)
 
 
@@ -450,6 +461,18 @@ def _mod_where(name: str) -> str:
     return _piece_where({"name": name})
 
 
+def _buildings_have_the_window(map_name: str) -> bool:
+    """True once building generation has taken the progress line.
+
+    Writing the terrain files can still be publishing a picture after that
+    pass has returned. That picture must not put "Writing map files" back
+    up, or paint over the buildings.
+    """
+    with _PROGRESS_LOCK:
+        stage = (_PROGRESS.get(map_name) or {}).get("stage") or ""
+    return stage not in ("", "mod", "regions", "osm", "overture", "render", "done")
+
+
 def _sync_draw_locked(map_name: str) -> None:
     """Headline, strip text, and fraction for the pieces being drawn.
 
@@ -459,6 +482,10 @@ def _sync_draw_locked(map_name: str) -> None:
     drawing is listed, with its grid coordinate and the step it is on.
     """
     prog = _PROGRESS.setdefault(map_name, {})
+    # A buildings run owns the headline. A preview that finishes after the
+    # terrain pass must not put the window back on "Writing map files".
+    if prog.get("stage") not in (None, "", "mod", "regions", "osm", "overture", "render"):
+        return
     pieces = prog.get("pieces") or []
     total = len(pieces) or 1
     done = 0
@@ -496,6 +523,33 @@ def _sync_draw_locked(map_name: str) -> None:
         prog.pop("wave", None)
 
 
+def _set_piece_border(map_name: str, piece_name: str, border: str,
+                      work: float | None = None) -> None:
+    """Colour of that mod's outline: wait, run (orange), or done (green).
+
+    `work` is how far through this mod the current pass is, from 0 to 1.
+    It only moves forward.
+    """
+    with _PROGRESS_LOCK:
+        for piece in (_PROGRESS.get(map_name) or {}).get("pieces") or []:
+            if piece.get("name") != piece_name:
+                continue
+            piece["border"] = border
+            if border == "done":
+                piece["work"] = 1.0
+                piece["finished"] = True
+                piece["step"] = ""
+            elif border == "run":
+                piece["finished"] = False
+                if work is not None:
+                    piece["work"] = max(float(piece.get("work") or 0), float(work))
+            elif border == "wait":
+                piece["finished"] = False
+                piece["step"] = ""
+                piece["work"] = 0
+            return
+
+
 def _touch_piece(map_name: str, index: int, step: str | None = None,
                  work: float | None = None, finished: bool = False) -> None:
     with _PROGRESS_LOCK:
@@ -505,12 +559,15 @@ def _touch_piece(map_name: str, index: int, step: str | None = None,
             if not piece.get("finished"):
                 if step is not None:
                     piece["step"] = step
+                    if step:
+                        piece["border"] = "run"
                 if work is not None:
                     piece["work"] = max(float(piece.get("work") or 0), float(work))
             if finished:
                 piece["finished"] = True
                 piece["work"] = 1.0
                 piece["step"] = ""
+                piece["border"] = "done"
         _sync_draw_locked(map_name)
 
 
@@ -564,6 +621,74 @@ def _bbox_corners(mod_dir: Path):
     return [[north, west], [north, east], [south, east], [south, west]]
 
 
+def _install_saved_preview(piece_dir: Path) -> int:
+    """Put this piece's saved picture where the window already looks.
+
+    Returns 1 when a picture is there. The live cache is not part of the
+    project, so a map opened on another PC has nothing to show until this
+    copies the preview that was written beside the piece.
+    """
+    name = piece_dir.name
+    src = piece_dir / f"{name}_preview.png"
+    try:
+        PAINT_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0
+    dest = PAINT_DIR / f"{name}.png"
+    try:
+        if src.is_file():
+            if not dest.is_file() or src.stat().st_mtime > dest.stat().st_mtime:
+                shutil.copy2(src, dest)
+            return 1
+        if dest.is_file():
+            return 1
+        ground = piece_dir / f"{name}.bmp"
+        if not ground.is_file():
+            ground = piece_dir / f"{name}_ground_base.bmp"
+        if not ground.is_file():
+            return 0
+        from PIL import Image
+        with Image.open(ground) as image:
+            _save_paint_view(image.convert("RGB"), name)
+        return 1
+    except OSError:
+        return 1 if dest.is_file() else 0
+
+
+def _seed_saved_previews(map_name: str, map_dir: Path) -> None:
+    """Lay every finished mod on the preview, not the one piece being built."""
+    info = _piece_info(map_dir)
+    shown = []
+    for piece_dir in _pack_mod_dirs(map_dir) or [map_dir]:
+        piece_info = _piece_info(piece_dir)
+        corners = _piece_corners(piece_dir, piece_info)
+        if not corners:
+            continue
+        row = col = None
+        match = _MOD_AT.search(piece_dir.name)
+        if match:
+            row, col = int(match.group(1)), int(match.group(2))
+        shown.append({
+            "name": piece_dir.name,
+            "row": row,
+            "col": col,
+            "corners": corners,
+            "rev": _install_saved_preview(piece_dir),
+            "work": 1,
+            "finished": True,
+            "step": "",
+            "border": "done",
+        })
+    if not shown:
+        return
+    fields = {"pieces": shown}
+    try:
+        fields["rotation"] = round(float(info.get("rotation") or 0), 1)
+    except (TypeError, ValueError):
+        pass
+    _set_progress(map_name, **fields)
+
+
 def _ensure_paint_piece(map_name: str, mod_dir: Path) -> None:
     """A piece entry the window can hang a build preview on.
 
@@ -574,7 +699,7 @@ def _ensure_paint_piece(map_name: str, mod_dir: Path) -> None:
         pieces = _PROGRESS.setdefault(map_name, {}).setdefault("pieces", [])
         if any(piece.get("name") == mod_dir.name for piece in pieces):
             return
-    corners = _bbox_corners(mod_dir)
+    corners = _piece_corners(mod_dir, _piece_info(mod_dir))
     if not corners:
         return
     with _PROGRESS_LOCK:
@@ -630,24 +755,129 @@ def api_stop():
     return jsonify({"stopping": True, "mapName": name})
 
 
+def _eta_seconds(name: str, now: float, fraction: float, started: float) -> float | None:
+    """Seconds left, from the pace the bar has actually been moving at.
+
+    ``elapsed * (1 - done) / done`` treats the bar as a clock. The bar runs
+    ahead through the quick stages and then sits still through paving and
+    the bridge railings, so a twenty-minute guess becomes "a minute left"
+    and stays there while that stage is still going. This follows the
+    slower of the recent pace and the whole run, and a new figure only
+    eases the old one aside. While the bar is not moving, the last figure
+    counts down, and once that guess has run out it grows with the wait.
+    """
+    fraction = max(0.0, min(1.0, fraction))
+    elapsed = max(0.0, now - started)
+    if fraction >= 1:
+        return 0.0
+    if fraction <= 0 or elapsed < 12:
+        return None
+
+    clock = _ETA_CLOCK.get(name)
+    if clock is None or clock.get("started") != started:
+        clock = {"started": started, "samples": [], "eta": None, "at": None,
+                 "stall": False}
+        _ETA_CLOCK[name] = clock
+    samples: list = clock["samples"]
+    if (not samples or now - samples[-1][0] >= 2.0
+            or fraction > samples[-1][1] + 1e-6):
+        samples.append((now, fraction))
+    horizon = now - 180.0
+    while len(samples) > 3 and samples[0][0] < horizon:
+        samples.pop(0)
+
+    # rate is fraction per second. stalled means a full window with the bar
+    # sitting still, which is not the same as "too early to say".
+    rate = None
+    stalled = False
+    if len(samples) >= 2:
+        t1, f1 = samples[-1]
+        t0, f0 = samples[0]
+        for ts, fs in samples:
+            if t1 - ts >= 40.0:
+                t0, f0 = ts, fs
+                break
+        dt = t1 - t0
+        df = f1 - f0
+        if dt >= 10.0 and df >= 0.001:
+            rate = df / dt
+        elif dt >= 40.0 and df < 0.001:
+            stalled = True
+
+    life = fraction / elapsed if elapsed >= 20.0 else None
+    prev = clock.get("eta")
+    prev_at = clock.get("at")
+
+    def remember(eta: float) -> float:
+        clock["eta"] = max(0.0, eta)
+        clock["at"] = now
+        return clock["eta"]
+
+    if stalled:
+        if prev is None or prev_at is None:
+            return None
+        if not clock.get("stall"):
+            clock["stall"] = True
+            clock["stall_eta"] = prev
+            clock["stall_at"] = prev_at
+        base = float(clock.get("stall_eta")
+                     if clock.get("stall_eta") is not None else prev)
+        origin = float(clock.get("stall_at") or prev_at)
+        aged = base - (now - origin)
+        if aged > 0:
+            return remember(aged)
+        return remember((now - origin) - base)
+
+    if rate is None:
+        if prev is not None and prev_at is not None:
+            return remember(max(0.0, prev - (now - prev_at)))
+        if life is None or fraction >= 0.85:
+            return None
+        return remember(min((1.0 - fraction) / life, 8 * 3600.0))
+
+    clock["stall"] = False
+    clock["stall_eta"] = None
+    pace = rate if life is None else min(rate, life)
+    raw = min(max(0.0, (1.0 - fraction) / pace), 8 * 3600.0)
+    if prev is None or prev_at is None:
+        return remember(raw)
+    aged = prev - (now - prev_at)
+    delta = raw - aged
+    step = max(0.0, now - prev_at)
+    # Behind: catch up over about half a minute. A smaller number has to
+    # keep being true for several minutes before the window believes it,
+    # so one jump in the bar cannot turn twenty minutes into one.
+    tau = 35.0 if delta > 0 else 240.0
+    blend = 1.0 - math.exp(-step / tau)
+    return remember(aged + delta * blend)
+
+
 @app.route("/api/progress")
 def api_progress():
+    name = request.args.get("map", "")
+    now = time.time()
     with _PROGRESS_LOCK:
-        snap = copy.deepcopy(_PROGRESS.get(request.args.get("map", ""), {}))
-    # Elapsed and the time left are worked out here, on the poll, so a stage
-    # that sits on one counter still moves the clock. `started` is when the
-    # long pass began: drawing the pieces, or generating the buildings.
-    if snap:
-        snap["now"] = time.time()
-    started = snap.get("started")
-    fraction = snap.get("fraction")
-    if (snap.get("stage") not in ("stopping", "stopped", "done", "error", None)
-            and isinstance(started, (int, float))
-            and isinstance(fraction, (int, float))):
-        elapsed = max(0.0, time.time() - float(started))
-        snap["elapsed"] = elapsed
-        if 0 < float(fraction) < 1 and elapsed >= 1:
-            snap["eta"] = elapsed * (1.0 - float(fraction)) / float(fraction)
+        snap = copy.deepcopy(_PROGRESS.get(name, {}))
+        if snap:
+            snap["now"] = now
+        started = snap.get("started")
+        fraction = snap.get("fraction")
+        stage = snap.get("stage")
+        if stage in ("done", "stopped", "error"):
+            _ETA_CLOCK.pop(name, None)
+        elif (stage not in ("stopping", None)
+              and isinstance(started, (int, float))
+              and isinstance(fraction, (int, float))):
+            # Worked out on the poll, so a stage that sits on one counter
+            # still moves the clock. `started` is when this pass began.
+            snap["elapsed"] = max(0.0, now - float(started))
+            if float(fraction) >= 1:
+                snap["eta"] = 0
+            elif float(fraction) > 0:
+                eta = _eta_seconds(name, now, float(fraction), float(started))
+                snap["eta"] = None if eta is None else round(eta, 1)
+            else:
+                snap["eta"] = None
     return jsonify(snap)
 
 
@@ -772,8 +1002,12 @@ def tile(z: int, x: int, y: int):
         # the server behind the page's back. Waiting on that round trip made
         # panning back over somewhere already visited as slow as the first
         # time, for a picture of a street that had not changed in a week.
+        # Not while a map is being drawn or buildings are being generated.
+        # That check opens a TLS connection on a side thread, and SciPy is
+        # in the middle of the build on another. On this Python those two
+        # waits never return, so looking around freezes the window for good.
         key = (z, x, y)
-        if key not in _TILE_REVALIDATING:
+        if not _generation_busy() and key not in _TILE_REVALIDATING:
             _TILE_REVALIDATING.add(key)
 
             def revalidate():
@@ -784,6 +1018,10 @@ def tile(z: int, x: int, y: int):
 
             threading.Thread(target=revalidate, name=f"tile-{z}-{x}-{y}",
                              daemon=True).start()
+    elif not fresh and _generation_busy():
+        # A tile we have never stored. Fetching it now would open TLS while
+        # the build still holds SciPy, and that wait does not return.
+        return ("", 404)
     elif not fresh and not _fetch_tile(z, x, y, path, meta, info):
         return ("", 502)
     resp = send_file(path, mimetype="image/png")
@@ -1021,12 +1259,51 @@ def _normalise_bbox(south: float, west: float, north: float,
     return (south, west, north, east), None
 
 
-# Drawing a map holds several pictures of it at once - the ground, the
-# vegetation, the masks the gardens and the paving are worked out from. Measured
-# on real towns (a 2400 x 2400 Paris peaked at 0.54 GB, a 1200 x 900 Manhattan
-# at 0.12 GB), that is about this much, plus what the program itself takes.
-BYTES_PER_TILE = 80
+# What one piece holds while it is drawn, apart from the program itself.
+# The ground is a band of four cells (Helpers/terrain piece.rs FLUSH_CELLS)
+# plus the neighbour halo the garden pass reads (renderer.GARDEN_REACH_TILES),
+# at five bytes a tile of that window: palette indexes for ground and
+# vegetation, the biome, the woodland mask, and a byte for the water bits.
+# The biome plane is the whole piece, and so is the spawn map at a tenth of
+# the scale. One band of class bytes is in hand with the window. After the
+# window is dropped, Python copies the biome plane twice more — once into
+# bytes, once into the image — while the library still holds it, and that
+# copy is the larger moment on a full mod.
+_DRAW_CELL = 300
+_DRAW_FLUSH_CELLS = 4
+_DRAW_HALO = 18
+_DRAW_SPAWN_SCALE = 10
+_DRAW_WINDOW_BPP = 5
+_DRAW_BIOME_COPIES = 3
+# What the program itself takes, on top of one piece.
 BASE_BYTES = 150e6
+
+
+def _piece_bytes(tiles_w: float, tiles_h: float) -> float:
+    """Bytes of pictures one piece holds, from the band the library draws.
+
+    The same sums as piece::working_bytes, then the biome copies. A full mod
+    of 7500 tiles on a side peaks at 168,750,000 bytes, which is the three
+    biome planes, not the 113,362,500 byte window.
+    """
+    width = max(0, int(tiles_w))
+    height = max(0, int(tiles_h))
+    if width == 0 or height == 0:
+        return 0.0
+    scale = _DRAW_SPAWN_SCALE
+    band = _DRAW_CELL * _DRAW_FLUSH_CELLS
+    if scale > 1:
+        band = max(scale, (band // scale) * scale)
+    band = min(band, height)
+    extra = _DRAW_HALO + 1
+    window = min(height, band + extra * 2)
+    pictures = window * width * _DRAW_WINDOW_BPP
+    klass = band * width
+    biome = height * width
+    spawn = max(1, width // scale) * max(1, height // scale) * 3
+    working = pictures + klass + biome + spawn
+    handoff = biome * _DRAW_BIOME_COPIES
+    return float(max(working, handoff))
 
 
 def _too_big_for_memory(tiles_w: float, tiles_h: float) -> str | None:
@@ -1036,7 +1313,7 @@ def _too_big_for_memory(tiles_w: float, tiles_h: float) -> str | None:
     of a few square kilometres needs more: it used to get halfway through and
     fail with "MemoryError".
     """
-    needed = tiles_w * tiles_h * BYTES_PER_TILE + BASE_BYTES
+    needed = _piece_bytes(tiles_w, tiles_h) + BASE_BYTES
     status = knoxlog.memory_status()
     if not status:
         return None
@@ -1064,14 +1341,33 @@ def _memory_gib() -> float:
 def _parallel_cap() -> int:
     """How many full mods this PC may draw at once.
 
-    Installed memory, in gibibytes, divided by 4.75, with the fraction
-    dropped. A full mod is about 4.65 GB; 4.75 leaves a little spare.
-    A machine with less than that still draws one piece.
+    Installed memory divided by one full mod's picture peak, with five
+    percent spare, and the fraction dropped. That peak is about 0.17 GB
+    (see _piece_bytes). A machine with less than that still draws one piece.
     """
     status = knoxlog.memory_status()
     if not status or status[0] <= 0:
         return 1
-    return max(1, int(_memory_gib() / 4.75))
+    side = modgrid.mod_side_tiles()
+    share = _piece_bytes(side, side) * 1.05
+    if share <= 0:
+        return 1
+    return max(1, int(status[0] / share))
+
+
+def _compile_slots(count: int) -> int:
+    """How many mods may compile at the same time.
+
+    Each running mod is one WorldEd process. One of those per 12 GB of
+    installed memory, and never more than two. A machine with less than
+    12 GB, or one whose memory cannot be read, still compiles one mod.
+    """
+    count = max(0, int(count))
+    if count <= 1:
+        return count
+    gib = _memory_gib()
+    by_memory = max(1, int(gib / COMPILE_GIB_PER_INSTANCE)) if gib > 0 else 1
+    return max(1, min(count, COMPILE_MAX_AT_ONCE, by_memory))
 
 
 def _terrain_workers(count: int, requested) -> int:
@@ -1089,6 +1385,207 @@ def _terrain_workers(count: int, requested) -> int:
         chosen = cap
     chosen = min(chosen, cap)
     return max(1, min(chosen, max(1, count)))
+
+
+# Settings that change the drawn ground. Anything else (room size, how often
+# a block of flats appears) is decided while the buildings are laid out, and
+# a restart can change those without downloading the regional map again.
+_TERRAIN_SETTINGS = (
+    "align_streets", "rotate_degrees", "straight_roads",
+    "tree_density", "spawn_density", "fill_gaps",
+)
+
+
+def _near(a, b, tol: float = 1e-4) -> bool:
+    try:
+        return abs(float(a) - float(b)) <= tol
+    except (TypeError, ValueError):
+        return False
+
+
+def _json_near(a, b) -> bool:
+    """Same JSON value, with a little slack on coordinates Leaflet round-trips."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return _near(a, b, 1e-4)
+    if isinstance(a, dict) and isinstance(b, dict):
+        return set(a) == set(b) and all(_json_near(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_json_near(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _terrain_settings_match(saved: Settings, requested: Settings) -> bool:
+    return all(_near(getattr(saved, key), getattr(requested, key), 1e-6)
+               for key in _TERRAIN_SETTINGS)
+
+
+# Settings that change the rooms. Zombie counts do not: those can be
+# recounted without laying the buildings out again.
+_LAYOUT_SETTINGS = (
+    "seed", "true_map", "min_size", "max_size", "room_size",
+    "square_buildings", "max_levels", "apartment_footprint",
+    "apartment_chance", "style_oddity", "neighbourhood_tiles",
+    "guaranteed_rifle", "parking_density",
+)
+
+
+def _layout_settings_match(saved: Settings, requested: Settings) -> bool:
+    return all(_near(getattr(saved, key), getattr(requested, key), 1e-6)
+               for key in _LAYOUT_SETTINGS)
+
+
+def _piece_layout_matches(piece: Path, settings: Settings) -> bool:
+    """True when this piece was laid out with the same room settings."""
+    path = _settings_path(piece)
+    if not path.is_file():
+        return False
+    return _layout_settings_match(_load_settings(piece), settings)
+
+
+def _rooms_already_laid(piece: Path, settings: Settings) -> bool:
+    """True when this piece's building pass finished and still matches.
+
+    A stamp from an older KnoxMap does not count, and neither does a .pzw
+    left behind with no rooms. The piece that was in the middle of a pass
+    has rooms on disk and no stamp; that one is continued, not skipped.
+    """
+    if not _piece_layout_matches(piece, settings):
+        return False
+    ran = (mapstate.read(str(piece)).get("stages") or {}).get("build") or {}
+    if not isinstance(ran, dict) or ran.get("guessed"):
+        return False
+    version = str(ran.get("version") or "0")
+    if mapstate._parse(version) < mapstate._parse(mapstate.CHANGED_IN["build"]):
+        return False
+    if not (piece / f"{piece.name}.pzw").is_file():
+        return False
+    folder = piece / "buildings"
+    return folder.is_dir() and any(folder.glob("*.tbx"))
+
+
+def _piece_restart_plan(piece: Path, settings: Settings) -> str:
+    """Whether a restart skips this piece, continues it, or lays it out again."""
+    if _rooms_already_laid(piece, settings):
+        return "done"
+    if _rooms_to_keep(piece, settings):
+        return "resume"
+    return "rebuild"
+
+
+def _plan_pieces(targets: list[Path], settings: Settings) -> list[str]:
+    """Check every piece at the same time."""
+    if len(targets) <= 1:
+        return [_piece_restart_plan(piece, settings) for piece in targets]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=len(targets),
+                            thread_name_prefix="knox-mod-check") as pool:
+        return list(pool.map(
+            lambda piece: _piece_restart_plan(piece, settings), targets))
+
+
+def _rooms_to_keep(piece: Path, settings: Settings) -> bool:
+    """True when a pass stopped after writing some of this piece's rooms."""
+    if not _piece_layout_matches(piece, settings):
+        return False
+    folder = piece / "buildings"
+    return folder.is_dir() and any(folder.glob("*.tbx"))
+
+
+def _bbox_near(saved, south: float, west: float, north: float, east: float) -> bool:
+    if not isinstance(saved, dict):
+        return False
+    try:
+        return (_near(saved["south"], south) and _near(saved["west"], west)
+                and _near(saved["north"], north) and _near(saved["east"], east))
+    except (KeyError, TypeError):
+        return False
+
+
+def _piece_drawn(path: Path) -> bool:
+    """The files a finished terrain pass leaves in one piece."""
+    name = path.name
+    return all((path / f"{name}{suffix}").is_file() for suffix in (
+        "_info.json", "_buildings.geojson", ".bmp"))
+
+
+def _listed_pieces(map_dir: Path, info: dict) -> list[Path] | None:
+    """Piece folders named by the pack, or the map folder when it is one piece."""
+    mods = info.get("mods") or []
+    if not mods:
+        return [map_dir]
+    root = str(OUTPUT_DIR.resolve())
+    found = []
+    for item in mods:
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        if not isinstance(name, str) or not name or name != SAFE_NAME.sub("_", name):
+            return None
+        path = (OUTPUT_DIR / name).resolve()
+        if not str(path).startswith(root + os.sep) or not path.is_dir():
+            return None
+        found.append(path)
+    return found
+
+
+def _terrain_files_ready(map_dir: Path, info: dict) -> bool:
+    pieces = _listed_pieces(map_dir, info)
+    return bool(pieces) and all(_piece_drawn(path) for path in pieces)
+
+
+def _reusable_generate(map_dir: Path, map_name: str, settings: Settings,
+                       south: float, west: float, north: float, east: float,
+                       meters_per_tile: float, shape) -> dict | None:
+    """The map already drawn for this area, or None when Generate must redraw it.
+
+    The regional extracts live in the app cache, not in the project. A map
+    moved to another PC still has its terrain, and downloading those extracts
+    again is what filled the disk the last time. Buildings read the files
+    beside the map, so a restart that is still on the same area continues
+    there.
+    """
+    # A guessed stamp is a project whose record was never written (the disk
+    # filled) or one from before stamps. The files on disk are the terrain.
+    # A real stamp from an older KnoxMap still has to be drawn again.
+    ran = mapstate.done(str(map_dir)).get("generate") or {}
+    if not ran.get("guessed") and "generate" in mapstate.needs(str(map_dir)):
+        return None
+    info_path = map_dir / f"{map_name}_info.json"
+    if not info_path.is_file():
+        return None
+    try:
+        with open(info_path, encoding="utf-8") as fh:
+            info = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(info, dict):
+        return None
+    if not _bbox_near(info.get("bbox"), south, west, north, east):
+        return None
+    if not _near(info.get("meters_per_tile"), meters_per_tile, 1e-6):
+        return None
+    if not _json_near(info.get("shape"), shape):
+        return None
+    if _settings_path(map_dir).is_file() and not _terrain_settings_match(
+            _load_settings(map_dir), settings):
+        return None
+    if not _terrain_files_ready(map_dir, info):
+        return None
+    summary = _map_summary(map_dir)
+    summary.update({
+        "reused": True,
+        "osmSeconds": 0,
+        "fromOverture": info.get("from_overture") or 0,
+        "fromStreets": 0,
+        "overtureError": "",
+        "heavy": [],
+        "modTiles": modgrid.mod_side_tiles(),
+        "modCells": modgrid.MOD_CELLS,
+    })
+    return summary
 
 
 @app.route("/api/generate", methods=["POST"])
@@ -1163,6 +1660,18 @@ def generate():
     # use the same ones without the page having to send them again - and so a
     # map from last week can be reproduced exactly.
     settings = Settings.from_dict(data.get("settings"))
+    reused = _reusable_generate(map_dir, map_name, settings, south, west, north, east,
+                                meters_per_tile, shape)
+    if reused is not None:
+        # Building knobs may have changed. The ground they stand on has not.
+        _save_settings(map_dir, settings)
+        reused["settings"] = settings.to_dict()
+        _set_progress(map_name, stage="done", view="", sections=[],
+                      message="Generating buildings")
+        _seed_saved_previews(map_name, map_dir)
+        log.info("generate %s: terrain already on disk, continuing without "
+                 "the regional map download", map_name)
+        return jsonify(reused)
     _save_settings(map_dir, settings)
 
     # The daily extracts have to cover the map at any turn, because the street
@@ -1179,7 +1688,9 @@ def generate():
     region_steps = {
         "check": "Checking daily map extracts",
         "download": "Downloading a daily map extract",
+        "shores": "Finding harbours in the daily",
         "filter": "Picking the roads and buildings in the selected area",
+        "cut": "Cutting the selected area",
     }
 
     def _region_progress(name, index, total, step, download=None):
@@ -1203,16 +1714,35 @@ def generate():
 
     rotation = float(settings.rotate_degrees)
     if settings.align_streets:
+        def _read_roads(done, total_bytes, speed=0.0):
+            shown = {"done": done, "total": total_bytes, "speed": speed}
+            _set_progress(map_name, stage="regions", done=0, total=1,
+                          message="Reading the roads in the selected area",
+                          download=shown)
+
+        _set_progress(map_name, stage="regions", done=0, total=1,
+                      message="Reading the roads in the selected area",
+                      download={"done": 0, "total": 0, "speed": 0})
         try:
             highways = localosm.features_for_bbox(
                 str(BASE_DIR), regions, *bbox, highways_only=True,
-                should_stop=_stopper(map_name))
+                should_stop=_stopper(map_name), on_bytes=_read_roads)
         except knoxstop.Stopped:
             return _stopped(map_name, "generate")
         except Exception as exc:
             _set_progress(map_name, stage="error", message=str(exc))
             return failed(f"OSM query failed: {exc}", 502, exc)
-        angle, strength = renderer.dominant_road_angle(highways, *bbox)
+
+        def _line_up(done, total_n):
+            shown = {"done": done, "total": total_n, "speed": 0}
+            _set_progress(map_name, stage="regions", done=0, total=1,
+                          message="Lining the map up with the streets",
+                          download=shown if total_n else {"done": 0, "total": 0, "speed": 0})
+
+        _set_progress(map_name, stage="regions", done=0, total=1,
+                      message="Lining the map up with the streets",
+                      download={"done": 0, "total": 0, "speed": 0})
+        angle, strength = renderer.dominant_road_angle(highways, *bbox, on_step=_line_up)
         if strength >= renderer.ALIGN_MIN_STRENGTH and abs(angle) >= 0.5:
             rotation = -angle + float(settings.rotate_degrees)
         del highways
@@ -1222,16 +1752,27 @@ def generate():
         south, west, north, east, meters_per_tile, rotation)
     tiles = modgrid.plan(parent.width, parent.height)
     cells_x, cells_y = parent.cell_grid()
+    # A drawn outline keeps only cells it covers completely. A diagonal that
+    # clips a cell does not render that cell, and a mod with none of its
+    # cells covered is not drawn at all.
+    fitted = modgrid.fit_tiles(tiles, renderer.cells_fully_inside(parent, shape))
+    if not fitted:
+        return jsonify({"error": "That selection does not cover a whole cell, "
+                                 "so there is nothing to draw."}), 400
     pack_origin = choose_origin(str(map_dir), cells_x, cells_y)
-    step = modgrid.mod_side_tiles() // CELL_SIZE
     planned = []
-    for tile in tiles:
-        planned.append({
+    windows = []
+    for tile, local in fitted:
+        record = {
             "name": modgrid.mod_name(map_name, tile.row, tile.col),
             "row": tile.row, "col": tile.col,
-            "world_origin": [pack_origin[0] + tile.col * step,
-                             pack_origin[1] + tile.row * step],
-        })
+            "world_origin": [pack_origin[0] + tile.x0 // CELL_SIZE,
+                             pack_origin[1] + tile.y0 // CELL_SIZE],
+        }
+        if local is not None:
+            record["keep_cells"] = local
+        planned.append(record)
+        windows.append(parent.window(tile.x0, tile.y0, tile.tiles_w, tile.tiles_h))
     old = modgrid.read_pack(str(map_dir)) or {}
     keep = {item["name"] for item in planned}
     for item in old.get("mods") or []:
@@ -1250,9 +1791,6 @@ def generate():
     shown_result = None
     shown = planned[0]["name"]
     osm_time = time.time() - t0
-    windows = [
-        parent.window(tile.x0, tile.y0, tile.tiles_w, tile.tiles_h) for tile in tiles
-    ]
     # OpenStreetMap first. Overture is asked only for the patches it left
     # empty, once, and that answer is what every piece reads.
     overture_rows: list = []
@@ -1267,13 +1805,15 @@ def generate():
             cover = parent.latlon_bbox()
             mapped = localosm.features_for_bbox(
                 str(BASE_DIR), regions, *cover, should_stop=_stopper(map_name))
-            gaps = overture.gap_rects(overture.osm_building_boxes(mapped), cover)
+            # Keep this list off `gaps`. That name is the running count of
+            # buildings Overture added, and the pieces add into it later.
+            gap_boxes = overture.gap_rects(overture.osm_building_boxes(mapped), cover)
             del mapped
-            if not gaps:
+            if not gap_boxes:
                 log.info("overture %s: OpenStreetMap already covers this map", map_name)
                 overture_note = {"skipped": True}
             else:
-                places = f"{len(gaps)} area" + ("" if len(gaps) == 1 else "s")
+                places = f"{len(gap_boxes)} area" + ("" if len(gap_boxes) == 1 else "s")
                 _set_progress(map_name, stage="overture",
                               message="Fetching building footprints",
                               view="Fetching building footprints",
@@ -1289,9 +1829,9 @@ def generate():
 
                 overture_rows, overture_note = overture.prepare(
                     cover, str(map_dir), map_name, should_stop=_stopper(map_name),
-                    gaps=gaps, progress=_overture_download)
+                    gaps=gap_boxes, progress=_overture_download)
                 log.info("overture %s: %d buildings across %d areas%s",
-                         map_name, len(overture_rows), len(gaps),
+                         map_name, len(overture_rows), len(gap_boxes),
                          " from the copy beside the map" if overture_note.get("cached") else "")
         except knoxstop.Stopped:
             return _stopped(map_name, "generate")
@@ -1303,10 +1843,10 @@ def generate():
                      and not overture_note.get("skipped"))
     # The window lays these out before any of them is drawn, then fills each
     # one in as the bitmap is painted.
-    _set_progress(map_name, stage="mod", done=0, total=len(tiles),
+    _set_progress(map_name, stage="mod", done=0, total=len(planned),
                   message="Drawing a map piece",
                   view="Drawing a map piece",
-                  detail=f"0 of {len(tiles)} finished",
+                  detail=f"0 of {len(planned)} finished",
                   fraction=0.0,
                   started=time.time(),
                   rotation=round(rotation, 1),
@@ -1318,14 +1858,19 @@ def generate():
                       "rev": 0,
                       "work": 0,
                       "step": "",
+                      "border": "wait",
                   } for record, window in zip(planned, windows)])
     street_houses = 0
     # One thread per piece, up to one per core. Each thread walks that piece
     # the whole way: the cut, the missing buildings, the terrain, the files.
     # The pieces that do not fit in this wave wait, then take a free core.
-    slots = _terrain_workers(len(tiles), data.get("parallel"))
+    slots = _terrain_workers(len(planned), data.get("parallel"))
     log.info("generate %s: %d map pieces, %d at once (memory allows %d)",
              map_name, len(planned), slots, _parallel_cap())
+    # Each piece's library session takes every core but one. That core stays
+    # with the rest of the program. Several pieces in flight share the
+    # machine by running at once, rather than by each being handed a fraction
+    # of the cores up front.
     try:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1341,7 +1886,7 @@ def generate():
                 if settings.fill_gaps:
                     from generator import overture
                     _touch_piece(map_name, index - 1,
-                                 step="Filling in missing buildings", work=0.04)
+                                 step="Filling in missing buildings", work=0.03)
                     if overture_note.get("why") or overture_note.get("error"):
                         piece_gaps = dict(overture_note)
                         piece_gaps.setdefault("added", 0)
@@ -1362,10 +1907,12 @@ def generate():
                 log.info("generate %s: drawing %s (%d of %d), %d features",
                          map_name, record["name"], index, len(planned), len(features))
                 _touch_piece(map_name, index - 1,
-                             step="Drawing the ground", work=0.08)
+                             step="Drawing the ground", work=0.04)
 
                 def on_view(image, stage=None, work=None,
                             _name=record["name"], _index=index - 1):
+                    if _buildings_have_the_window(map_name):
+                        return
                     if stage is not None or work is not None:
                         _touch_piece(map_name, _index, step=stage, work=work)
                     if image is None:
@@ -1376,6 +1923,10 @@ def generate():
                         return
                     _bump_paint(map_name, _index)
 
+                raw_keep = record.get("keep_cells")
+                keep_cells = None
+                if raw_keep:
+                    keep_cells = {(int(cell[0]), int(cell[1])) for cell in raw_keep}
                 drawn = renderer.render(
                     features, piece[0], piece[1], piece[2], piece[3],
                     meters_per_tile=meters_per_tile,
@@ -1391,6 +1942,7 @@ def generate():
                     proj=window,
                     on_view=on_view,
                     file_workers=1 if slots > 1 else None,
+                    keep_cells=keep_cells,
                 )
                 _note_piece_layers(map_name, record["name"], mod_dir)
                 _stamp_mod(mod_dir, record, map_name, overture=used_overture)
@@ -1434,7 +1986,7 @@ def generate():
     except knoxstop.Stopped:
         return _stopped(map_name, "generate")
     except MemoryError:
-        need = modgrid.mod_side_tiles() ** 2 * BYTES_PER_TILE + BASE_BYTES
+        need = _piece_bytes(modgrid.mod_side_tiles(), modgrid.mod_side_tiles()) + BASE_BYTES
         _set_progress(map_name, stage="error", message="ran out of memory")
         return failed(
             f"A map piece ran out of memory while it was being drawn. One piece "
@@ -1451,7 +2003,7 @@ def generate():
     if shown_result is not None:
         result = shown_result
         _write_readme(map_dir, map_name, result)
-    _set_progress(map_name, stage="done")
+    _set_progress(map_name, stage="done", view="", sections=[])
     mapstate.stamp(str(map_dir), "generate")
     from_addresses = 0
     try:
@@ -1513,6 +2065,8 @@ def _stamp_mod(mod_dir: Path, record: dict, parent: str, overture: bool = False)
     info["world_origin"] = record["world_origin"]
     info["mod_row"] = record["row"]
     info["mod_col"] = record["col"]
+    if record.get("keep_cells") is not None:
+        info["keep_cells"] = record["keep_cells"]
     if overture:
         info["overture"] = True
     with open(path, "w", encoding="utf-8") as fh:
@@ -1580,6 +2134,9 @@ def _map_summary(map_dir: Path) -> dict:
         "modCount": len(info.get("mods") or []),
         "regions": info.get("regions") or [],
         "files": _summary_files(map_dir, info),
+        # Drawn ground is in the project. Generate can continue at buildings
+        # without downloading the regional extracts again.
+        "terrainReady": _terrain_files_ready(map_dir, info),
     }
 
 
@@ -1637,20 +2194,59 @@ def _find_project(start: Path) -> Path | None:
     return None
 
 
+def _import_pack_pieces(src: Path) -> None:
+    """Copy a pack's piece folders in beside the project.
+
+    Each piece is a sibling of the folder the window calls the project, and
+    that sibling is where the drawn map and the building files are. Copying
+    the parent alone leaves them behind, and the next Generate then downloads
+    the regional map as if the terrain had never been drawn.
+    """
+    data = modgrid.read_pack(str(src))
+    if not data:
+        return
+    output = OUTPUT_DIR.resolve()
+    parent = src.parent.resolve()
+    pending = []
+    for item in data.get("mods") or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name or name != SAFE_NAME.sub("_", name):
+            continue
+        sibling = (parent / name).resolve()
+        target = (output / name).resolve()
+        if sibling == target:
+            continue
+        if not str(sibling).startswith(str(parent) + os.sep) or not sibling.is_dir():
+            continue
+        if target.exists():
+            continue
+        pending.append((sibling, target, name))
+    for sibling, target, name in pending:
+        log.info("load map: copying piece %s", name)
+        shutil.copytree(sibling, target, ignore=_ignore_export)
+
+
 def _place_in_output(folder: Path) -> Path:
     """A project the window can open: already in output/, or copied there."""
     output = OUTPUT_DIR.resolve()
     folder = folder.resolve()
     if folder.parent == output:
+        _import_pack_pieces(folder)
         return folder
     safe = SAFE_NAME.sub("_", folder.name).strip("_") or "map"
     dest = output / safe
     if dest.exists():
-        if dest.resolve() == folder:
-            return dest
-        raise ValueError("A map with that name is already in KnoxMap.")
+        if dest.resolve() != folder:
+            # The parent was loaded earlier without its pieces. Those pieces
+            # are siblings of the folder they picked; bring across any that
+            # are not here yet.
+            _import_pack_pieces(folder)
+        return dest
     log.info("load map: copying %s to %s", folder, dest)
-    shutil.copytree(folder, dest)
+    shutil.copytree(folder, dest, ignore=_ignore_export)
+    _import_pack_pieces(folder)
     return dest
 
 
@@ -1858,19 +2454,116 @@ def _map_dir(map_name: str) -> Path | None:
     return d
 
 
+def _generation_busy() -> bool:
+    """True while terrain or buildings are still running.
+
+    Panning the street map during that work must not start a tile refresh
+    on another thread. See the tile route.
+    """
+    with _PROGRESS_LOCK:
+        for snap in _PROGRESS.values():
+            stage = snap.get("stage") if isinstance(snap, dict) else None
+            if stage and stage not in ("done", "stopped", "error"):
+                return True
+    return False
+
+
+def _mods_at_once(count: int) -> int:
+    """How many map pieces to build at the same time.
+
+    A quarter of the logical processors, and at least 4 when the machine has
+    4 or more. A machine with fewer than 4 processors runs that many pieces.
+    Pieces share one set of layout workers, so more pieces does not mean more
+    processes: it only keeps the workers fed while other stages run.
+    """
+    count = max(0, int(count))
+    if count <= 1:
+        return count
+    cores = os.cpu_count() or 1
+    slots = min(cores, max(4, cores // 4))
+    from knoxbuild.build import layout_process_budget
+    slots = min(slots, layout_process_budget())
+    return max(1, min(count, slots))
+
+
 def warm_buildings() -> None:
     """Import the building generator on the thread that is about to serve.
 
     SciPy's libraries wait forever if that first import happens on a request
     thread. Buildings then never starts: the window stays where it was, and
     zooming the map does nothing because the server no longer answers.
+    The street-tile connection is opened here for the same reason: the first
+    pan during a build must not be the first time that library loads.
     """
     log.info("loading the building generator")
     knoxlog.flush()
     started = time.time()
-    from knoxbuild.build import LayoutPool, build as _build_buildings  # noqa: F401
+    from knoxbuild import layoutwork  # noqa: F401
+    from knoxbuild.build import build as _build_buildings  # noqa: F401
+    _tile_session()
     log.info("building generator ready in %.1fs", time.time() - started)
     knoxlog.flush()
+
+
+@app.route("/api/cull", methods=["POST"])
+def api_cull():
+    """Drop whole mods after the terrain is drawn, before buildings run."""
+    data = _json_body()
+    map_dir = _map_dir(data.get("mapName", ""))
+    if map_dir is None:
+        return jsonify({"error": "Unknown map."}), 404
+    raw = data.get("drop") or []
+    if not isinstance(raw, list):
+        return jsonify({"error": "Say which mods to drop."}), 400
+    pack = modgrid.read_pack(str(map_dir))
+    if not pack:
+        if any(isinstance(name, str) and name for name in raw):
+            return jsonify({"error": "This map is not split into mods."}), 400
+        return jsonify({"dropped": [], "mods": 1})
+    known = {}
+    for item in pack.get("mods") or []:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            known[item["name"]] = item
+    drop = {name for name in raw if isinstance(name, str) and name in known}
+    if known and len(drop) >= len(known):
+        return jsonify({"error": "Leave at least one mod."}), 400
+    kept = [item for name, item in known.items() if name not in drop]
+    origin = pack.get("origin") or [0, 0]
+    try:
+        origin_xy = (int(origin[0]), int(origin[1]))
+        cells_x = int(pack.get("cells_x") or 0)
+        cells_y = int(pack.get("cells_y") or 0)
+    except (TypeError, ValueError, IndexError):
+        return jsonify({"error": "This map's mod list could not be read."}), 400
+    modgrid.write_pack(
+        str(map_dir / "pack.json"),
+        str(pack.get("parent") or map_dir.name),
+        origin_xy, cells_x, cells_y, kept)
+    info_path = map_dir / f"{map_dir.name}_info.json"
+    try:
+        with open(info_path, encoding="utf-8") as fh:
+            info = json.load(fh)
+    except (OSError, ValueError):
+        info = None
+    if isinstance(info, dict):
+        info["mods"] = kept
+        with open(info_path, "w", encoding="utf-8") as fh:
+            json.dump(info, fh, indent=2)
+    import shutil
+    root = str(OUTPUT_DIR.resolve())
+    for name in drop:
+        path = (OUTPUT_DIR / name).resolve()
+        if str(path).startswith(root + os.sep) and path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    with _PROGRESS_LOCK:
+        pieces = (_PROGRESS.get(map_dir.name) or {}).get("pieces")
+        if isinstance(pieces, list):
+            _PROGRESS[map_dir.name]["pieces"] = [
+                piece for piece in pieces
+                if not (isinstance(piece, dict) and piece.get("name") in drop)
+            ]
+    log.info("cull %s: dropped %s", map_dir.name, ", ".join(sorted(drop)) or "none")
+    return jsonify({"dropped": sorted(drop), "mods": len(kept)})
 
 
 @app.route("/api/buildings", methods=["POST"])
@@ -1908,112 +2601,285 @@ def api_buildings():
         log.info("buildings %s: request received", map_dir.name)
         knoxlog.flush()
         _set_progress(map_dir.name, stage="start", done=0, total=0,
-                      message="Starting buildings", process=1, processes=1,
+                      message="Generating buildings", view="", sections=[],
+                      process=1, processes=1,
                       eta=None, fraction=0, started=t0, mod=0, mods=0, detail="")
+        _seed_saved_previews(map_dir.name, map_dir)
         phase["text"] = "importing the building generator"
         log.info("buildings %s: importing the building generator", map_dir.name)
         knoxlog.flush()
-        from knoxbuild.build import LayoutPool, build as build_buildings
+        from knoxbuild import layoutwork
+        from knoxbuild.build import build as build_buildings
+        from knoxbuild.build import layout_process_budget
         log.info("buildings %s: building generator imported in %.1fs",
                  map_dir.name, time.time() - t0)
         knoxlog.flush()
 
         settings = Settings.from_dict(data.get("settings"))             if data.get("settings") else _load_settings(map_dir)
         paper_map = data.get("paperMap", True) is not False
-        _save_settings(map_dir, settings)
         targets = _pack_mod_dirs(map_dir) or [map_dir]
+        for target in targets:
+            _set_piece_border(map_dir.name, target.name, "wait")
+        # Decided before the settings are written over. A one-piece map keeps
+        # its settings in this same folder, and saving first would hide a change.
+        # Every mod is checked at once. Rooms are laid out a few mods at a time.
+        piece_plan = _plan_pieces(targets, settings)
+        _save_settings(map_dir, settings)
         log.info("buildings %s: started (%d piece%s)", map_dir.name, len(targets),
                  "" if len(targets) == 1 else "s")
         knoxlog.flush()
         _set_progress(map_dir.name, stage="start", done=0, total=len(targets),
-                      message="Starting buildings", process=1, processes=1,
+                      message="Generating buildings", view="", sections=[],
+                      process=1, processes=1,
                       eta=None, fraction=0, started=t0,
-                      mod=1, mods=len(targets),
+                      mod=1, mods=len(targets), modsDone=0,
                       detail=_mod_where(targets[0].name) if targets else "")
         out = io.StringIO()
         total = 0
-        # One layout pool for every piece of this run. Closed when the run
-        # ends; Stop kills it so the next run starts a fresh one.
-        pool = LayoutPool(_stopper(map_dir.name))
+        # A few mods lay out at once. Each one has its own process pool, one
+        # process per building.
+        abort = threading.Event()
+
+        def stop_for_run() -> bool:
+            return abort.is_set() or map_dir.name in _STOPPING
+
         try:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             from contextlib import redirect_stdout
-            for index, target in enumerate(targets, start=1):
-                knoxstop.check(_stopper(map_dir.name), "the buildings")
-                phase["text"] = (f"mod {index} of {len(targets)} "
-                                 f"{target.name}: starting")
-                log.info("buildings %s: piece %d of %d (%s)",
-                         map_dir.name, index, len(targets), target.name)
-                knoxlog.flush()
 
-                def on_progress(stage, done, total_n, message, process, processes, eta,
-                                fraction=0.0, _index=index):
-                    stopping = map_dir.name in _STOPPING
-                    share = max(0.0, min(1.0, float(fraction or 0)))
-                    overall = ((_index - 1) + share) / len(targets)
+            piece_log = threading.local()
+
+            class _PieceStdout:
+                def write(self, text):
+                    buf = getattr(piece_log, "buf", None)
+                    if buf is not None and text:
+                        buf.write(text)
+                    return len(text) if isinstance(text, str) else 0
+
+                def flush(self):
+                    return None
+
+            prog_lock = threading.Lock()
+            prog: dict[int, dict] = {}
+            gate = threading.Lock()
+            errors: list[BaseException] = []
+            stopped_exc: list[BaseException] = []
+            work: list[tuple[int, Path]] = []
+
+            def publish() -> None:
+                with prog_lock:
+                    nmods = len(targets)
+                    running = []
+                    frac = 0.0
+                    mods_done = 0
+                    for i in range(1, nmods + 1):
+                        slot = prog.get(i)
+                        if slot and slot.get("closed"):
+                            frac += 1.0
+                            mods_done += 1
+                        elif slot:
+                            running.append(slot)
+                            frac += float(slot.get("share") or 0.0)
+                    fraction = frac / nmods if nmods else 1.0
+                    latest = max(running, key=lambda s: s.get("touched") or 0.0,
+                                 default=None)
+                    running_n = len(running)
+                    snap = dict(latest) if latest else None
+                    ordered = sorted(running, key=lambda s: int(s.get("index") or 0))
+                    # Each running mod keeps its own counter. Summing them
+                    # made the window jump whenever a mod changed stage.
+                    def _slot_eta(slot) -> float | None:
+                        raw = slot.get("eta")
+                        if raw is None:
+                            return None
+                        try:
+                            eta = float(raw)
+                        except (TypeError, ValueError):
+                            return None
+                        try:
+                            age = time.time() - float(slot.get("touched") or 0)
+                        except (TypeError, ValueError):
+                            age = 0.0
+                        return round(max(0.0, eta - max(0.0, age)), 1)
+
+                    sections = [{
+                        "where": str(slot.get("detail") or ""),
+                        "step": str(slot.get("message") or "Generating buildings"),
+                        "done": int(slot.get("done") or 0),
+                        "total": int(slot.get("total") or 0),
+                        "eta": _slot_eta(slot),
+                    } for slot in ordered]
+                stopping = map_dir.name in _STOPPING
+                if snap is None:
+                    _set_progress(map_dir.name, done=mods_done, total=len(targets),
+                                  fraction=fraction, running=0,
+                                  started=t0, mods=len(targets),
+                                  modsDone=mods_done, sections=[])
+                    return
+                if running_n > 1:
+                    phase["text"] = (f"{running_n} mods at once: "
+                                     f"{snap.get('message') or ''}")
+                else:
                     phase["text"] = (
-                        f"mod {_index} of {len(targets)} {target.name}: "
-                        f"{message} {done}/{total_n}"
+                        f"mod {snap.get('index')} of {len(targets)} "
+                        f"{snap.get('name')}: {snap.get('message') or ''}"
                     )
-                    _set_progress(
-                        map_dir.name,
-                        stage="stopping" if stopping else stage,
-                        done=done, total=total_n,
-                        message="Stopping" if stopping else message,
-                        process=process, processes=processes,
-                        eta=None if stopping else eta,
-                        fraction=overall,
-                        started=t0,
-                        mod=_index, mods=len(targets),
-                        detail=_mod_where(target.name),
-                    )
+                _set_progress(
+                    map_dir.name,
+                    stage="stopping" if stopping else snap.get("stage") or "layout",
+                    done=mods_done,
+                    total=len(targets),
+                    message="Stopping" if stopping else snap.get("message") or "Generating buildings",
+                    process=snap.get("process") or 1,
+                    processes=snap.get("processes") or 1,
+                    eta=None if stopping else snap.get("eta"),
+                    fraction=fraction,
+                    started=t0,
+                    mod=snap.get("index") or 1,
+                    mods=len(targets),
+                    modsDone=mods_done,
+                    running=running_n,
+                    detail=snap.get("detail") or "",
+                    sections=sections,
+                )
 
-                def on_phase(text, _index=index, _name=target.name):
-                    phase["text"] = (f"mod {_index} of {len(targets)} "
-                                     f"{_name}: {text}")
+            def note_slot(index: int, target: Path, **fields) -> None:
+                with prog_lock:
+                    slot = prog.setdefault(index, {
+                        "index": index, "name": target.name,
+                        "detail": _mod_where(target.name),
+                        "share": 0.0, "touched": time.time(),
+                    })
+                    slot["touched"] = time.time()
+                    slot.update(fields)
+                    closed = bool(slot.get("closed"))
+                publish()
+                _set_piece_border(map_dir.name, target.name,
+                                  "done" if closed else "run")
 
-                _set_progress(map_dir.name, stage="load", done=0, total=4,
-                              message="Loading building data", process=1, processes=1,
-                              eta=None, fraction=(index - 1) / len(targets),
-                              started=t0, mod=index, mods=len(targets),
-                              detail=_mod_where(target.name))
-                _save_settings(target, settings)
-                _ensure_paint_piece(map_dir.name, target)
-
-                def on_view(image, stage=None, _name=target.name):
-                    try:
-                        # Room-layout previews are transient status images. At
-                        # half-size they encode at roughly one quarter the pixel
-                        # cost while remaining clear in the progress panel.
-                        longest = 1024 if stage == "Laying out rooms" else 2048
-                        _save_paint_view(image, _name, longest)
-                    except OSError:
-                        return
-                    _bump_paint_named(map_dir.name, _name)
-                    if stage:
-                        _set_progress(map_dir.name, view=stage)
-
-                def on_overlay(image, _name=target.name):
-                    _save_buildings_overlay(image, _name, map_dir.name)
-
-                with redirect_stdout(out):
-                    code = build_buildings(str(target), settings=settings,
-                                           should_stop=_stopper(map_dir.name),
-                                           on_progress=on_progress, on_view=on_view,
-                                           on_overlay=on_overlay,
-                                           pool=pool, paper_map=paper_map,
-                                           on_phase=on_phase)
-                if code:
-                    log.info("buildings %s: piece %s stopped early (%s)",
-                             map_dir.name, target.name, code)
-                    knoxlog.flush()
+            for index, target in enumerate(targets, start=1):
+                if piece_plan[index - 1] != "done":
+                    work.append((index, target))
+                    _set_piece_border(map_dir.name, target.name, "wait")
+                    continue
                 piece_count = len(list((target / "buildings").glob("*.tbx")))
                 total += piece_count
-                log.info("buildings %s: piece %s wrote %d buildings (%.0fs)",
-                         map_dir.name, target.name, piece_count, time.time() - t0)
-                knoxlog.flush()
-                mapstate.stamp(str(target), "build")
+                log.info("buildings %s: piece %s already has its rooms",
+                         map_dir.name, target.name)
+                note_slot(index, target, closed=True, share=1.0,
+                          stage="layout", done=piece_count,
+                          total=max(piece_count, 1),
+                          message="Buildings already laid out",
+                          process=1, processes=1, eta=None)
+
+            slots = _mods_at_once(len(work)) if work else 1
+            log.info("buildings %s: %d mods, %d at once, up to %d shared layout "
+                     "processes", map_dir.name, len(targets),
+                     slots if work else 0, layout_process_budget())
+            knoxlog.flush()
+
+            def run_piece(index: int, target: Path) -> None:
+                nonlocal total
+                buf = io.StringIO()
+                piece_log.buf = buf
+                try:
+                    knoxstop.check(stop_for_run, "the buildings")
+                    log.info("buildings %s: piece %d of %d (%s)",
+                             map_dir.name, index, len(targets), target.name)
+                    knoxlog.flush()
+                    resume = piece_plan[index - 1] == "resume"
+                    if resume:
+                        log.info("buildings %s: piece %s continuing from the rooms "
+                                 "already written", map_dir.name, target.name)
+                        knoxlog.flush()
+                    where = _mod_where(target.name)
+                    _ensure_paint_piece(map_dir.name, target)
+                    note_slot(index, target, stage="load", done=0, total=4,
+                              message=("Continuing buildings" if resume
+                                       else "Loading building data"),
+                              process=1, processes=1, eta=None, share=0.0,
+                              detail=where, closed=False)
+
+                    def on_progress(stage, done, total_n, message, process, processes, eta,
+                                    fraction=0.0, _index=index, _name=target.name,
+                                    _where=where):
+                        note_slot(
+                            _index, target,
+                            stage=stage, done=done, total=total_n,
+                            message=message, process=process, processes=processes,
+                            eta=eta,
+                            share=max(0.0, min(1.0, float(fraction or 0))),
+                            detail=_where, name=_name, closed=False,
+                        )
+
+                    def on_phase(text, _index=index, _name=target.name):
+                        phase["text"] = (f"mod {_index} of {len(targets)} "
+                                         f"{_name}: {text}")
+
+                    _save_settings(target, settings)
+
+                    def on_view(image, stage=None, _name=target.name):
+                        try:
+                            # Room-layout previews are transient status images.
+                            # At half-size they encode at roughly one quarter
+                            # the pixel cost while remaining clear.
+                            longest = 1024 if stage == "Laying out rooms" else 2048
+                            _save_paint_view(image, _name, longest)
+                        except OSError:
+                            return
+                        _bump_paint_named(map_dir.name, _name)
+                        if stage:
+                            _set_progress(map_dir.name, view=stage)
+
+                    def on_overlay(image, _name=target.name):
+                        _save_buildings_overlay(image, _name, map_dir.name)
+
+                    code = build_buildings(str(target), settings=settings,
+                                           should_stop=stop_for_run,
+                                           on_progress=on_progress, on_view=on_view,
+                                           on_overlay=on_overlay,
+                                           paper_map=paper_map,
+                                           on_phase=on_phase, resume=resume)
+                    if code:
+                        log.info("buildings %s: piece %s stopped early (%s)",
+                                 map_dir.name, target.name, code)
+                        knoxlog.flush()
+                    piece_count = len(list((target / "buildings").glob("*.tbx")))
+                    with gate:
+                        total += piece_count
+                    log.info("buildings %s: piece %s wrote %d buildings (%.0fs)",
+                             map_dir.name, target.name, piece_count, time.time() - t0)
+                    knoxlog.flush()
+                    mapstate.stamp(str(target), "build")
+                    note_slot(index, target, closed=True, share=1.0)
+                except knoxstop.Stopped as exc:
+                    with gate:
+                        stopped_exc.append(exc)
+                except Exception as exc:
+                    abort.set()
+                    with gate:
+                        errors.append(exc)
+                finally:
+                    text = buf.getvalue()
+                    if text:
+                        with gate:
+                            out.write(text)
+
+            if work:
+                # One lease keeps the layout workers running from piece to
+                # piece; they go away on their own once the build is over.
+                with redirect_stdout(_PieceStdout()), layoutwork.lease():
+                    with ThreadPoolExecutor(max_workers=slots,
+                                            thread_name_prefix="knox-mod") as ex:
+                        futs = [ex.submit(run_piece, index, target)
+                                for index, target in work]
+                        for fut in as_completed(futs):
+                            fut.result()
+            if errors:
+                raise errors[0]
+            if stopped_exc:
+                raise stopped_exc[0]
         except knoxstop.Stopped:
-            pool.kill()
             for target in targets:
                 folder = target / "buildings"
                 if not folder.is_dir():
@@ -2029,8 +2895,6 @@ def api_buildings():
                      phase["text"], out.getvalue()[-4000:])
             knoxlog.flush()
             return failed(f"Building generation failed: {exc}", 500, exc)
-        finally:
-            pool.close()
         mapstate.stamp(str(map_dir), "build")
         _set_progress(map_dir.name, stage="done", done=total, total=max(total, 1),
                       message="Buildings ready", process=1, processes=1, eta=0,
@@ -3203,6 +4067,8 @@ def _repaint_piece(map_name: str, piece_dir: Path, settings, stop) -> None:
     osm_bbox = cover_box if isinstance(fetch, (list, tuple)) else None
 
     def on_view(image, stage=None, work=None, _name=piece_dir.name):
+        if _buildings_have_the_window(map_name):
+            return
         if stage is not None or work is not None:
             with _PROGRESS_LOCK:
                 prog = _PROGRESS.setdefault(map_name, {})
@@ -3305,7 +4171,9 @@ def _edit_mode(stages: set[str]) -> str | None:
 @app.route("/api/edit/apply", methods=["POST"])
 def api_edit_apply():
     """Run the cheapest stage the overlays still need, on the stale pieces."""
-    from knoxbuild.build import LayoutPool, build as build_buildings
+    from knoxbuild import layoutwork
+    from knoxbuild.build import build as build_buildings
+    from knoxbuild.build import layout_process_budget
     from knoxbuild.edits import Edits
 
     data = _json_body()
@@ -3330,78 +4198,133 @@ def api_edit_apply():
     t0 = time.time()
     out = io.StringIO()
     total = 0
-    pool = LayoutPool(_stopper(map_dir.name))
-    stop = _stopper(map_dir.name)
+    abort = threading.Event()
+
+    def stop_for_run() -> bool:
+        return abort.is_set() or map_dir.name in _STOPPING
+
+    slots = _mods_at_once(len(affected))
+    log.info("edit apply %s: %d mods at once, up to %d shared layout processes",
+             map_dir.name, slots, layout_process_budget())
     try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from contextlib import redirect_stdout
-        for index, (target, edits, stages) in enumerate(affected, start=1):
-            knoxstop.check(stop, "the buildings")
-            settings = _load_settings(target)
-            _save_settings(target, settings)
-            info = _piece_info(target)
-            _ensure_edit_paint(map_dir.name, target, info)
-            if mode == "repaint" and "repaint" in stages:
-                _set_progress(map_dir.name, stage="mod", done=index - 1,
-                              total=len(affected), message="Drawing a map piece",
-                              fraction=(index - 1) / len(affected), started=t0,
-                              mod=index, mods=len(affected),
-                              detail=_mod_where(target.name))
-                _repaint_piece(map_dir.name, target, settings, stop)
 
-            def on_progress(stage, done, total_n, message, process, processes, eta,
-                            fraction=0.0, _index=index,
-                            _detail=_mod_where(target.name)):
-                stopping = map_dir.name in _STOPPING
-                share = max(0.0, min(1.0, float(fraction or 0)))
-                overall = ((_index - 1) + share) / len(affected)
-                _set_progress(
-                    map_dir.name,
-                    stage="stopping" if stopping else stage,
-                    done=done, total=total_n,
-                    message="Stopping" if stopping else message,
-                    process=process, processes=processes,
-                    eta=None if stopping else eta,
-                    fraction=overall,
-                    started=t0,
-                    mod=_index, mods=len(affected),
-                    detail=_detail,
-                )
+        piece_log = threading.local()
 
-            def on_view(image, stage=None, _name=target.name):
-                try:
-                    _save_paint_view(image, _name)
-                except OSError:
-                    return
-                _bump_paint_named(map_dir.name, _name)
-                if stage:
-                    _set_progress(map_dir.name, view=stage)
+        class _PieceStdout:
+            def write(self, text):
+                buf = getattr(piece_log, "buf", None)
+                if buf is not None and text:
+                    buf.write(text)
+                return len(text) if isinstance(text, str) else 0
 
-            def on_overlay(image, _name=target.name):
-                _save_buildings_overlay(image, _name, map_dir.name)
+            def flush(self):
+                return None
 
-            if mode in ("repaint", "rebuild"):
-                relayout_ids = None
-            elif mode == "reroll":
-                relayout_ids = _reroll_ids(target, edits)
-            else:
-                relayout_ids = set()
-            _set_progress(map_dir.name, stage="index", done=0, total=1,
-                          message="Reading footprints", process=1, processes=1,
-                          eta=None, fraction=(index - 1) / len(affected),
-                          started=t0, mod=index, mods=len(affected),
-                          detail=target.name)
-            with redirect_stdout(out):
+        gate = threading.Lock()
+        errors: list[BaseException] = []
+        stopped_exc: list[BaseException] = []
+        shares = [0.0] * len(affected)
+
+        def run_piece(index: int, target, edits, stages) -> None:
+            nonlocal total
+            buf = io.StringIO()
+            piece_log.buf = buf
+            try:
+                knoxstop.check(stop_for_run, "the buildings")
+                settings = _load_settings(target)
+                _save_settings(target, settings)
+                info = _piece_info(target)
+                _ensure_edit_paint(map_dir.name, target, info)
+                if mode == "repaint" and "repaint" in stages:
+                    _set_progress(map_dir.name, stage="mod", done=index - 1,
+                                  total=len(affected), message="Drawing a map piece",
+                                  fraction=(index - 1) / len(affected), started=t0,
+                                  mod=index, mods=len(affected), running=slots,
+                                  detail=_mod_where(target.name))
+                    _repaint_piece(map_dir.name, target, settings, stop_for_run)
+
+                def on_progress(stage, done, total_n, message, process, processes, eta,
+                                fraction=0.0, _index=index,
+                                _detail=_mod_where(target.name)):
+                    stopping = map_dir.name in _STOPPING
+                    share = max(0.0, min(1.0, float(fraction or 0)))
+                    with gate:
+                        shares[_index - 1] = share
+                        overall = sum(shares) / len(affected)
+                    _set_progress(
+                        map_dir.name,
+                        stage="stopping" if stopping else stage,
+                        done=done, total=total_n,
+                        message="Stopping" if stopping else message,
+                        process=process, processes=processes,
+                        eta=None if stopping else eta,
+                        fraction=overall,
+                        started=t0,
+                        mod=_index, mods=len(affected), running=slots,
+                        detail=_detail,
+                    )
+
+                def on_view(image, stage=None, _name=target.name):
+                    try:
+                        _save_paint_view(image, _name)
+                    except OSError:
+                        return
+                    _bump_paint_named(map_dir.name, _name)
+                    if stage:
+                        _set_progress(map_dir.name, view=stage)
+
+                def on_overlay(image, _name=target.name):
+                    _save_buildings_overlay(image, _name, map_dir.name)
+
+                if mode in ("repaint", "rebuild"):
+                    relayout_ids = None
+                elif mode == "reroll":
+                    relayout_ids = _reroll_ids(target, edits)
+                else:
+                    relayout_ids = set()
+                _set_progress(map_dir.name, stage="index", done=0, total=1,
+                              message="Reading footprints", process=1, processes=1,
+                              eta=None, fraction=(index - 1) / len(affected),
+                              started=t0, mod=index, mods=len(affected),
+                              running=slots, detail=target.name)
                 code = build_buildings(
-                    str(target), settings=settings, should_stop=stop,
+                    str(target), settings=settings, should_stop=stop_for_run,
                     on_progress=on_progress, on_view=on_view,
-                    on_overlay=on_overlay, pool=pool,
+                    on_overlay=on_overlay,
                     relayout_ids=relayout_ids)
-            if code:
-                raise RuntimeError(f"Building generation failed ({code}).")
-            total += len(list((target / "buildings").glob("*.tbx")))
-            mapstate.stamp(str(target), "build")
+                if code:
+                    raise RuntimeError(f"Building generation failed ({code}).")
+                with gate:
+                    shares[index - 1] = 1.0
+                    total += len(list((target / "buildings").glob("*.tbx")))
+                mapstate.stamp(str(target), "build")
+            except knoxstop.Stopped as exc:
+                with gate:
+                    stopped_exc.append(exc)
+            except Exception as exc:
+                abort.set()
+                with gate:
+                    errors.append(exc)
+            finally:
+                text = buf.getvalue()
+                if text:
+                    with gate:
+                        out.write(text)
+
+        with redirect_stdout(_PieceStdout()), layoutwork.lease():
+            with ThreadPoolExecutor(max_workers=slots,
+                                    thread_name_prefix="knox-mod") as ex:
+                futs = [ex.submit(run_piece, index, target, edits, stages)
+                        for index, (target, edits, stages) in enumerate(affected, start=1)]
+                for fut in as_completed(futs):
+                    fut.result()
+        if errors:
+            raise errors[0]
+        if stopped_exc:
+            raise stopped_exc[0]
     except knoxstop.Stopped:
-        pool.kill()
         for target, _edits, _stages in affected:
             folder = target / "buildings"
             if not folder.is_dir():
@@ -3416,8 +4339,6 @@ def api_edit_apply():
         log.info("edit apply %s output before the error:\n%s", map_dir.name,
                  out.getvalue()[-4000:])
         return failed(f"Building generation failed: {exc}", 500, exc)
-    finally:
-        pool.close()
     mapstate.stamp(str(map_dir), "build")
     _set_progress(map_dir.name, stage="done", done=total, total=max(total, 1),
                   message="Buildings ready", process=1, processes=1, eta=0,
@@ -3842,15 +4763,15 @@ def api_setup_status():
     """What is installed, so the page can say exactly what is missing.
 
     Drawing terrain needs nothing but this app. Buildings need nothing more.
-    Compiling needs the map tools and the patched compiler, and the tools need
-    tile artwork extracted from the player's own game. Each gap says how to
-    close it, instead of a compile failing later with a message about a
-    missing executable.
+    Compiling needs knox-compile. The map tools supply tile artwork, kerbs
+    and road markings from the player's own game. Each gap says how to close
+    it, instead of a compile failing later with a message about a missing file.
     """
     import knoxpaths
 
     tools = knoxpaths.mapping_tools_dir()
-    cli = knoxpaths.worlded_cli()
+    from tools.compile_map import knox_compile_binary
+    cli = knox_compile_binary()
     game = knoxpaths.pz_install_dir()
     import knoxmap_setup
     tiles = 0
@@ -3861,14 +4782,11 @@ def api_setup_status():
                  if waiting else
                  "KnoxMap downloads these the first time it opens. If this stays "
                  "missing, the details are in logs/setup.log.")
-    compiler_fix = ("Cannot find WorldEd. Choose Download or Find."
-                    if waiting else
-                    "KnoxMap downloads this the first time it opens. You can also "
-                    "compile by hand with Open in WorldEd.")
+    compiler_fix = ("knox-compile is missing. Build it and pack KnoxMap again.")
     checks = [
         {"id": "tools", "ok": bool(tools), "label": "PZ Mapping Tools",
          "fix": tools_fix},
-        {"id": "compiler", "ok": bool(cli), "label": "Patched map compiler",
+        {"id": "compiler", "ok": cli is not None, "label": "Map compiler",
          "fix": compiler_fix},
         {"id": "game", "ok": bool(game) and bool(knoxpaths.pz_jar(game)),
          "label": "Project Zomboid install",
@@ -3893,20 +4811,6 @@ def api_setup_status():
         {"id": "road_rules", "ok": _has_road_rules(tools), "label": "Kerbs and road markings",
          "fix": "KnoxMap adds these the first time it opens."},
     ]
-    # Off Windows the compiler is either one built for this system - what
-    # Setup fetches on Linux, and nothing else is needed for it - or the
-    # Windows build through Wine, which a PC playing Project Zomboid through
-    # Proton already has, though not always on the path. Everything but
-    # Compile works either way.
-    if os.name != "nt":
-        checks.append(
-            {"id": "wine", "ok": knoxpaths.tools_runnable(),
-             "label": "A map compiler that runs here",
-             "fix": "KnoxMap fetches the compiler built for this system the first time it opens. "
-                    "If there is none for it, the map tools' Windows build needs Wine: "
-                    "install it with your package manager (apt install wine, pacman -S "
-                    "wine, dnf install wine), or set KNOXMAP_WINE to the build you want "
-                    "used. Everything except Compile works without either."})
     optional = [
         {"id": "elevators", "ok": knoxpaths.elevators_mod_installed(),
          "label": "Elevators mod (optional)",
@@ -4301,6 +5205,33 @@ def api_compile_status():
         return jsonify({"error": "Unknown map."}), 404
     with _PROGRESS_LOCK:
         state = dict(_COMPILE.get(map_dir.name, {"state": "idle"}))
+        state["pieces"] = copy.deepcopy(
+            (_PROGRESS.get(map_dir.name) or {}).get("pieces") or [])
+    now = time.time()
+    tracks = state.get("tracks")
+    if isinstance(tracks, list):
+        cooled = []
+        for track in tracks:
+            item = dict(track) if isinstance(track, dict) else {}
+            marked = item.get("markedAt")
+            eta = item.get("eta")
+            if eta is not None and marked:
+                item["eta"] = max(0.0, float(eta) - (now - float(marked)))
+            cooled.append(item)
+        state["tracks"] = cooled
+    marked = state.get("markedAt")
+    if state.get("eta") is not None and marked:
+        state["eta"] = max(0.0, float(state["eta"]) - (now - float(marked)))
+    state["now"] = now
+    # While a compile is running the three tracks already carry the counts.
+    # Walking every lot header on each poll is the slow part on a large map.
+    if state.get("state") == "running":
+        cells_track = next((t for t in (state.get("tracks") or [])
+                            if isinstance(t, dict) and t.get("id") == "cells"), None)
+        state["cells"] = int((cells_track or {}).get("done") or 0)
+        state["expected"] = int((cells_track or {}).get("total") or 0)
+        state["failed"] = []
+        return jsonify(state)
     pieces = _pack_mod_dirs(map_dir) or [map_dir]
     cells = 0
     tmx = 0
@@ -4318,13 +5249,6 @@ def api_compile_status():
     state["cells"] = cells
     state["expected"] = _expected_cells(map_dir)
     state["tmx"] = tmx
-    # The estimate was taken when the last batch finished. Count it down on
-    # this poll so the page moves while the next batch is still inside WorldEd.
-    now = time.time()
-    marked = state.get("markedAt")
-    if state.get("eta") is not None and marked:
-        state["eta"] = max(0.0, float(state["eta"]) - (now - float(marked)))
-    state["now"] = now
     # Cells the last compile tried three times and could not do. It steps over
     # them rather than throwing away the hours already spent, so this is how
     # the window knows to offer them again instead of saying "done".
@@ -4334,23 +5258,16 @@ def api_compile_status():
 
 @app.route("/api/compile", methods=["POST"])
 def api_compile():
-    """Convert and compile the whole map without touching WorldEd's menus.
-
-    Uses the patched PZWorldEd_cli.exe, which adds a --generate-map switch that
-    runs BMP to TMX and Generate Lots in order. Stock WorldEd has no such
-    switch, so without the patched build this falls back to /api/worlded.
-    """
+    """Convert and compile the whole map with knox-compile."""
     import subprocess
 
     data = _json_body()
     map_dir = _map_dir(data.get("mapName", ""))
     if map_dir is None:
         return jsonify({"error": "Unknown map."}), 404
-    exe = _worlded_exe(cli=True)
-    if exe is None:
-        return jsonify({"error": "Patched PZWorldEd_cli.exe not found — use "
-                                 "Open in WorldEd and run the two menu "
-                                 "commands instead."}), 400
+    from tools.compile_map import failed_cells, knox_compile_binary
+    if knox_compile_binary() is None:
+        return jsonify({"error": "knox-compile was not found."}), 400
     targets = _pack_mod_dirs(map_dir) or [map_dir]
     if any(not (piece / f"{piece.name}.pzw").exists() for piece in targets):
         return jsonify({"error": "No .pzw yet — generate the buildings first."}), 400
@@ -4359,7 +5276,6 @@ def api_compile():
     # re-run would skip the batches already on disk anyway, but it walks every
     # one of them to find that out, and on a big map that is minutes before it
     # reaches the handful that matter.
-    from tools.compile_map import failed_cells
     only_failed = bool(data.get("onlyFailed"))
     output = data.get("output") if isinstance(data.get("output"), str) else ""
     if only_failed and not any(failed_cells(piece) for piece in targets):
@@ -4377,7 +5293,9 @@ def api_compile():
                           "started": time.time(),
                           "phase": "prepare",
                           "phaseDetail": "Checking the project",
-                          "mods": len(targets)}
+                          "mods": len(targets),
+                          "running": 1,
+                          "tracks": []}
 
     def worker() -> None:
         """Compiling a town takes many minutes.
@@ -4386,12 +5304,8 @@ def api_compile():
         froze until it finished. It runs on its own thread now and the page
         polls /api/compile-status, so the app stays usable and shows progress.
 
-        The work goes out in batches of cells, one short-lived WorldEd
-        process each: a single process compiling a whole town never gives
-        its memory back and took the machine down at 13.7 GB. See
-        tools/compile_map.py. Each mod is its own project, so those mods
-        compile at the same time. Batches inside one mod stay in order,
-        because they rewrite that mod's project file.
+        One knox-compile runs at a time, on every core. The next mod is
+        loaded and held in memory so it can start the moment this one ends.
         """
         from tools import compile_map as compiler
 
@@ -4451,15 +5365,13 @@ def api_compile():
                     "phaseDetail": prev.get("phaseDetail"),
                 }
 
-        side = compiler.batch_side(COMPILE_BATCH)
-        log.info("compile %s: started (%d piece%s, batches of %d%s)", name,
-                 len(targets), "" if len(targets) == 1 else "s", side,
-                 "" if len(targets) <= 1 else ", in parallel")
+        log.info("compile %s: started (%d mod%s, one at a time)", name,
+                 len(targets), "" if len(targets) == 1 else "s")
         t0 = time.time()
         # One counter per mod. WorldEd batches inside a mod stay serial, and
         # the window sees the sum: batches finished, and how many mods are
         # still in a batch. Time left divides the remaining batches by how
-        # many mods are compiling, because those WorldEd processes overlap.
+        # many WorldEd processes are actually running.
         slots: dict[str, dict] = {}
 
         def _publish_mods() -> None:
@@ -4550,53 +5462,172 @@ def api_compile():
                 if only_failed and not only:
                     continue
                 todo.append((piece, only))
-            if len(todo) <= 1:
-                for piece, only in todo:
-                    produced += compiler.compile_map(str(piece), batch=side,
-                                                    exe=str(exe), on_progress=note,
-                                                    should_stop=_stopper(name),
-                                                    only_cells=only)
+            def planned_cells(piece: Path, only) -> int:
+                if only:
+                    count = 0
+                    for cells in only:
+                        x0, y0, x1, y1 = (int(v) for v in list(cells)[:4])
+                        count += max(0, x1 - x0 + 1) * max(0, y1 - y0 + 1)
+                    return count
+                w, h = compiler.world_size(piece / f"{piece.name}.pzw")
+                return max(0, w * h)
+
+            plan = []
+            for piece, only in todo:
+                plan.append({
+                    "name": piece.name, "cells": planned_cells(piece, only),
+                    "done": 0, "work": 0, "lot_done": 0,
+                    "closed": False, "open": False, "held": False,
+                    "started": None, "phase": "prepare",
+                })
+
+            def publish(phase: str | None = None, detail: str | None = None) -> None:
+                now = time.time()
+                with _PROGRESS_LOCK:
+                    prev = _COMPILE.get(name) or {}
+                    running = ("stopping" if prev.get("state") == "stopping"
+                               else "running")
+                    current = next((m for m in plan
+                                    if m["open"] and not m["closed"] and not m["held"]),
+                                   None)
+                    shown = current or next((m for m in reversed(plan) if m["closed"]), None)
+                    mods_done = sum(1 for m in plan if m["closed"])
+                    cell_total = sum(int(m["cells"]) for m in plan)
+                    cells_done = sum(int(m["cells"]) if m["closed"] else int(m["lot_done"])
+                                     for m in plan)
+                    mod_total = len(plan)
+                    elapsed = max(0.0, now - t0)
+                    if current and current["started"]:
+                        mod_elapsed = max(0.0, now - current["started"])
+                        mod_done = int(current["lot_done"])
+                        mod_work = int(current["cells"])
+                    elif shown:
+                        mod_elapsed = 0.0
+                        mod_done = int(shown["cells"])
+                        mod_work = mod_done
+                    else:
+                        mod_elapsed = 0.0
+                        mod_done = 0
+                        mod_work = 0
+
+                    def eta(elapsed_s: float, done_n: float, total_n: float):
+                        if total_n <= 0 or done_n <= 0:
+                            return None
+                        if done_n >= total_n:
+                            return 0.0
+                        return elapsed_s / done_n * (total_n - done_n)
+
+                    frac = (mod_done / mod_work) if mod_work else 0.0
+                    mods_pos = mods_done + (frac if current else 0.0)
+                    tracks = [
+                        {"id": "mod", "label": "This mod",
+                         "where": shown["name"] if shown else "",
+                         "done": mod_done, "total": mod_work,
+                         "fraction": frac,
+                         "eta": eta(mod_elapsed, mod_done, mod_work),
+                         "markedAt": now},
+                        {"id": "cells", "label": "All cells", "where": "",
+                         "done": cells_done, "total": cell_total,
+                         "fraction": (cells_done / cell_total) if cell_total else 0.0,
+                         "eta": eta(elapsed, cells_done, cell_total),
+                         "markedAt": now},
+                        {"id": "mods", "label": "Mods", "where": "",
+                         "done": mods_done, "total": mod_total,
+                         "fraction": (mods_pos / mod_total) if mod_total else 0.0,
+                         "eta": eta(elapsed, mods_pos, mod_total),
+                         "markedAt": now},
+                    ]
+                    _COMPILE[name] = {
+                        **prev,
+                        "state": running, "error": None,
+                        "started": prev.get("started") or t0,
+                        "mods": mod_total, "running": 1,
+                        "phase": phase or (current or {}).get("phase") or prev.get("phase"),
+                        "phaseDetail": (detail if detail is not None
+                                        else prev.get("phaseDetail")),
+                        "tracks": tracks, "markedAt": now,
+                    }
+
+            def watch(piece_name: str):
+                def on_progress(done: int, total: int, cells: int,
+                                skipped: bool = False, *,
+                                phase: str | None = None,
+                                detail: str | None = None,
+                                finished: bool = True) -> None:
+                    mod = next(m for m in plan if m["name"] == piece_name)
+                    if mod["held"]:
+                        return
+                    if phase:
+                        mod["phase"] = phase
+                    # Only finished cells move the counters. Converting the
+                    # maps reports its own total, and cell threads can report
+                    # an earlier count after a later one. Both used to pull
+                    # the bars backward.
+                    if phase == "lots" and total:
+                        if not mod.get("cells_fixed"):
+                            mod["cells"] = int(total)
+                            mod["cells_fixed"] = True
+                        incoming = int(done)
+                        if incoming > int(mod["lot_done"]):
+                            mod["lot_done"] = incoming
+                            mod["done"] = incoming
+                            mod["work"] = int(mod["cells"])
+                            cells_n = int(mod["cells"]) or 1
+                            _set_piece_border(name, piece_name, "run",
+                                              mod["lot_done"] / cells_n)
+                    if not mod["started"]:
+                        mod["started"] = time.time()
+                    shown = f"{piece_name}: {detail}" if detail else piece_name
+                    publish(phase, shown)
+                return on_progress
+
+            def begin(index: int, hold: bool):
+                piece, only = todo[index]
+                mod = plan[index]
+                mod["open"] = True
+                mod["held"] = hold
+                if not hold:
+                    mod["started"] = time.time()
+                    _set_piece_border(name, piece.name, "run")
+                publish("prepare",
+                        f"Loading {piece.name}" if hold else piece.name)
+                return compiler.start_compile(
+                    str(piece), on_progress=watch(piece.name),
+                    should_stop=_stopper(name), only_cells=only, hold=hold)
+
+            _seed_saved_previews(name, map_dir)
+            for piece, _only in todo:
+                _ensure_paint_piece(name, piece)
+                _set_piece_border(name, piece.name, "wait")
+
+            active = None
+            primed = None
+            try:
+                for index, (piece, _only) in enumerate(todo):
+                    if primed is not None:
+                        plan[index]["held"] = False
+                        plan[index]["started"] = time.time()
+                        _set_piece_border(name, piece.name, "run")
+                        primed.release()
+                        active = primed
+                        primed = None
+                        publish(plan[index]["phase"], piece.name)
+                    else:
+                        active = begin(index, False)
+                    if index + 1 < len(todo):
+                        primed = begin(index + 1, True)
+                    produced += active.wait()
+                    plan[index]["closed"] = True
+                    plan[index]["lot_done"] = int(plan[index]["cells"])
+                    plan[index]["done"] = int(plan[index]["cells"])
+                    plan[index]["work"] = int(plan[index]["cells"])
+                    _set_piece_border(name, piece.name, "done")
                     mapstate.stamp(str(piece), "compile")
-            else:
-                log.info("compile %s: %d mods at once", name, len(todo))
-                counts: list[int] = []
-                errors: list[BaseException] = []
-                gate = threading.Lock()
-
-                def run_piece(piece: Path, only) -> None:
-                    try:
-                        count = compiler.compile_map(
-                            str(piece), batch=side, exe=str(exe),
-                            on_progress=note_for(piece.name),
-                            should_stop=_stopper(name),
-                            only_cells=only)
-                        mapstate.stamp(str(piece), "compile")
-                        with gate:
-                            counts.append(count)
-                    except BaseException as exc:
-                        with gate:
-                            errors.append(exc)
-                    finally:
-                        close_piece(piece.name)
-
-                workers = [
-                    threading.Thread(target=run_piece, args=(piece, only),
-                                     name=f"compile-{piece.name}", daemon=True)
-                    for piece, only in todo
-                ]
-                for worker_thread in workers:
-                    worker_thread.start()
-                for worker_thread in workers:
-                    worker_thread.join()
-                produced = sum(counts)
-                failed_run = [exc for exc in errors
-                              if not isinstance(exc, knoxstop.Stopped)]
-                if failed_run:
-                    raise failed_run[0]
-                stopped_run = next((exc for exc in errors
-                                    if isinstance(exc, knoxstop.Stopped)), None)
-                if stopped_run:
-                    raise stopped_run
+                    publish()
+            finally:
+                for job in (primed, active):
+                    if job is not None:
+                        job.stop()
             if not produced:
                 eid = knoxlog.record(None, f"compile {name}: produced no cells")
                 with _PROGRESS_LOCK:
@@ -4611,8 +5642,7 @@ def api_compile():
             for piece in targets:
                 left.extend(compiler.failed_cells(str(piece)))
             try:
-                note(0, 0, 0, phase="copy", detail="Copying the compiled map",
-                     finished=False)
+                publish("copy", "Copying the compiled map")
                 placed = _deliver_compiled(map_dir, output)
             except Exception as exc:
                 eid = knoxlog.record(exc, f"compile {name}: could not copy output")

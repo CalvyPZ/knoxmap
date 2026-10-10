@@ -86,22 +86,25 @@ const drawControl = new L.Control.Draw({
   edit: { featureGroup: drawnItems, remove: true },
 });
 
+const VANILLA_BTN_SVG = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" d="M1.6 4.2 6 2.4l4 1.6 4.4-1.8v9.6L10 13.6l-4-1.6-4.4 1.8Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M6 2.4v9.6M10 4v9.6"/></svg>';
 const VanillaOverlayControl = L.Control.extend({
   options: { position: 'bottomleft' },
-  onAdd() {
+  onAdd(host) {
     const box = L.DomUtil.create('div', 'vanilla-overlay-control');
     const bar = L.DomUtil.create('div', 'leaflet-bar', box);
-    const btn = L.DomUtil.create('button', '', bar);
+    const btn = L.DomUtil.create('button', 'vanilla-overlay-btn', bar);
     btn.type = 'button';
-    btn.id = 'vanillaOverlayBtn';
     btn.setAttribute('aria-pressed', 'false');
     btn.title = 'Overlay Vanilla Map';
     btn.setAttribute('aria-label', 'Overlay Vanilla Map');
-    btn.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" d="M1.6 4.2 6 2.4l4 1.6 4.4-1.8v9.6L10 13.6l-4-1.6-4.4 1.8Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M6 2.4v9.6M10 4v9.6"/></svg>';
-    const note = L.DomUtil.create('div', 'hint', box);
-    note.id = 'vanillaNote';
+    btn.innerHTML = VANILLA_BTN_SVG;
+    L.DomUtil.create('div', 'hint vanilla-note', box);
     L.DomEvent.disableClickPropagation(box);
     L.DomEvent.disableScrollPropagation(box);
+    L.DomEvent.on(btn, 'click', () => {
+      if (vanillaParts.length) hideVanillaOverlay();
+      else showVanillaOverlay(host);
+    });
     return box;
   },
 });
@@ -309,6 +312,7 @@ let vanillaCells = [];
 let vanillaGroups = null;
 let vanillaParts = [];
 let vanillaMarker = null;
+let vanillaHost = null;
 
 function vanillaMetresPerTile() {
   return parseFloat(document.getElementById('metersPerTile').value) || 1;
@@ -444,9 +448,16 @@ function vanillaIcon() {
 }
 
 function setVanillaButton(on) {
-  const btn = document.getElementById('vanillaOverlayBtn');
-  btn.classList.toggle('is-on', on);
-  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  document.querySelectorAll('.vanilla-overlay-btn').forEach(btn => {
+    btn.classList.toggle('is-on', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+
+function setVanillaNote(text) {
+  document.querySelectorAll('.vanilla-note').forEach(note => {
+    note.textContent = text;
+  });
 }
 
 function placeVanilla(center) {
@@ -460,17 +471,19 @@ function placeVanilla(center) {
 
 function bindVanillaDrag(layer) {
   const el = layer.getElement();
-  if (!el) return;
-    el.addEventListener('pointerdown', (ev) => {
-    if (ev.button !== 0 || !vanillaMarker) return;
+  if (!el || el.dataset.vanillaDrag) return;
+  el.dataset.vanillaDrag = '1';
+  el.addEventListener('pointerdown', (ev) => {
+    const host = vanillaHost;
+    if (ev.button !== 0 || !vanillaMarker || !host) return;
     ev.preventDefault();
     ev.stopPropagation();
     if (el.setPointerCapture) el.setPointerCapture(ev.pointerId);
-    const start = map.mouseEventToLatLng(ev);
+    const start = host.mouseEventToLatLng(ev);
     const origin = vanillaMarker.getLatLng();
     el.style.cursor = 'grabbing';
     const move = (e) => {
-      const now = map.mouseEventToLatLng(e);
+      const now = host.mouseEventToLatLng(e);
       placeVanilla(L.latLng(
         origin.lat + (now.lat - start.lat),
         origin.lng + (now.lng - start.lng),
@@ -489,10 +502,11 @@ function bindVanillaDrag(layer) {
 }
 
 function hideVanillaOverlay() {
-  vanillaParts.forEach(part => map.removeLayer(part));
+  vanillaParts.forEach(part => { if (part._map) part.remove(); });
   vanillaParts = [];
-  if (vanillaMarker) map.removeLayer(vanillaMarker);
+  if (vanillaMarker && vanillaMarker._map) vanillaMarker.remove();
   vanillaMarker = null;
+  vanillaHost = null;
   setVanillaButton(false);
 }
 
@@ -501,28 +515,70 @@ function syncVanillaOverlay() {
   placeVanilla(vanillaMarker.getLatLng());
 }
 
-function showVanillaOverlay() {
-  const note = document.getElementById('vanillaNote');
-  if (!vanillaCells.length || !vanillaGroups || !vanillaGroups.length) {
-    if (note) note.textContent = 'The base game\'s Knox County map was not found.';
+// The render preview is its own map. While that picture is up, the overlay
+// belongs on it; back on the street map, the same shape returns there.
+function vanillaViewMap() {
+  const pane = document.getElementById('map-pane');
+  if (paintMap
+      && pane.classList.contains('is-painting')
+      && pane.classList.contains('is-painted')) {
+    return paintMap;
+  }
+  return map;
+}
+
+function ensureVanillaPane(host) {
+  if (host.getPane('vanilla')) return;
+  const pane = host.createPane('vanilla');
+  pane.style.zIndex = '560';
+}
+
+function hostVanillaLayers(host) {
+  host = host || vanillaViewMap();
+  if (!vanillaParts.length && !vanillaMarker) return;
+  if (vanillaHost === host) {
+    vanillaParts.forEach(bindVanillaDrag);
     return;
   }
-  if (note) note.textContent = '';
+  ensureVanillaPane(host);
+  for (const part of vanillaParts) {
+    if (part._map) part.remove();
+    part.addTo(host);
+    bindVanillaDrag(part);
+  }
+  if (vanillaMarker) {
+    if (vanillaMarker._map) vanillaMarker.remove();
+    vanillaMarker.addTo(host);
+  }
+  vanillaHost = host;
+}
+
+function showVanillaOverlay(host) {
+  host = host || vanillaViewMap();
+  if (!vanillaCells.length || !vanillaGroups || !vanillaGroups.length) {
+    setVanillaNote('The base game\'s Knox County map was not found.');
+    return;
+  }
+  setVanillaNote('');
   hideVanillaOverlay();
-  const center = map.getCenter();
+  ensureVanillaPane(host);
+  const center = host.getCenter();
   const style = {
     color: '#ffc857', weight: 2, dashArray: '7 6',
     fillColor: '#ffc857', fillOpacity: 0.08,
     interactive: true, smoothFactor: 0, className: 'vanilla-shape',
+    pane: 'vanilla',
   };
-  vanillaParts = vanillaLatLngRings(center).map(rings => L.polygon(rings, style).addTo(map));
+  vanillaHost = host;
+  vanillaParts = vanillaLatLngRings(center).map(rings => L.polygon(rings, style).addTo(host));
   vanillaParts.forEach(bindVanillaDrag);
   vanillaMarker = L.marker(center, {
     draggable: true, keyboard: false, zIndexOffset: 600,
     bubblingMouseEvents: false, icon: vanillaIcon(),
-  }).addTo(map);
+  }).addTo(host);
   vanillaMarker.on('drag', () => placeVanilla(vanillaMarker.getLatLng()));
   setVanillaButton(true);
+  if (host !== map) return;
   const pts = [];
   const walk = (node) => {
     if (!node) return;
@@ -544,11 +600,6 @@ async function loadVanillaCells() {
   }
 }
 loadVanillaCells();
-
-document.getElementById('vanillaOverlayBtn').addEventListener('click', () => {
-  if (vanillaParts.length) hideVanillaOverlay();
-  else showVanillaOverlay();
-});
 
 function startLasso(button) {
   if (stopLasso) stopLasso();
@@ -889,7 +940,6 @@ function updateBboxFields() {
   const modsY = Math.max(1, Math.ceil(tilesY / MOD_TILES));
   const mods = modsX * modsY;
   const stats = document.getElementById('area-stats');
-  const btn = document.getElementById('generateBtn');
   const side = Math.max(tilesX, tilesY);
   const heavy = [];
   if (area > BIG_AREA_KM2) {
@@ -921,8 +971,8 @@ function updateBboxFields() {
       You can still build it — this is a heads-up, not a wall.</div>` : ''}
     ${slow ? `<div class="stat-note warn">A large selection — ${mods} mods, drawn one at a time.</div>` : ''}
   `;
-  btn.disabled = false;
   fx.step('area', 'done');
+  if (typeof syncExportButton === 'function') syncExportButton();
 }
 
 function clearBboxFields() {
@@ -934,7 +984,7 @@ function clearBboxFields() {
   stats.className = 'empty';
   stats.hidden = true;
   stats.innerHTML = '';
-  document.getElementById('generateBtn').disabled = true;
+  if (typeof syncExportButton === 'function') syncExportButton();
   const landmarks = document.getElementById('landmark-results');
   if (landmarks) landmarks.innerHTML = '';
   fx.resetFrom('area');
@@ -1401,6 +1451,8 @@ let sideMaster = 'setup';
 let generateRunning = false;
 let generateComplete = false;
 let generateToken = 0;
+// Set for the whole Export run, from terrain through compile and install.
+let pipelineRunning = false;
 
 const SIDE_LABELS = {
   setup: 'Config',
@@ -1455,15 +1507,14 @@ function configStepReady() {
 }
 
 function sideStepReady() {
+  if (pipelineRunning) return false;
   if (sideMaster === 'setup') return configStepReady();
-  if (sideMaster === 'map' || sideMaster === 'edit') return true;
-  if (sideMaster === 'build') return generateComplete && !generateRunning;
+  if (sideMaster === 'map' || sideMaster === 'edit' || sideMaster === 'build') return true;
   return false;
 }
 
-// Next on Generate watches these two flags, not the status text. The buildings
-// panel writes its own "done" line, so the flags have to be cleared in that
-// same place or the result can be on screen while Next stays locked.
+// Generate is settings only, so Next stays available. These flags still track
+// a run started from Export, and the buildings step clears them when it finishes.
 function releaseGenerate(token) {
   if (token != null && token !== generateToken) return;
   generateRunning = false;
@@ -1509,7 +1560,7 @@ function syncSideSteps() {
   const hideNext = sideMaster === 'export' || (i >= 0 && i >= last);
   const backText = sideText(onConfig ? 'Cancel' : 'Back');
   for (const btn of document.querySelectorAll('.side-prev')) {
-    btn.disabled = onConfig ? false : i <= 0;
+    btn.disabled = pipelineRunning || (onConfig ? false : i <= 0);
     if (btn.textContent !== backText) btn.textContent = backText;
   }
   for (const btn of document.querySelectorAll('.side-next')) {
@@ -1669,10 +1720,15 @@ function showLoadedArea(data) {
   if (bounds && bounds.isValid()) map.fitBounds(bounds, { padding: [30, 30] });
 }
 
+// The map last opened or drawn. Generate uses it to stay on buildings when
+// the ground for this area is already in the project.
+let openedMap = null;
+
 function presentMap(data) {
   generateToken += 1;
   generateRunning = false;
   generateComplete = true;
+  openedMap = data;
   const nameInput = document.getElementById('mapName');
   if (nameInput && data.mapName) nameInput.value = data.mapName;
   const scale = document.getElementById('metersPerTile');
@@ -1727,72 +1783,58 @@ function showUpgrade(data) {
 }
 
 // ---- a picture of the finished map ------------------------------------------------
-// Drawn from the compiled cells the game itself loads, so it is the map rather
-// than an impression of it - which is why it needs the map compiled, and why
-// it takes the better part of a minute and runs on its own thread.
-function wirePictures(mapName) {
-  const button = document.getElementById('makePictures');
-  const note = document.getElementById('pictureNote');
+// Drawn from the compiled cells, after compile, when Draw map is on.
+function showPictureShots(files) {
   const shots = document.getElementById('pictureShots');
-  if (!button) return;
-  const draw = document.getElementById('pictureDraw');
-  if (draw) draw.hidden = false;
-  bindExportGroups();
-  syncPictureButton();
-  note.textContent = '';
-  shots.hidden = true;
+  if (!shots) return;
   shots.innerHTML = '';
+  const names = { 'town.png': 'The whole map', 'close.png': 'Close up',
+                  'inside.png': 'With the roofs off' };
+  for (const url of files) {
+    const file = url.split('/').pop();
+    const link = document.createElement('a');
+    link.href = url;
+    link.target = '_blank';
+    link.title = names[file] || file;
+    const img = document.createElement('img');
+    img.src = `${url}?t=${Date.now()}`;
+    img.alt = link.title;
+    link.append(img);
+    shots.append(link);
+  }
+  shots.hidden = files.length === 0;
+}
 
-  const show = files => {
-    shots.innerHTML = '';
-    const names = { 'town.png': 'The whole map', 'close.png': 'Close up',
-                    'inside.png': 'With the roofs off' };
-    for (const url of files) {
-      const file = url.split('/').pop();
-      const link = document.createElement('a');
-      link.href = url;
-      link.target = '_blank';
-      link.title = names[file] || file;
-      const img = document.createElement('img');
-      img.src = `${url}?t=${Date.now()}`;   // a redraw replaces the same file
-      img.alt = link.title;
-      link.append(img);
-      shots.append(link);
-    }
-    shots.hidden = files.length === 0;
-  };
-
-  button.onclick = async () => {
-    button.disabled = true;
+async function drawMapPictures(mapName) {
+  const note = document.getElementById('pictureNote');
+  if (note) {
     note.className = 'hint';
     note.textContent = 'Drawing the map — this takes a minute…';
-    try {
-      const shots = pictureShots();
-      if (!shots.length) return;
-      const res = await fetch('/api/pictures', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mapName, shots }),
-      });
-      const started = await res.json();
-      if (!res.ok) throw apiError(started, res);
-      for (;;) {
-        await new Promise(r => setTimeout(r, 1500));
-        const st = await (await fetch(
-          `/api/pictures-status?map=${encodeURIComponent(mapName)}`)).json();
-        if (st.state === 'running') continue;
-        if (st.error) throw new Error(st.error);
-        show(st.files || []);
-        note.textContent = 'Click one to see it full size.';
-        break;
-      }
-    } catch (err) {
+  }
+  try {
+    const res = await fetch('/api/pictures', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mapName, shots: ['town', 'close', 'inside'] }),
+    });
+    const started = await res.json();
+    if (!res.ok) throw apiError(started, res);
+    for (;;) {
+      await new Promise(r => setTimeout(r, 1500));
+      const st = await (await fetch(
+        `/api/pictures-status?map=${encodeURIComponent(mapName)}`)).json();
+      if (st.state === 'running') continue;
+      if (st.error) throw new Error(st.error);
+      showPictureShots(st.files || []);
+      if (note) note.textContent = 'Click one to see it full size.';
+      return true;
+    }
+  } catch (err) {
+    if (note) {
       note.className = 'hint error';
       note.textContent = err.message || String(err);
-    } finally {
-      syncPictureButton();
-      button.textContent = 'Draw it again';
     }
-  };
+    return false;
+  }
 }
 
 
@@ -1891,6 +1933,20 @@ let paintCover = 1;
 // Leaflet zoom when the bitmap was fitted. Later zooms stay in Leaflet;
 // the cover scale stays the one that matched the preview at this zoom.
 let paintFitZoom = null;
+// A drag or a wheel zoom. Progress keeps rewriting the preview transform
+// while buildings are generated. Doing that mid-gesture changes the scale
+// Leaflet divides the mouse by, and one move can throw the picture far
+// enough that the window never draws again.
+let paintInteracting = false;
+let paintTransformDirty = false;
+let paintGestureBearing = 0;
+let paintGestureCover = 1;
+
+function paintCoverScale() {
+  const c = Number(paintInteracting ? paintGestureCover : paintCover);
+  if (!Number.isFinite(c) || c < 0.25) return 1;
+  return Math.min(c, 6);
+}
 
 function unrotateClient(map, clientX, clientY) {
   const rect = map.getContainer().getBoundingClientRect();
@@ -1898,14 +1954,22 @@ function unrotateClient(map, clientX, clientY) {
   const cy = rect.top + rect.height / 2;
   const dx = clientX - cx;
   const dy = clientY - cy;
-  const rad = (-paintBearing) * Math.PI / 180;
+  const bearing = paintInteracting ? paintGestureBearing : paintBearing;
+  const rad = (-bearing) * Math.PI / 180;
   const cos = Math.cos(rad);
   const sin = Math.sin(rad);
-  const inv = paintCover || 1;
-  return {
-    x: cx + (dx * cos + dy * sin) / inv,
-    y: cy + (-dx * sin + dy * cos) / inv,
-  };
+  const inv = paintCoverScale();
+  const x = cx + (dx * cos + dy * sin) / inv;
+  const y = cy + (-dx * sin + dy * cos) / inv;
+  const moved = Math.hypot(dx, dy);
+  const turned = Math.hypot(x - cx, y - cy);
+  // A broken scale used to turn a few pixels of mouse into a pane offset
+  // the renderer could not draw. Keep the real point when the inverse
+  // blows up, and let the drag stay where the pointer is.
+  if (!Number.isFinite(x) || !Number.isFinite(y) || turned > moved * 8 + 64) {
+    return { x: clientX, y: clientY };
+  }
+  return { x, y };
 }
 
 function bearingPoint(obj, x, y) {
@@ -1920,7 +1984,9 @@ function bearingPoint(obj, x, y) {
 }
 
 function bearingEvent(e) {
-  if ((!paintBearing && paintCover === 1) || !paintMap || !e) return e;
+  const bearing = paintInteracting ? paintGestureBearing : paintBearing;
+  const cover = paintCoverScale();
+  if ((!bearing && cover === 1) || !paintMap || !e) return e;
   const touch = e.touches && e.touches.length === 1 ? e.touches[0] : null;
   const src = touch || e;
   if (src.clientX == null) return e;
@@ -1952,12 +2018,31 @@ function hookPaintInput(map) {
     const enabled = !!drag._enabled;
     if (enabled) drag.disable();
     drag._onDown = function (e) {
+      beginPaintGesture();
       const result = down.call(this, bearingEvent(e));
       // bearingEvent already turned the drag into container pixels.
+      // Leaflet also divides by the CSS scale of this container. Leaving
+      // that scale in place while the preview is spun makes one drag step
+      // huge enough to freeze the window.
       this._parentScale = { x: 1, y: 1 };
       return result;
     };
-    drag._onMove = function (e) { return move.call(this, bearingEvent(e)); };
+    drag._onMove = function (e) {
+      this._parentScale = { x: 1, y: 1 };
+      const start = this._startPos;
+      const result = move.call(this, bearingEvent(e));
+      if (start && this._newPos && this._element) {
+        const dx = this._newPos.x - start.x;
+        const dy = this._newPos.y - start.y;
+        const limit = Math.max(map.getSize().x, map.getSize().y, 1) * 3;
+        if (!Number.isFinite(dx) || !Number.isFinite(dy)
+            || Math.abs(dx) > limit || Math.abs(dy) > limit) {
+          this._newPos = start;
+          L.DomUtil.setPosition(this._element, start);
+        }
+      }
+      return result;
+    };
     if (enabled) drag.enable();
   }
   map.mouseEventToContainerPoint = function (e) {
@@ -2026,12 +2111,43 @@ function updatePaintCover() {
   // cover stays the preview fit and a scroll wheel still zooms.
   const back = Math.pow(2, zoom - paintFitZoom);
   const contain = Math.min(w / (box.width / back), h / (box.height / back));
-  paintCover = Number.isFinite(contain) && contain > 0 ? contain : 1;
+  paintCover = Number.isFinite(contain) && contain > 0 ? Math.min(6, Math.max(0.25, contain)) : 1;
+  capPaintZoom();
+}
+
+function capPaintZoom() {
+  if (!paintMap || paintFitZoom == null || !Number.isFinite(paintFitZoom)) return;
+  // A few steps in is enough to look at a building. Further than that, the
+  // preview bitmap is stretched across a layer the window cannot draw, and
+  // the process stays frozen for the rest of the run.
+  const minZ = Math.max(0, paintFitZoom - 4);
+  const maxZ = paintFitZoom + 3;
+  if (paintMap.getMinZoom() !== minZ) paintMap.setMinZoom(minZ);
+  if (paintMap.getMaxZoom() !== maxZ) paintMap.setMaxZoom(maxZ);
+}
+
+function beginPaintGesture() {
+  if (paintInteracting) return;
+  paintInteracting = true;
+  paintGestureBearing = paintBearing;
+  paintGestureCover = paintCover;
+}
+
+function endPaintGesture() {
+  if (!paintInteracting) return;
+  paintInteracting = false;
+  if (!paintTransformDirty) return;
+  paintTransformDirty = false;
+  applyPaintTransform();
 }
 
 function applyPaintTransform() {
   const el = document.getElementById('paint-map');
   if (!el) return;
+  if (paintInteracting) {
+    paintTransformDirty = true;
+    return;
+  }
   updatePaintCover();
   if (!paintBearing && paintCover <= 1.001) {
     paintCover = 1;
@@ -2054,7 +2170,10 @@ function applyPaintTransform() {
 function setPaintBearing(degrees) {
   const next = Number(degrees);
   const value = Number.isFinite(next) ? next : 0;
-  if (value !== paintBearing) paintFitZoom = null;
+  if (value === paintBearing) return;
+  // Keep the zoom the bitmap was fitted at. Resetting it to whatever zoom
+  // the user had reached while looking around made the cover scale collapse
+  // or explode on the next progress tick.
   paintBearing = value;
   applyPaintTransform();
   if (paintMap) hookPaintInput(paintMap);
@@ -2069,7 +2188,16 @@ function ensurePaintMap() {
     zoomSnap: 0,
   });
   paintMap.setView([38.0406, -84.5037], 13);
+  paintMap.addControl(new VanillaOverlayControl());
+  if (vanillaParts.length) setVanillaButton(true);
   paintMap.on('resize', applyPaintTransform);
+  paintMap.on('zoomstart', beginPaintGesture);
+  paintMap.on('zoomend', endPaintGesture);
+  paintMap.on('dragend', endPaintGesture);
+  const box = paintMap.getContainer();
+  box.addEventListener('pointerdown', beginPaintGesture);
+  window.addEventListener('pointerup', endPaintGesture);
+  window.addEventListener('pointercancel', endPaintGesture);
   hookPaintInput(paintMap);
   return paintMap;
 }
@@ -2105,6 +2233,7 @@ function showPaintMap() {
   pane.classList.add('is-painting');
   if (paintSession && paintSession.frame) pane.classList.add('is-painted');
   const m = ensurePaintMap();
+  hostVanillaLayers();
   const place = () => {
     applyPaintTransform();
     m.invalidateSize({ pan: false });
@@ -2124,7 +2253,12 @@ function showMainMap() {
   const pane = document.getElementById('map-pane');
   pane.classList.remove('is-painting', 'is-painted');
   hideEditMap();
+  hostVanillaLayers();
   requestAnimationFrame(() => map.invalidateSize());
+}
+
+function paintPreviewReady() {
+  return (paintSession?.pieces || []).some(p => (p.rev || 0) > 0);
 }
 
 function syncMapDisplay() {
@@ -2132,12 +2266,14 @@ function syncMapDisplay() {
     showEditMap();
     return;
   }
-  const ready = (paintSession?.pieces || []).some(p => (p.rev || 0) > 0);
-  if (paintSession && onGenerateStep() && ready) showPaintMap();
+  // Culling is a choice about the drawn ground. The street map stays hidden
+  // for that step, and once the terrain picture exists while Generate is open.
+  if (paintSession && (culling || (paintPreviewReady() && onGenerateStep()))) showPaintMap();
   else showMainMap();
 }
 
 function beginPaintView() {
+  endCullStage();
   paintToken += 1;
   paintFitZoom = null;
   genOverlayTerrainReady = false;
@@ -2147,7 +2283,12 @@ function beginPaintView() {
     frame: false, token: paintToken,
   };
   setPaintBearing(0);
-  if (paintMap) paintMap.eachLayer(layer => paintMap.removeLayer(layer));
+  if (paintMap) {
+    paintMap.eachLayer(layer => {
+      if (vanillaParts.includes(layer) || layer === vanillaMarker) return;
+      paintMap.removeLayer(layer);
+    });
+  }
   syncMapDisplay();
 }
 
@@ -2156,6 +2297,60 @@ function revealPaintFrame() {
   paintSession.frame = true;
   const pane = document.getElementById('map-pane');
   if (pane.classList.contains('is-painting')) pane.classList.add('is-painted');
+  hostVanillaLayers();
+}
+
+// Outline of one mod while it is drawn, built, or compiled.
+const PIECE_BORDER = { wait: '#c6d36a', run: '#ee8423', done: '#3ea652' };
+
+function pieceBorderState(piece) {
+  if (piece.border === 'run' || piece.border === 'done' || piece.border === 'wait') {
+    return piece.border;
+  }
+  if (piece.step && !piece.finished) return 'run';
+  if (piece.finished) return 'done';
+  return 'wait';
+}
+
+function applyPieceBorder(entry, piece) {
+  if (entry.image && entry.image._image) {
+    entry.image._image.style.opacity = piece.culled ? '0.2' : '1';
+  }
+  if (piece.culled) {
+    entry.outline.setStyle({
+      color: '#e06a62',
+      weight: 3,
+      opacity: 1,
+      fillColor: '#e06a62',
+      fillOpacity: 0.35,
+      dashArray: '6 4',
+    });
+    return;
+  }
+  const state = pieceBorderState(piece);
+  const shown = (piece.rev || 0) > 0;
+  entry.outline.setStyle({
+    color: PIECE_BORDER[state],
+    weight: state === 'run' ? 3 : 2,
+    opacity: 1,
+    fillColor: culling ? '#c6d36a' : PIECE_BORDER[state],
+    fillOpacity: culling ? 0.12 : (shown ? 0 : 0.95),
+    dashArray: null,
+  });
+}
+
+// Shared edges would hide the work if a finished piece were painted last.
+// Orange (being drawn) stays above yellow (still to do), and both stay
+// above green (finished).
+function stackPieceBorders() {
+  if (!paintSession) return;
+  const rank = { done: 0, wait: 1, run: 2 };
+  const pieces = [...(paintSession.pieces || [])].sort((a, b) =>
+    (rank[pieceBorderState(a)] || 0) - (rank[pieceBorderState(b)] || 0));
+  for (const piece of pieces) {
+    const entry = paintSession.layers.get(piece.name);
+    if (entry && entry.outline) entry.outline.bringToFront();
+  }
 }
 
 function drawPaintPieces() {
@@ -2165,12 +2360,13 @@ function drawPaintPieces() {
     let entry = paintSession.layers.get(piece.name);
     if (!entry) {
       const outline = L.polygon(piece.corners, {
-        color: '#c6d36a', weight: 1, fillColor: '#5a6423', fillOpacity: 0.95,
+        color: PIECE_BORDER.wait, weight: 2, fillColor: '#5a6423', fillOpacity: 0.95,
         interactive: false,
       }).addTo(paintMap);
       entry = { outline, image: null, rev: 0 };
       paintSession.layers.set(piece.name, entry);
     }
+    applyPieceBorder(entry, piece);
     const rev = piece.rev || 0;
     if (rev > 0 && rev !== entry.rev) {
       const url = `/paint/${encodeURIComponent(piece.name)}.png?v=${rev}`;
@@ -2179,10 +2375,8 @@ function drawPaintPieces() {
         if (!paintSession || paintSession.token !== token) return;
         revealPaintFrame();
       };
-      entry.outline.setStyle({ fillOpacity: 0 });
       if (!entry.image) {
         entry.image = new PaintImage(url, piece.corners, reveal).addTo(paintMap);
-        entry.outline.bringToFront();
       } else {
         entry.image.setUrl(url);
         if (entry.image._image && entry.image._image.complete && entry.image._image.naturalWidth) {
@@ -2194,6 +2388,7 @@ function drawPaintPieces() {
       entry.rev = rev;
     }
   }
+  stackPieceBorders();
 }
 
 function updatePaintPieces(pieces) {
@@ -2212,13 +2407,10 @@ function updatePaintPieces(pieces) {
     for (const c of piece.corners || []) pts.push([c[0], c[1]]);
   }
   if (pts.length && !paintSession.fit) paintSession.fit = L.latLngBounds(pts);
-  const ready = pieces.some(p => (p.rev || 0) > 0);
+  const ready = pieces.some(p => (p.rev || 0) > 0 || p.border);
   if (!ready || onEditStep() || !onGenerateStep()) return;
   const pane = document.getElementById('map-pane');
-  if (!pane.classList.contains('is-painting')) {
-    showPaintMap();
-    return;
-  }
+  if (!pane.classList.contains('is-painting')) showPaintMap();
   drawPaintPieces();
   if (paintMap && paintSession.fit && !paintSession.fitted && paintMap.getSize().x) {
     paintMap.fitBounds(paintSession.fit, { padding: [0, 0], animate: false });
@@ -3052,15 +3244,17 @@ document.getElementById('genOverlays').addEventListener('change', () => {
 //
 // Furnishing buildings follows a finished terrain pass when this is on.
 
-const generateOptions = { buildings: true, paperMap: true };
+const generateOptions = { buildings: true, paperMap: true, cull: false };
 
 function readGenerateOptions() {
   const buildings = document.getElementById('genBuildings');
   const paperMap = document.getElementById('genPaperMap');
+  const cull = document.getElementById('genCull');
   const overture = document.getElementById('genOverture');
   const fill = document.getElementById('fillGaps');
   if (buildings) generateOptions.buildings = buildings.checked;
   if (paperMap) generateOptions.paperMap = paperMap.checked;
+  if (cull) generateOptions.cull = cull.checked;
   if (overture && fill) fill.checked = overture.checked;
   const box = document.getElementById('ovBuildings');
   const root = document.getElementById('genOverlays');
@@ -3081,9 +3275,172 @@ document.getElementById('fillGaps').addEventListener('change', () => {
   if (overture && fill) overture.checked = fill.checked;
 });
 
-document.getElementById('generateBtn').addEventListener('click', async () => {
-  if (!currentRect) return;
-  const b = currentRect.getBounds();
+// After the terrain is drawn, the mapper can drop whole mods before buildings
+// are generated. Off unless the Cull mods switch is on.
+let culling = false;
+const culledMods = new Set();
+
+function endCullStage() {
+  culling = false;
+  culledMods.clear();
+  const bar = document.getElementById('cullBar');
+  if (bar) bar.hidden = true;
+}
+
+function cullButtonLabel() {
+  const btn = document.getElementById('cullContinue');
+  if (!btn) return;
+  const n = culledMods.size;
+  btn.textContent = n === 1 ? 'Drop 1 mod and continue'
+    : (n ? `Drop ${n} mods and continue` : 'Continue');
+}
+
+function armCullClicks() {
+  if (!paintMap || !paintSession) return;
+  for (const piece of paintSession.pieces || []) {
+    const entry = paintSession.layers.get(piece.name);
+    if (!entry || !entry.outline || entry._cullArmed) continue;
+    entry._cullArmed = true;
+    paintMap.removeLayer(entry.outline);
+    entry.outline.options.interactive = true;
+    entry.outline.addTo(paintMap);
+    entry.outline.on('click', (ev) => {
+      if (ev.originalEvent) L.DomEvent.stopPropagation(ev.originalEvent);
+      if (!culling) return;
+      piece.culled = !piece.culled;
+      if (piece.culled) culledMods.add(piece.name);
+      else culledMods.delete(piece.name);
+      applyPieceBorder(entry, piece);
+      cullButtonLabel();
+    });
+  }
+  stackPieceBorders();
+}
+
+function forgetCulledPieces(names) {
+  const gone = new Set(names);
+  if (!paintSession) return;
+  for (const name of gone) {
+    const entry = paintSession.layers.get(name);
+    if (!entry || !paintMap) continue;
+    if (entry.outline) paintMap.removeLayer(entry.outline);
+    if (entry.image) paintMap.removeLayer(entry.image);
+    paintSession.layers.delete(name);
+  }
+  paintSession.pieces = (paintSession.pieces || []).filter(piece => !gone.has(piece.name));
+}
+
+function waitForCull(token) {
+  return new Promise((resolve, reject) => {
+    const btn = document.getElementById('cullContinue');
+    const timer = setInterval(() => {
+      if (token !== generateToken) {
+        cleanup();
+        reject(new Error('cancelled'));
+      }
+    }, 250);
+    const onClick = () => {
+      cleanup();
+      resolve([...culledMods]);
+    };
+    const cleanup = () => {
+      clearInterval(timer);
+      btn.removeEventListener('click', onClick);
+    };
+    btn.addEventListener('click', onClick);
+  });
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// The terrain picture is written after the generate request returns. Polling
+// has already stopped by then, so without this the cull clicks land on the
+// street map and the drawn ground never comes up.
+async function waitForTerrainPreview(mapName, token) {
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    if (token !== generateToken) throw new Error('cancelled');
+    try {
+      const progress = await (await fetch(
+        `/api/progress?map=${encodeURIComponent(mapName)}`)).json();
+      if (Array.isArray(progress.pieces) && progress.pieces.length) {
+        updatePaintPieces(progress.pieces);
+      }
+      if (paintPreviewReady()) {
+        showPaintMap();
+        // The street map stays on top until the picture is marked shown.
+        // Cull clicks are on the paint map, so that switch happens now.
+        revealPaintFrame();
+        return;
+      }
+    } catch (_) { /* the next tick tries again */ }
+    await sleep(400);
+  }
+  if (paintSession && (paintSession.pieces || []).length) {
+    showPaintMap();
+    revealPaintFrame();
+  }
+}
+
+async function runCullStage(mapName, token) {
+  const status = document.getElementById('status');
+  await waitForTerrainPreview(mapName, token);
+  if (token !== generateToken) throw new Error('cancelled');
+  culling = true;
+  culledMods.clear();
+  for (const piece of (paintSession && paintSession.pieces) || []) piece.culled = false;
+  const bar = document.getElementById('cullBar');
+  if (bar) bar.hidden = false;
+  cullButtonLabel();
+  drawPaintPieces();
+  armCullClicks();
+  status.className = '';
+  status.textContent = 'Terrain is drawn. Click mods to drop them, then continue.';
+  fx.overlay.cull();
+  const wantBuildings = readGenerateOptions().buildings;
+  for (;;) {
+    const dropped = await waitForCull(token);
+    if (token !== generateToken) throw new Error('cancelled');
+    const btn = document.getElementById('cullContinue');
+    btn.disabled = true;
+    try {
+      const res = await fetch('/api/cull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mapName, drop: dropped }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw apiError(data, res);
+      forgetCulledPieces(dropped);
+      culling = false;
+      if (bar) bar.hidden = true;
+      if (!wantBuildings) {
+        status.className = 'success';
+        const note = dropped.length
+          ? `Dropped ${dropped.length} mod${dropped.length === 1 ? '' : 's'}.`
+          : 'Kept every mod.';
+        status.textContent = note;
+        fx.overlay.done(note);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      if (err && err.message === 'cancelled') throw err;
+      status.className = 'error';
+      status.textContent = (err && err.message) || 'Could not drop those mods.';
+      fx.overlay.cull(status.textContent);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+}
+
+// Terrain, then the Generate-page choices (cull, buildings, paper map).
+// Export calls this, then compile, install and the WorldEd project.
+async function runGeneratePipeline() {
+  if (!currentRect) return false;
 
   // Name it here rather than letting the server invent one, so progress can be
   // polled under a key the page already knows.
@@ -3092,6 +3449,7 @@ document.getElementById('generateBtn').addEventListener('click', async () => {
     .replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
   nameField.value = chosen;
 
+  readGenerateOptions();
   const bb = rectBounds(currentRect);
   const body = {
     south: bb.s,
@@ -3105,11 +3463,9 @@ document.getElementById('generateBtn').addEventListener('click', async () => {
     parallel: readParallel(),
   };
 
-  const btn = document.getElementById('generateBtn');
   const status = document.getElementById('status');
-  btn.disabled = true;
   status.className = '';
-  status.textContent = 'Starting…';
+  status.textContent = '';
   fx.step('style', 'done');
   fx.step('terrain', 'running');
   fx.overlay.show();
@@ -3122,6 +3478,7 @@ document.getElementById('generateBtn').addEventListener('click', async () => {
   generateComplete = false;
   syncSideSteps();
   let furnishBuildings = false;
+  let holdForCull = false;
 
   try {
     const res = await fetch('/api/generate', {
@@ -3132,40 +3489,99 @@ document.getElementById('generateBtn').addEventListener('click', async () => {
     const data = await res.json();
     if (wasStopped(data, res)) {
       status.className = '';
-      status.textContent = 'Stopped. The area is still drawn - press Generate map to start again.';
+      status.textContent = 'Stopped. The area is still drawn - press Export to start again.';
       fx.overlay.hide();
       fx.step('terrain', '');
       fx.toast('ok', 'Stopped', 'The area and the settings are as you left them.');
-      return;
+      return false;
     }
     if (!res.ok) throw apiError(data, res);
 
     status.className = 'success';
-    const added = Number(data.fromOverture || 0);
-    const streets = Number(data.fromStreets || 0);
-    const gapNote = data.overtureError
-      ? data.overtureError
-      : (added
-        ? `${added.toLocaleString()} buildings added where OpenStreetMap had none.`
-        : '');
-    const streetNote = streets
-      ? `${streets.toLocaleString()} houses added along streets that had none.`
-      : '';
-    const extra = [gapNote, streetNote].filter(Boolean).join(' ');
-    status.textContent = `Done in ${data.osmSeconds}s (OSM query). ${data.featureCount} features rendered.`
-      + (extra ? ` ${extra}` : '');
-    fx.overlay.done(`${data.featureCount.toLocaleString()} features on the map`);
-    fx.step('terrain', 'done');
-    fx.toast('ok', 'Terrain generated',
-             `${data.cellsX} × ${data.cellsY} cells from ${data.featureCount.toLocaleString()} features.`
-             + (extra ? ` ${extra}` : ''));
-    if (token === generateToken) generateComplete = true;
-    genOverlayTerrainReady = true;
-    syncGenOverlays(paintSession && paintSession.pieces);
-    renderResults(data);
-    loadMaps();
-    furnishBuildings = readGenerateOptions().buildings;
+    if (data.reused) {
+      const opts = readGenerateOptions();
+      holdForCull = opts.cull;
+      furnishBuildings = opts.buildings && !holdForCull;
+      status.textContent = holdForCull
+        ? 'Terrain is already drawn. Choose mods to drop.'
+        : (furnishBuildings
+          ? 'Terrain is already drawn. Generating buildings.'
+          : 'Terrain is already drawn.');
+      fx.step('terrain', 'done');
+      if (furnishBuildings) {
+        fx.overlay.buildings({
+          stage: 'Generating buildings',
+          detail: 'using the map already on disk',
+          pct: 1,
+        });
+        fx.toast('ok', 'Generating buildings', 'The terrain is already drawn.');
+      } else if (!holdForCull) {
+        fx.overlay.hide();
+      }
+      if (token === generateToken) generateComplete = true;
+      openedMap = Object.assign({}, openedMap || {}, {
+        mapName: data.mapName,
+        terrainReady: true,
+        bbox: { south: body.south, west: body.west, north: body.north, east: body.east },
+        metersPerTile: body.metersPerTile,
+        shape: body.shape || null,
+        settings: body.settings,
+      });
+      renderResults(data);
+      loadMaps();
+      genOverlayTerrainReady = true;
+      syncGenOverlays(paintSession && paintSession.pieces);
+    } else {
+      const added = Number(data.fromOverture || 0);
+      const streets = Number(data.fromStreets || 0);
+      const gapNote = data.overtureError
+        ? data.overtureError
+        : (added
+          ? `${added.toLocaleString()} buildings added where OpenStreetMap had none.`
+          : '');
+      const streetNote = streets
+        ? `${streets.toLocaleString()} houses added along streets that had none.`
+        : '';
+      const extra = [gapNote, streetNote].filter(Boolean).join(' ');
+      const opts = readGenerateOptions();
+      holdForCull = opts.cull;
+      furnishBuildings = opts.buildings && !holdForCull;
+      fx.step('terrain', 'done');
+      if (token === generateToken) generateComplete = true;
+      genOverlayTerrainReady = true;
+      syncGenOverlays(paintSession && paintSession.pieces);
+      renderResults(data);
+      loadMaps();
+      if (holdForCull) {
+        status.textContent = 'Terrain is drawn. Choose mods to drop.';
+      } else if (furnishBuildings) {
+        status.textContent = 'Terrain is drawn. Generating buildings.';
+        fx.overlay.buildings({
+          stage: 'Generating buildings',
+          detail: 'the terrain is drawn',
+          pct: 1,
+        });
+      } else {
+        status.textContent = `Done in ${data.osmSeconds}s (OSM query). ${data.featureCount} features rendered.`
+          + (extra ? ` ${extra}` : '');
+        fx.overlay.done(`${data.featureCount.toLocaleString()} features on the map`);
+        fx.toast('ok', 'Terrain generated',
+                 `${data.cellsX} × ${data.cellsY} cells from ${data.featureCount.toLocaleString()} features.`
+                 + (extra ? ` ${extra}` : ''));
+      }
+      openedMap = Object.assign({}, openedMap || {}, {
+        mapName: body.mapName,
+        terrainReady: true,
+        bbox: { south: body.south, west: body.west, north: body.north, east: body.east },
+        metersPerTile: body.metersPerTile,
+        shape: body.shape || null,
+        settings: body.settings,
+        needs: [],
+      });
+    }
   } catch (err) {
+    holdForCull = false;
+    furnishBuildings = false;
     if (token === generateToken) generateComplete = false;
     status.className = 'error';
     status.textContent = `Error: ${err.message}`;
@@ -3175,17 +3591,44 @@ document.getElementById('generateBtn').addEventListener('click', async () => {
   } finally {
     stopProgress();
     showStop(null);
-    btn.disabled = false;
-    if (token === generateToken && !furnishBuildings) releaseGenerate(token);
+    if (token === generateToken && !furnishBuildings && !holdForCull) releaseGenerate(token);
   }
-  if (furnishBuildings) {
+  if (token === generateToken && generateComplete) {
     try {
-      await generateBuildings(token);
+      await waitForTerrainPreview(chosen, token);
+    } catch (err) {
+      if (err && err.message === 'cancelled') {
+        endCullStage();
+        if (token === generateToken) releaseGenerate(token);
+        return false;
+      }
+    }
+  }
+  if (holdForCull && token === generateToken) {
+    try {
+      const buildAfter = await runCullStage(chosen, token);
+      if (!(buildAfter && token === generateToken)) return token === generateToken;
+      return await generateBuildings(token);
+    } catch (err) {
+      if (!err || err.message !== 'cancelled') {
+        status.className = 'error';
+        status.textContent = err.message || 'Culling stopped.';
+        fx.overlay.fail(status.textContent);
+      }
+      return false;
+    } finally {
+      endCullStage();
+      if (token === generateToken) releaseGenerate(token);
+    }
+  } else if (furnishBuildings) {
+    try {
+      return await generateBuildings(token);
     } finally {
       releaseGenerate(token);
     }
   }
-});
+  return token === generateToken && generateComplete;
+}
 
 // ---- stopping a long step ----
 //
@@ -3266,50 +3709,14 @@ function startProgress(mapName) {
       const p = await res.json();
       if (epoch !== progressEpoch) return;
       const overlay = document.getElementById('gen-overlay');
-      if (!overlay || overlay.dataset.mode !== 'buildings') fx.overlay.update(p);
+      if (overlay && (overlay.dataset.mode === 'buildings' || overlay.dataset.mode === 'compile')) {
+        updatePaintPieces(p.pieces);
+        if (p.rotation != null) setPaintBearing(p.rotation);
+        return;
+      }
+      fx.overlay.update(p);
       updatePaintPieces(p.pieces);
       if (p.rotation != null) setPaintBearing(p.rotation);
-      const status = document.getElementById('status');
-      if (p.stage === 'mod') {
-        const sections = Array.isArray(p.sections) ? p.sections : [];
-        const lines = sections.length
-          ? sections.map((section) => (
-            section.where ? `${section.where} · ${section.step}` : section.step
-          ))
-          : [p.view || 'Drawing a map piece'];
-        const detail = document.getElementById('gen-detail');
-        const rest = detail ? detail.textContent : '';
-        status.textContent = rest ? `${lines.join('\n')}\n${rest}` : lines.join('\n');
-      } else if (p.view && p.stage === 'render') {
-        status.textContent = p.detail ? `${p.view} — ${p.detail}` : p.view;
-      } else if (p.stage === 'osm') {
-        const total = p.total || 1;
-        status.textContent = total > 1
-          ? `Querying OpenStreetMap — area ${(p.done || 0) + 1} of ${total}…`
-          : 'Querying OpenStreetMap…';
-      } else if (p.stage === 'overture') {
-        const dl = p.download;
-        if (dl && dl.total > 0) {
-          const pct = Math.min(100, Math.round(100 * dl.done / dl.total));
-          const left = dl.speed > 0 && dl.total > dl.done
-            ? ` · ${Math.max(1, Math.round((dl.total - dl.done) / dl.speed))}s left`
-            : '';
-          const size = (n) => {
-            if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
-            if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(n >= 10 * 1024 ** 2 ? 0 : 1)} MB`;
-            return `${Math.max(1, Math.round(n / 1024))} KB`;
-          };
-          status.textContent = `Fetching building footprints · ${size(dl.done)} of ${size(dl.total)}`
-                             + ` · ${pct}%${left}`;
-        } else {
-          status.textContent = p.detail
-            ? `${p.view || 'Finding where OpenStreetMap has no buildings'} — ${p.detail}`
-            : (p.view || 'Finding where OpenStreetMap has no buildings…');
-        }
-      } else if (p.stage === 'render') {
-        status.textContent = `Rendering ${p.features.toLocaleString()} features `
-                           + 'into bitmaps…';
-      }
     } catch (_) { /* the generate call is the source of truth */ }
   }, 800);
 }
@@ -3332,14 +3739,8 @@ function exportParts(id) {
   return Object.values(exportBoxes(id)).filter(el => el.checked).map(el => el.value);
 }
 
-function pictureShots() {
-  return exportParts('pictureOptions');
-}
-
-function syncPictureButton() {
-  const button = document.getElementById('makePictures');
-  if (!button || button.hidden) return;
-  button.disabled = pictureShots().length === 0;
+function exportParts(id) {
+  return Object.values(exportBoxes(id)).filter(el => el.checked).map(el => el.value);
 }
 
 let installReady = false;
@@ -3347,9 +3748,11 @@ let exportBusy = false;
 let compileRunning = false;
 
 function exportSelection() {
+  const compile = !!document.getElementById('optCompile')?.checked;
   return {
-    compile: !!document.getElementById('optCompile')?.checked,
-    install: !!document.getElementById('optInstall')?.checked,
+    compile,
+    install: compile && !!document.getElementById('optInstall')?.checked,
+    draw: compile && !!document.getElementById('optDraw')?.checked,
     editable: !!document.getElementById('optEditable')?.checked,
   };
 }
@@ -3358,7 +3761,9 @@ function applyExportLocations(data) {
   if (!data) return;
   const output = document.getElementById('exportOutputPath');
   const install = document.getElementById('exportInstallPath');
+  const mapFile = document.getElementById('exportMapFilePath');
   if (output && !output.value && data.output_dir) output.value = data.output_dir;
+  if (mapFile && !mapFile.value && data.output_dir) mapFile.value = data.output_dir;
   if (install && !install.value && data.mods_dir) install.value = data.mods_dir;
 }
 
@@ -3366,25 +3771,24 @@ function syncExportButton() {
   const btn = document.getElementById('exportBtn');
   if (!btn) return;
   const sel = exportSelection();
-  btn.disabled = exportBusy || compileRunning || !(sel.compile || sel.install || sel.editable);
+  btn.disabled = exportBusy || compileRunning || pipelineRunning || !currentRect
+    || !(sel.compile || sel.editable);
 }
 
 function syncExportOptions() {
-  const sel = exportSelection();
-  const row = document.getElementById('exportOutputRow');
+  const compileOn = !!document.getElementById('optCompile')?.checked;
+  const installOn = !!document.getElementById('optInstall')?.checked;
+  const editableOn = !!document.getElementById('optEditable')?.checked;
+  const installToggle = document.getElementById('installToggle');
+  const drawToggle = document.getElementById('drawToggle');
   const installRow = document.getElementById('exportInstallRow');
-  if (installRow) installRow.hidden = !sel.install;
-  if (row) {
-    const slot = sel.compile
-      ? document.getElementById('compileOutputSlot')
-      : document.getElementById('editableOutputSlot');
-    if (sel.compile || sel.editable) {
-      if (slot && row.parentElement !== slot) slot.appendChild(row);
-      row.hidden = false;
-    } else {
-      row.hidden = true;
-    }
-  }
+  const compileRow = document.getElementById('exportOutputRow');
+  const mapFileRow = document.getElementById('exportMapFileRow');
+  if (installToggle) installToggle.hidden = !compileOn;
+  if (drawToggle) drawToggle.hidden = !compileOn;
+  if (installRow) installRow.hidden = !compileOn || !installOn;
+  if (compileRow) compileRow.hidden = !compileOn;
+  if (mapFileRow) mapFileRow.hidden = !editableOn;
   syncExportButton();
 }
 
@@ -3393,11 +3797,6 @@ function syncInstallButton() {
 }
 
 function bindExportGroups() {
-  const pictures = document.getElementById('pictureOptions');
-  if (pictures && !pictures.dataset.bound) {
-    pictures.dataset.bound = '1';
-    pictures.addEventListener('change', syncPictureButton);
-  }
   const choices = document.getElementById('exportChoices');
   if (choices && !choices.dataset.bound) {
     choices.dataset.bound = '1';
@@ -3437,7 +3836,6 @@ function renderResults(data) {
   bindExportGroups();
   const note = document.getElementById('saveNote');
   if (note) { note.className = 'hint'; note.textContent = ''; }
-  wirePictures(data.mapName);
 
   document.querySelectorAll('.map-badge').forEach(el => {
     el.textContent = data.mapName;
@@ -3470,14 +3868,159 @@ function setRectFromBounds(bounds) {
   setSelection(L.rectangle(bounds, SEL_STYLE));
 }
 
-// A place's own boundary from the search result, as the selection.
-function setOutline(geojson) {
+function outlineLayer(geojson) {
   const flip = rings => rings.map(ring => ring.map(([lon, lat]) => [lat, lon]));
   const latlngs = geojson.type === 'Polygon' ? flip(geojson.coordinates)
                                              : geojson.coordinates.map(flip);
-  setSelection(L.polygon(latlngs, SEL_STYLE));
+  return L.polygon(latlngs, SEL_STYLE);
+}
+
+// A place's own boundary from the search result, as the selection.
+function setOutline(geojson) {
+  setSelection(outlineLayer(geojson));
   return currentRect.getBounds();
 }
+
+// Shapes within this distance, or that overlap, become one outline.
+const REGION_MERGE_M = 10;
+
+function geoPolygons(geojson) {
+  if (!geojson) return [];
+  if (geojson.type === 'Polygon') return [geojson.coordinates];
+  if (geojson.type === 'MultiPolygon') return geojson.coordinates.slice();
+  return [];
+}
+
+function localFrame(groups) {
+  let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity;
+  for (const polys of groups) {
+    for (const rings of polys) {
+      for (const ring of rings) {
+        for (const [lon, lat] of ring) {
+          if (lon < minLon) minLon = lon;
+          if (lon > maxLon) maxLon = lon;
+          if (lat < minLat) minLat = lat;
+          if (lat > maxLat) maxLat = lat;
+        }
+      }
+    }
+  }
+  const lon0 = (minLon + maxLon) / 2;
+  const lat0 = (minLat + maxLat) / 2;
+  const cos = Math.max(0.01, Math.cos(lat0 * Math.PI / 180));
+  const toXY = polys => polys.map(rings => rings.map(ring => ring.map(([lon, lat]) => [
+    (lon - lon0) * 111320 * cos,
+    (lat - lat0) * 111320,
+  ])));
+  const toLL = polys => polys.map(rings => rings.map(ring => ring.map(([x, y]) => [
+    wrapLon(lon0 + x / (111320 * cos)),
+    lat0 + y / 111320,
+  ])));
+  return { toXY, toLL };
+}
+
+function layerFromGeoPolys(polys) {
+  const converted = [];
+  for (const rings of polys) {
+    const latlngRings = [];
+    for (const ring of rings) {
+      const pts = ring.slice();
+      if (pts.length > 1) {
+        const a = pts[0], b = pts[pts.length - 1];
+        if (a[0] === b[0] && a[1] === b[1]) pts.pop();
+      }
+      if (pts.length >= 3) latlngRings.push(pts.map(([lon, lat]) => [lat, lon]));
+    }
+    if (latlngRings.length && latlngRings[0].length >= 3) converted.push(latlngRings);
+  }
+  if (!converted.length) return null;
+  if (converted.length === 1) return L.polygon(converted[0], SEL_STYLE);
+  return L.polygon(converted, SEL_STYLE);
+}
+
+// Add a region outline beside the current selection. Pieces that overlap,
+// or that come within 10 m, are welded into one outline.
+function addOutline(geojson) {
+  const incoming = geoPolygons(geojson);
+  if (!incoming.length) return null;
+  if (!currentRect) {
+    setSelection(outlineLayer(geojson));
+    return currentRect.getBounds();
+  }
+  const records = selectionPieces().map(layer => ({
+    layer, polys: layerPolygons(layer),
+  })).filter(rec => rec.polys.length);
+  const frame = localFrame([incoming].concat(records.map(rec => rec.polys)));
+  const incomingXY = frame.toXY(incoming);
+  const xyGroups = records.map(rec => frame.toXY(rec.polys));
+  const inMerge = xyGroups.map(() => false);
+  const bag = [incomingXY];
+  for (let bi = 0; bi < bag.length; bi++) {
+    const part = bag[bi];
+    for (let i = 0; i < xyGroups.length; i++) {
+      if (inMerge[i]) continue;
+      if (!knoxClip.within(xyGroups[i], part, REGION_MERGE_M)) continue;
+      inMerge[i] = true;
+      bag.push(xyGroups[i]);
+    }
+  }
+  const kept = [];
+  const mergePolys = incomingXY.slice();
+  xyGroups.forEach((polys, i) => {
+    if (inMerge[i]) mergePolys.push(...polys);
+    else kept.push(records[i].layer);
+  });
+  let added = null;
+  if (inMerge.some(Boolean)) {
+    const joined = knoxClip.unionWithin(mergePolys, REGION_MERGE_M);
+    added = layerFromGeoPolys(frame.toLL(joined));
+  }
+  if (!added) {
+    inMerge.forEach((yes, i) => { if (yes) kept.push(records[i].layer); });
+    added = outlineLayer(geojson);
+  }
+  const layers = kept.concat([added]);
+  setSelection(layers.length === 1 ? layers[0] : L.featureGroup(layers));
+  return currentRect.getBounds();
+}
+
+const regionAsk = document.getElementById('regionAsk');
+const regionReplaceBtn = document.getElementById('regionReplace');
+const regionAddBtn = document.getElementById('regionAdd');
+let regionAskResolve = null;
+let regionPick = 0;
+
+function closeRegionAsk(choice) {
+  if (!regionAskResolve) return;
+  const resolve = regionAskResolve;
+  regionAskResolve = null;
+  if (regionAsk) regionAsk.hidden = true;
+  resolve(choice);
+}
+
+function askRegionMerge() {
+  if (regionAskResolve) closeRegionAsk(null);
+  if (!regionAsk) return Promise.resolve('replace');
+  regionAsk.hidden = false;
+  return new Promise(resolve => {
+    regionAskResolve = resolve;
+    if (regionReplaceBtn) regionReplaceBtn.focus();
+  });
+}
+
+if (regionReplaceBtn) regionReplaceBtn.addEventListener('click', () => closeRegionAsk('replace'));
+if (regionAddBtn) regionAddBtn.addEventListener('click', () => closeRegionAsk('add'));
+if (regionAsk) {
+  regionAsk.addEventListener('click', (ev) => {
+    if (ev.target === regionAsk) closeRegionAsk(null);
+  });
+}
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && regionAskResolve) {
+    ev.preventDefault();
+    closeRegionAsk(null);
+  }
+});
 
 function boundsAround(lat, lon, km) {
   const dLat = km / 111.32 / 2;
@@ -3522,9 +4065,27 @@ function renderSearchResults(results) {
   }).join('');
   searchResults.hidden = false;
 
-  const selectBorder = (r) => {
-    const bounds = setOutline(r.outline);
-    map.fitBounds(bounds, { padding: [30, 30] });
+  const selectBorder = async (r) => {
+    const pick = ++regionPick;
+    if (regionAskResolve) closeRegionAsk(null);
+    let mode = 'replace';
+    if (searchMode === 'region' && currentRect) {
+      mode = await askRegionMerge();
+      if (!mode || pick !== regionPick) return;
+    }
+    let bounds = null;
+    try {
+      bounds = mode === 'add' ? addOutline(r.outline) : setOutline(r.outline);
+    } catch (err) {
+      if (mode === 'add') {
+        const layers = selectionPieces().concat([outlineLayer(r.outline)]);
+        setSelection(layers.length === 1 ? layers[0] : L.featureGroup(layers));
+        bounds = currentRect.getBounds();
+      } else {
+        bounds = setOutline(r.outline);
+      }
+    }
+    if (bounds && bounds.isValid()) map.fitBounds(bounds, { padding: [30, 30] });
     if (searchMarker) {
       map.removeLayer(searchMarker);
       searchMarker = null;
@@ -3780,10 +4341,7 @@ function setupPipeline(data) {
   ['buildings', 'compile', 'install'].forEach(k => fx.card(k, null));
   fx.card('buildings', 'ready');
   fx.resetFrom('buildings');
-  const compileBar = document.getElementById('compileBar');
-  if (compileBar) compileBar.style.width = '0%';
   note('buildingsNote', 'Turns every OSM footprint into a furnished building.');
-  note('compileNote', '');
   note('worldedNote', '');
   note('installNote', '');
   renderCensus(null);
@@ -3801,12 +4359,13 @@ function setupPipeline(data) {
 let buildingsJob = false;
 
 async function generateBuildings(token) {
-  if (buildingsJob || !currentMap) return;
+  if (buildingsJob || !currentMap) return false;
   buildingsJob = true;
-  const card = document.querySelector('#tabPanelGenerate .pipe-card[data-step="buildings"]');
-  if (card) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  note('buildingsNote', 'Generating buildings…');
-  fx.progress('buildings', 1);
+  const card = document.querySelector('.pipe-card[data-step="buildings"]');
+  if (card) {
+    card.hidden = false;
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
   showStop(currentMap);
   fx.overlay.buildings({
     stage: 'Starting buildings',
@@ -3833,7 +4392,7 @@ async function generateBuildings(token) {
       fx.progress('buildings', 0);
       fx.overlay.hide();
       fx.toast('ok', 'Stopped', 'Nothing was thrown away.');
-      return;
+      return false;
     }
     if (!res.ok) throw apiError(data, res);
     try {
@@ -3845,12 +4404,13 @@ async function generateBuildings(token) {
     fx.overlay.done(`${Number(data.count || 0).toLocaleString()} buildings`);
     note('buildingsNote', `${data.count} buildings → ${data.pzw}`, 'ok');
     renderCensus(data.population);
-    note('compileNote', '');
     finishGenerate(token);
+    return true;
   } catch (err) {
     note('buildingsNote', err.message, 'bad');
     fx.progress('buildings', 0);
     fx.overlay.fail(err.message);
+    return false;
   } finally {
     stopBuildProgress();
     showStop(null);
@@ -3867,12 +4427,15 @@ let buildSnapAt = 0;
 function formatLeft(seconds) {
   if (seconds == null || Number.isNaN(Number(seconds))) return null;
   const s = Math.max(0, Math.round(Number(seconds)));
-  if (s < 5) return 'a few seconds left';
-  if (s < 60) return `${s}s left`;
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  if (m < 60) return r ? `${m}m ${r}s left` : `${m}m left`;
-  return `${Math.floor(m / 60)}h ${m % 60}m left`;
+  // Whole minutes. A seconds readout twitched every poll, and a figure
+  // that sat on "1m" while a stage was stuck read as a promise.
+  if (s < 45) return 'under a minute left';
+  if (s < 90) return 'about a minute left';
+  const m = Math.round(s / 60);
+  if (m < 60) return `about ${m} min left`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm ? `about ${h} h ${rm} min left` : `about ${h} h left`;
 }
 
 function formatElapsed(seconds) {
@@ -3887,9 +4450,17 @@ function buildingFraction(p) {
   if (p && typeof p.fraction === 'number' && !Number.isNaN(p.fraction)) {
     return Math.max(0, Math.min(1, p.fraction));
   }
-  const mods = (p && p.mods) || 1;
-  const frac = p && p.total ? (p.done || 0) / p.total : 0;
-  return (Math.max(((p && p.mod) || 1) - 1, 0) + frac) / mods;
+  const mods = Number(p && p.mods) || 1;
+  const doneMods = p && p.modsDone != null ? Number(p.modsDone) : Number(p && p.done);
+  if (!Number.isNaN(doneMods)) return Math.max(0, Math.min(1, doneMods / mods));
+  return 0;
+}
+
+function sectionLeft(section, sampledAt) {
+  if (sampledAt == null || !section || section.eta == null) return null;
+  if (Number.isNaN(Number(section.eta))) return null;
+  const extra = (Date.now() - sampledAt) / 1000;
+  return formatLeft(Math.max(0, Number(section.eta) - extra));
 }
 
 function progressElapsed(p) {
@@ -3901,51 +4472,52 @@ function progressElapsed(p) {
   return Math.max(0, now - started);
 }
 
-function formatPct(fraction) {
-  const pct = Math.max(0, Math.min(100, fraction * 100));
-  if (pct > 0 && pct < 10) return `${pct.toFixed(1)}%`;
-  return `${Math.round(pct)}%`;
-}
-
 function liveLeft(p, sampledAt) {
   if (!p || p.stage === 'stopping' || p.stage === 'stopped') return null;
-  const frac = buildingFraction(p);
-  const base = progressElapsed(p);
-  if (base == null || frac <= 0) return p.eta;
-  if (frac >= 1) return 0;
-  const elapsed = base + (sampledAt ? (Date.now() - sampledAt) / 1000 : 0);
-  if (elapsed < 1) return null;
-  return elapsed * (1 - frac) / frac;
+  if (p.eta == null || Number.isNaN(Number(p.eta))) return null;
+  const extra = sampledAt ? (Date.now() - sampledAt) / 1000 : 0;
+  return Math.max(0, Number(p.eta) - extra);
 }
 
 function paintBuildProgress(p, sampledAt) {
   if (!p || !p.stage || p.stage === 'done') return;
+  // A terrain pass that just finished can still be reporting "Writing map
+  // files". That is not the buildings run.
+  if (p.stage === 'mod' || p.stage === 'regions' || p.stage === 'osm'
+      || p.stage === 'overture' || p.stage === 'render') {
+    if (p.rotation != null) setPaintBearing(p.rotation);
+    updatePaintPieces(p.pieces);
+    return;
+  }
   const stopping = p.stage === 'stopping' || p.stage === 'stopped';
   const stage = stopping ? 'Stopping' : (p.message || 'Generating buildings');
   const frac = buildingFraction(p);
   const elapsed = progressElapsed(p);
   const extra = sampledAt ? (Date.now() - sampledAt) / 1000 : 0;
   const shownElapsed = elapsed == null ? null : elapsed + extra;
+  const sections = Array.isArray(p.sections) ? p.sections : [];
+  const shownSections = stopping ? sections : sections.map((section) => {
+    const left = sectionLeft(section, sampledAt);
+    return left ? { ...section, left } : section;
+  });
   const parts = [];
-  if ((p.mods || 1) > 1) parts.push(`mod ${p.mod || 1} of ${p.mods}`);
-  if (p.detail) parts.push(p.detail);
-  if (p.total > 0) {
-    parts.push(`${Number(p.done || 0).toLocaleString()} of ${Number(p.total).toLocaleString()}`);
-  }
-  if ((p.processes || 1) > 1) parts.push(`${p.process || 0} of ${p.processes} workers`);
-  parts.push(formatPct(frac));
   if (!stopping) {
+    const mods = Number(p.mods) || 0;
+    if (mods > 0) {
+      const modsDone = p.modsDone != null ? Number(p.modsDone) : Number(p.done || 0);
+      const word = mods === 1 ? 'mod' : 'mods';
+      parts.push(`${modsDone.toLocaleString()} of ${mods.toLocaleString()} ${word}`);
+    }
     const left = formatLeft(liveLeft(p, sampledAt));
-    parts.push(left || (shownElapsed == null ? 'starting' : formatElapsed(shownElapsed)));
+    if (left) parts.push(left);
   }
-  const detail = parts.join(' · ');
+  const detail = stopping ? 'Stopping' : parts.join(' · ');
   updatePaintPieces(p.pieces);
-  note('buildingsNote', `${stage} · ${detail}`);
   fx.card('buildings', 'running');
   const bar = Math.max(frac * 100, 1);
-  fx.progress('buildings', bar);
   fx.overlay.buildings({
     stage,
+    sections: shownSections,
     detail,
     pct: bar,
     elapsed: shownElapsed,
@@ -3961,7 +4533,6 @@ function startBuildProgress(mapName) {
   const paintWaiting = () => {
     const waited = (Date.now() - localStart) / 1000;
     const detail = `waiting for the first status · ${formatElapsed(waited)}`;
-    note('buildingsNote', `Starting buildings · ${detail}`);
     fx.card('buildings', 'running');
     fx.overlay.buildings({
       stage: 'Starting buildings',
@@ -3976,7 +4547,12 @@ function startBuildProgress(mapName) {
       const res = await fetch(`/api/progress?map=${encodeURIComponent(mapName)}`);
       const p = await res.json();
       if (token !== buildProgressToken) return;
-      if (!p || !p.stage || p.stage === 'done') return;
+      if (!p || !p.stage || p.stage === 'done') {
+        if (p && p.rotation != null) setPaintBearing(p.rotation);
+        updatePaintPieces(p && p.pieces);
+        return;
+      }
+      if (p.rotation != null) setPaintBearing(p.rotation);
       buildSnap = p;
       buildSnapAt = Date.now();
       paintBuildProgress(p, buildSnapAt);
@@ -4122,50 +4698,36 @@ async function publishWorldEd(output) {
 }
 
 async function runExport() {
-  if (exportBusy) return;
-  const sel = exportSelection();
-  if (!sel.compile && !sel.install && !sel.editable) return;
-  if (!currentMap) {
-    note('compileNote', 'Generate a map first.', 'bad');
+  if (exportBusy || pipelineRunning) return;
+  if (!currentRect) {
+    fx.problem('Export', 'Draw an area on the map first.');
     return;
   }
   exportBusy = true;
+  pipelineRunning = true;
   syncExportButton();
+  syncSideSteps();
   const output = document.getElementById('exportOutputPath')?.value.trim() || '';
   const modsDir = document.getElementById('exportInstallPath')?.value.trim() || '';
   try {
+    const made = await runGeneratePipeline();
+    if (!made) return;
+    const sel = exportSelection();
+    if (!sel.compile && !sel.editable) return;
+    const mapFile = document.getElementById('exportMapFilePath')?.value.trim() || '';
     if (sel.compile) {
       const p = await startCompile(false, output);
       if (!p || p.state === 'error' || p.state === 'stopped') return;
-      if (sel.editable && p.output) {
-        note('worldedNote', `WorldEd project is in ${p.output}.`, 'ok');
-      }
     }
-    if (sel.editable && !sel.compile) {
-      const ok = await publishWorldEd(output);
-      if (!ok) return;
-    }
-    if (sel.install) {
-      // Compile writes the cells the game loads. Saving the project does not,
-      // so Install with Compile turned off only runs when those cells already
-      // exist from an earlier compile.
-      let compiled = sel.compile;
-      if (!compiled) {
-        try {
-          const ready = await (await fetch(
-            `/api/lots?map=${encodeURIComponent(currentMap)}`)).json();
-          compiled = !!ready.compiled;
-        } catch (_) { compiled = false; }
-      }
-      if (compiled) await runInstall(modsDir);
-      else note('installNote',
-                (sel.editable ? 'Project saved. ' : '')
-                + 'Install needs Compile map — the game reads the compiled cells.',
-                'warn');
-    }
+    if (sel.install) await runInstall(modsDir);
+    if (sel.draw) await drawMapPictures(currentMap);
+    if (sel.editable) await publishWorldEd(mapFile);
   } finally {
     exportBusy = false;
+    pipelineRunning = false;
+    generateRunning = false;
     syncExportButton();
+    syncSideSteps();
   }
 }
 
@@ -4188,7 +4750,7 @@ document.getElementById('exportOutputBrowse')?.addEventListener('click', async (
   try {
     await browseExportFolder('exportOutputPath', 'Select the output folder');
   } catch (err) {
-    note('compileNote', err.message, 'bad');
+    fx.problem('Export', err.message);
   }
 });
 document.getElementById('exportInstallBrowse')?.addEventListener('click', async () => {
@@ -4196,6 +4758,13 @@ document.getElementById('exportInstallBrowse')?.addEventListener('click', async 
     await browseExportFolder('exportInstallPath', 'Select the mods folder');
   } catch (err) {
     note('installNote', err.message, 'bad');
+  }
+});
+document.getElementById('exportMapFileBrowse')?.addEventListener('click', async () => {
+  try {
+    await browseExportFolder('exportMapFilePath', 'Select the map file folder');
+  } catch (err) {
+    note('worldedNote', err.message, 'bad');
   }
 });
 
@@ -4242,7 +4811,6 @@ document.getElementById('recountBtn').addEventListener('click', async () => {
     censusNote.className = 'step-note ok';
     // The compiled lots hold the old spawn map until they are rebuilt.
     installReady = false;
-    note('compileNote', 'Ready — compile again to bake in the new zombie counts.');
   } catch (err) {
     const censusNote = document.getElementById('censusNote');
     censusNote.textContent = err.message;
@@ -4276,7 +4844,19 @@ async function startCompile(onlyFailed, output) {
   if (retry) retry.hidden = true;
   compileRunning = true;
   syncExportButton();
-  note('compileNote', 'Starting…');
+  resetCompileHold();
+  if (paintSession) {
+    showPaintMap();
+    drawPaintPieces();
+  }
+  fx.overlay.compile({
+    detail: 'Starting…',
+    tracks: [
+      { label: 'This mod', done: 0, total: 0 },
+      { label: 'All cells', done: 0, total: 0 },
+      { label: 'Mods', done: 0, total: 0 },
+    ],
+  });
   showStop(currentMap);
   try {
     const res = await fetch('/api/compile', {
@@ -4294,7 +4874,9 @@ async function startCompile(onlyFailed, output) {
       pollCompile();
     });
   } catch (err) {
-    note('compileNote', err.message, 'bad');
+    fx.overlay.fail(err.message);
+    fx.problem('Compile failed', err.message, lastErrorId);
+    lastErrorId = null;
     showStop(null);
     compileRunning = false;
     if (!exportBusy) syncExportButton();
@@ -4318,12 +4900,10 @@ function showFailedCells(failed, cells) {
   if (!failed.length) return false;
   const where = failed.map(f => `${f.cells[0]},${f.cells[1]}`).join('  ');
   const many = failed.length === 1 ? 'batch' : 'batches';
-  note('compileNote',
-       `${cells} cells compiled, but ${failed.length} ${many} would not compile `
-       + `after 3 tries (at ${where}). The map has a hole in it until those are done.`,
-       'warn');
-  note('installNote', 'You can install it, but those cells will be missing.');
-  return true;
+  const message = `${cells} cells compiled, but ${failed.length} ${many} would not compile `
+       + `after 3 tries (at ${where}). The map has a hole in it until those are done.`;
+  note('installNote', `${message} You can install it, but those cells will be missing.`, 'warn');
+  return message;
 }
 
 // The compile runs on the server's own thread; this just watches it. Blocking
@@ -4332,88 +4912,62 @@ let compileTimer = null;
 let compilePaintTimer = null;
 let compileSnap = null;
 let compileSnapAt = 0;
+let compileHold = null;
 
-function compileSecondsLeft(p, sampledAt) {
-  if (!p || p.eta == null || Number.isNaN(Number(p.eta))) return null;
-  const extra = sampledAt ? (Date.now() - sampledAt) / 1000 : 0;
-  return Math.max(0, Number(p.eta) - extra);
+function resetCompileHold() {
+  compileHold = { modWhere: '', modDone: 0, modFrac: 0, cellsDone: 0, cellsFrac: 0, modsDone: 0, modsFrac: 0 };
 }
 
-function compileElapsed(p, sampledAt) {
-  const started = Number(p && p.started);
-  const now = Number(p && p.now);
-  if (!started || !now) return null;
-  const extra = sampledAt ? (Date.now() - sampledAt) / 1000 : 0;
-  return Math.max(0, now - started + extra);
-}
-
-const COMPILE_PHASES = [
-  ['prepare', 'Checking the project'],
-  ['convert', 'Converting cells to maps'],
-  ['lots', 'Compiling lots'],
-  ['record', 'Recording converted cells'],
-  ['copy', 'Copying the compiled map'],
-];
-
-function compilePhaseIndex(phase) {
-  const key = phase === 'skip' || phase === 'worlded' ? 'lots' : phase;
-  const index = COMPILE_PHASES.findIndex(([id]) => id === key);
-  return index < 0 ? 0 : index;
-}
-
-function paintCompileSteps(p) {
-  const list = document.getElementById('compileSteps');
-  if (!list) return;
-  if (!p || p.state !== 'running') {
-    list.hidden = true;
-    list.replaceChildren();
-    return;
-  }
-  const current = compilePhaseIndex(p.phase);
-  list.hidden = false;
-  list.replaceChildren(...COMPILE_PHASES.map(([, label], i) => {
-    const li = document.createElement('li');
-    li.className = i < current ? 'is-done' : i === current ? 'is-running' : 'is-wait';
-    const name = document.createElement('span');
-    name.textContent = label;
-    li.append(name);
-    if (i === current && p.phaseDetail) {
-      const detail = document.createElement('span');
-      detail.className = 'compile-step-detail';
-      detail.textContent = p.phaseDetail;
-      li.append(detail);
+function heldTrack(track) {
+  if (!compileHold) resetCompileHold();
+  const id = track.id || '';
+  let done = Number(track.done) || 0;
+  let fraction = Number(track.fraction);
+  if (id === 'mod') {
+    const where = track.where || '';
+    if (where !== compileHold.modWhere) {
+      compileHold.modWhere = where;
+      compileHold.modDone = done;
+      compileHold.modFrac = Number.isFinite(fraction) ? fraction : 0;
+    } else {
+      done = Math.max(compileHold.modDone, done);
+      compileHold.modDone = done;
+      if (Number.isFinite(fraction)) {
+        fraction = Math.max(compileHold.modFrac, fraction);
+        compileHold.modFrac = fraction;
+      }
     }
-    return li;
-  }));
+  } else if (id === 'cells' || id === 'mods') {
+    const doneKey = id === 'cells' ? 'cellsDone' : 'modsDone';
+    const fracKey = id === 'cells' ? 'cellsFrac' : 'modsFrac';
+    done = Math.max(compileHold[doneKey], done);
+    compileHold[doneKey] = done;
+    if (Number.isFinite(fraction)) {
+      fraction = Math.max(compileHold[fracKey], fraction);
+      compileHold[fracKey] = fraction;
+    }
+  }
+  return { ...track, done, fraction };
+}
+
+function trackLeft(track, sampledAt) {
+  if (!track || track.eta == null || Number.isNaN(Number(track.eta))) return '';
+  const extra = sampledAt ? (Date.now() - sampledAt) / 1000 : 0;
+  return formatLeft(Math.max(0, Number(track.eta) - extra)) || '';
 }
 
 function paintCompile(p, sampledAt) {
-  if (!p || p.state !== 'running') return;
-  const pct = p.expected ? Math.floor(100 * p.cells / p.expected) : 0;
-  // The batch counter is the honest one on a big map: cell files land in
-  // bursts and stay flat for minutes inside a batch, which reads as a hang.
-  // Batches tick over steadily. Time left uses that same counter.
-  // Several mods compile at once. `batch` is then how many batches have
-  // finished across all of them, so the bar is that share of the work.
-  const manyMods = (p.mods || 1) > 1;
-  const batchFrac = p.batches
-    ? (manyMods ? (p.batch || 0) / p.batches : (p.batch ? (p.batch - 1) / p.batches : 0))
-    : 0;
-  fx.progress('compile', p.batches ? Math.max(pct, 100 * batchFrac) : pct);
-  const left = formatLeft(compileSecondsLeft(p, sampledAt));
-  const elapsed = compileElapsed(p, sampledAt);
-  const clock = left || (elapsed == null ? '' : formatElapsed(elapsed));
-  const parts = [];
-  if (manyMods && p.batches) parts.push(`${p.batch || 0} of ${p.batches} batches`);
-  else if (p.batches && p.batch) parts.push(`Batch ${p.batch} of ${p.batches}`);
-  if (manyMods && p.running) parts.push(`${p.running} mods at once`);
-  else if (manyMods && p.running == null) parts.push(`${p.mods} mods at once`);
-  if (p.expected) parts.push(`${p.cells} of ${p.expected} cells compiled (${pct}%)`);
-  else if (p.cells) parts.push(`${p.cells} cells compiled`);
-  if (p.tmx) parts.push(`${p.tmx} converted`);
-  if (clock) parts.push(clock);
-  note('compileNote', parts.join(' · ') || 'Starting…');
-  paintCompileSteps(p);
+  if (p && Array.isArray(p.pieces) && p.pieces.length) updatePaintPieces(p.pieces);
+  if (!p || (p.state !== 'running' && p.state !== 'stopping')) return;
+  const stopping = p.state === 'stopping';
+  const tracks = (Array.isArray(p.tracks) ? p.tracks : []).map((track) => {
+    const held = heldTrack(track);
+    return { ...held, left: stopping ? '' : trackLeft(held, sampledAt) };
+  });
+  fx.overlay.compile({
+    detail: stopping ? 'Stopping…' : (p.phaseDetail || ''),
+    tracks,
+  });
 }
 
 function stopCompileWatch() {
@@ -4422,7 +4976,6 @@ function stopCompileWatch() {
   compileTimer = null;
   compilePaintTimer = null;
   compileSnap = null;
-  paintCompileSteps(null);
 }
 
 function pollCompile() {
@@ -4432,10 +4985,11 @@ function pollCompile() {
       const res = await fetch(
         `/api/compile-status?map=${encodeURIComponent(currentMap)}`);
       const p = await res.json();
+      if (p && Array.isArray(p.pieces) && p.pieces.length) updatePaintPieces(p.pieces);
       if (p.state === 'stopping') {
-        compileSnap = null;
-        paintCompileSteps(null);
-        note('compileNote', 'Stopping — waiting for WorldEd to close…');
+        compileSnap = p;
+        compileSnapAt = Date.now();
+        paintCompile(p, compileSnapAt);
         return;
       }
       if (p.state === 'running') {
@@ -4447,22 +5001,18 @@ function pollCompile() {
       stopCompileWatch();
       showStop(null);
       if (p.state === 'stopped') {
-        fx.progress('compile', 0);
-        note('compileNote', 'Stopped. The cells already compiled are kept — '
-                            + 'press Export to carry on from there.');
+        fx.overlay.hide();
         fx.toast('ok', 'Stopped', 'Compiling picks up where it left off.');
       } else if (p.state === 'error') {
         lastErrorId = p.errorId || null;
-        note('compileNote', p.error || 'Compile failed.', 'bad');
+        fx.overlay.fail(p.error || 'Compile failed.');
+        fx.problem('Compile failed', p.error || 'Compile failed.', lastErrorId);
+        lastErrorId = null;
       } else if (p.state === 'done') {
-        fx.progress('compile', 100);
         installReady = true;
         const where = p.output ? ` Written to ${p.output}.` : '';
-        if (!showFailedCells(p.failed, p.cells)) {
-          note('compileNote', `${p.cells} cells compiled.${where}`, 'ok');
-        } else if (where && document.getElementById('compileNote')) {
-          document.getElementById('compileNote').textContent += where;
-        }
+        const hole = showFailedCells(p.failed, p.cells);
+        fx.overlay.done(hole ? `${hole}${where}` : `${p.cells} cells compiled.${where}`);
       }
       finishCompile(p);
     } catch (_) { /* keep watching */ }

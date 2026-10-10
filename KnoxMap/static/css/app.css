@@ -130,14 +130,24 @@ main {
   height: 100%;
   /* Undo the pane rotation and the cover scale so zoom stays upright
      and at the corner of the screen, not the corner of the spun map.
-     The box covers the whole map. Without this it takes the wheel and
-     the zoom buttons' clicks, so zooming out does nothing and the view
-     stays frozen on the last frame. */
+     The box covers the whole map. It must not take the wheel or a drag:
+     during building generation that left the view frozen on the last
+     frame, and the window never recovered.
+     The transform would otherwise paint this box under the map panes, so
+     the vanilla outline covers the toggle and it cannot be turned off. */
+  z-index: 1000;
   pointer-events: none;
   transform: scale(var(--paint-unscale, 1)) rotate(var(--paint-unspin, 0deg));
   transform-origin: center center;
 }
-#paint-map .leaflet-control {
+#paint-map .leaflet-top,
+#paint-map .leaflet-bottom,
+#paint-map .leaflet-left,
+#paint-map .leaflet-right {
+  pointer-events: none;
+}
+#paint-map .leaflet-control,
+#paint-map .leaflet-control * {
   pointer-events: auto;
 }
 #map, #paint-map, #edit-map { position: absolute; inset: 0; }
@@ -387,25 +397,25 @@ input[readonly] { background: var(--bg); color: var(--muted); }
 .vanilla-overlay-control {
   display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
 }
-#vanillaOverlayBtn {
+.vanilla-overlay-btn {
   margin: 0; width: 26px; height: 26px; padding: 0;
   display: flex; align-items: center; justify-content: center;
   background: var(--panel); color: var(--text);
   border: 0; border-radius: 4px; box-shadow: none;
   cursor: pointer; line-height: 0; appearance: none;
 }
-.leaflet-touch #vanillaOverlayBtn { width: 30px; height: 30px; border-radius: 2px; }
-#vanillaOverlayBtn svg { width: 15px; height: 15px; display: block; pointer-events: none; }
-#vanillaOverlayBtn:hover { background: var(--hover); }
-#vanillaOverlayBtn.is-on,
-#vanillaOverlayBtn.is-on:hover {
+.leaflet-touch .vanilla-overlay-btn { width: 30px; height: 30px; border-radius: 2px; }
+.vanilla-overlay-btn svg { width: 15px; height: 15px; display: block; pointer-events: none; }
+.vanilla-overlay-btn:hover { background: var(--hover); }
+.vanilla-overlay-btn.is-on,
+.vanilla-overlay-btn.is-on:hover {
   background: var(--warn-soft); color: var(--warn);
 }
-.vanilla-overlay-control .leaflet-bar:has(#vanillaOverlayBtn.is-on) {
+.vanilla-overlay-control .leaflet-bar:has(.vanilla-overlay-btn.is-on) {
   border-color: var(--warn-line) !important;
 }
-#vanillaNote:empty { display: none; }
-#vanillaNote:not(:empty) {
+.vanilla-note:empty { display: none; }
+.vanilla-note:not(:empty) {
   max-width: 260px; background: var(--panel); border: 1px solid var(--line);
   border-radius: 4px; padding: 6px 8px; box-shadow: var(--shadow);
 }
@@ -446,7 +456,8 @@ input[readonly] { background: var(--bg); color: var(--muted); }
 #gen-overlay .btn-stop { margin-top: 10px; }
 
 #gen-overlay {
-  position: absolute; left: 12px; bottom: 12px; z-index: 1100;
+  /* Sit clear of the bottom-left buttons: zoom, draw tools, vanilla overlay. */
+  position: absolute; left: 52px; bottom: 12px; z-index: 1100;
   display: block; background: none; pointer-events: none;
 }
 #gen-overlay .gen-box { pointer-events: auto; }
@@ -470,7 +481,49 @@ input[readonly] { background: var(--bg); color: var(--muted); }
 #worldedAskNote:empty { display: none; }
 .worlded-ask-actions { display: flex; gap: 8px; margin-top: 14px; }
 .worlded-ask-actions .btn { flex: 1; }
+
+.region-ask {
+  position: fixed; inset: 0; z-index: 4600;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--scrim);
+}
+.region-ask[hidden] { display: none; }
+.region-ask-box {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 18px 20px; width: min(420px, calc(100% - 32px));
+  box-shadow: var(--shadow);
+}
+.region-ask-box p { margin: 0; font-weight: 600; font-size: 16px; line-height: 1.4; }
+.region-ask-actions { display: flex; gap: 8px; margin-top: 14px; }
+.region-ask-actions .btn { flex: 1; }
+.region-ask-actions .region-ask-btn,
+.region-ask-actions .region-ask-btn:hover:not(:disabled),
+.region-ask-actions .region-ask-btn:focus-visible {
+  background-color: var(--accent);
+  background-image: none;
+  color: var(--accent-ink);
+  border-color: var(--accent);
+  font-weight: 600;
+  box-shadow: none;
+}
+.region-ask-actions .region-ask-btn:hover:not(:disabled),
+.region-ask-actions .region-ask-btn:focus-visible {
+  background-color: var(--accent-hover);
+}
 .gen-box { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 16px 18px; width: min(480px, calc(100vw - 48px)); }
+#gen-overlay[data-mode="buildings"] .gen-box,
+#gen-overlay[data-mode="compile"] .gen-box { width: min(640px, calc(100vw - 48px)); }
+#gen-overlay[data-mode="compile"] #gen-stage { display: none; }
+.gen-track { margin-top: 12px; }
+.gen-track-head { display: flex; gap: 12px; align-items: baseline; }
+.gen-track-label { flex: 1; min-width: 0; }
+.gen-track-pct { flex: none; min-width: 3.2em; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.gen-track .gen-eta { min-width: 9.5em; text-align: right; }
+.gen-track .bar { margin-top: 4px; }
+.gen-track-count {
+  margin-top: 2px; color: var(--muted); font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
 .gen-kicker { font-weight: 600; margin-bottom: 4px; }
 #gen-stage { color: var(--text); line-height: 1.35; max-height: min(42vh, 320px); overflow-y: auto; }
 .gen-section { display: flex; gap: 10px; align-items: baseline; }
@@ -478,7 +531,14 @@ input[readonly] { background: var(--bg); color: var(--muted); }
   flex: none; min-width: 4.6em; color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.gen-step { min-width: 0; }
+.gen-step { min-width: 0; flex: 1; }
+.gen-count, .gen-eta {
+  flex: none; color: var(--muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.gen-count { margin-left: auto; }
+.gen-eta { margin-left: 10px; }
+.gen-step + .gen-eta { margin-left: auto; }
 #gen-detail, .gen-elapsed { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
 #gen-detail { line-height: 1.35; }
 #gen-bar { transition: width 0.4s linear; }
@@ -519,8 +579,12 @@ input[readonly] { background: var(--bg); color: var(--muted); }
 .area-toggles { margin-top: 12px; }
 #generateOptions.area-toggles { margin-top: 0; }
 #generateOptions .toggle-sub { margin-left: 40px; }
+#cullBar { margin-top: 10px; }
+#cullBar[hidden] { display: none; }
+#cullBar .step-note { margin: 0 0 8px; }
 a.btn.is-disabled { opacity: 0.45; pointer-events: none; }
 .toggle { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; cursor: pointer; }
+.toggle[hidden] { display: none; }
 .toggle input {
   position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
   overflow: hidden; clip: rect(0 0 0 0); border: 0;
@@ -659,7 +723,7 @@ a.btn.is-disabled { opacity: 0.45; pointer-events: none; }
 }
 .picture-draw[hidden] { display: none; }
 .picture-draw .area-toggles { margin-top: 0; }
-#tabPanelExport .export-actions #exportBtn { flex: 1; }
+#tabPanelExport .export-actions #exportBtn { flex: 1; width: auto; }
 .location-choice { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .location-option { display: flex; align-items: center; gap: 8px; color: var(--text); cursor: pointer; }
 .location-option input { width: auto; margin: 0; }
@@ -707,6 +771,7 @@ a.btn.is-disabled { opacity: 0.45; pointer-events: none; }
   display: flex; align-items: flex-start; gap: 12px; background: var(--panel);
   border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
 }
+.pipe-card[hidden] { display: none; }
 .pipe-card.is-done { border-left: 3px solid var(--accent); }
 .pipe-card.is-error { border-left: 3px solid var(--bad); }
 .pipe-card.is-running { border-left: 3px solid var(--warn); }
@@ -948,6 +1013,7 @@ summary .count { color: var(--muted); font-size: 12px; font-weight: 400; }
 
 /* Pictures of a finished map, drawn from the compiled cells. */
 .shots { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.shots[hidden] { display: none; }
 .shots a { flex: 1 1 120px; min-width: 0; border-radius: 4px; overflow: hidden;
            border: 1px solid var(--line); background: var(--shot); }
 .shots img { display: block; width: 100%; height: auto; }

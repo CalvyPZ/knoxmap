@@ -22,7 +22,7 @@ const tutorial = (() => {
     },
     {
       title: 'Sidebar',
-      body: 'Back and Next at the bottom of the sidebar move through Setup, Map and Build. The count shows which step you are on. Setup finds the game and names the map. Map is the area you drew. Build generates, compiles and installs the mod.',
+      body: 'Back and Next at the bottom of the sidebar move through Setup, Map, Generate and Export. The count shows which step you are on. Setup finds the game and names the map. Map is the area you drew. Generate holds the map options. Export builds, compiles and installs the mod.',
       targets: ['#controls'],
       place: 'left-of',
     },

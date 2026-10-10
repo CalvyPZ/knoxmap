@@ -58,8 +58,9 @@
       <div class="gen-box">
         <div class="gen-kicker">Generating terrain</div>
         <div id="gen-stage">Contacting OpenStreetMap…</div>
+        <div id="gen-tracks" hidden></div>
         <div id="gen-detail"></div>
-        <div class="bar"><div id="gen-bar" class="bar-fill"></div></div>
+        <div class="bar" id="gen-meter"><div id="gen-bar" class="bar-fill"></div></div>
         <div class="gen-elapsed"><span id="gen-clock">0:00</span> <span id="gen-elapsed-word" hidden>elapsed</span></div>
         <button id="stopOverlayBtn" class="btn btn-small btn-stop" data-stop>Stop</button>
       </div>
@@ -276,7 +277,7 @@
               <span class="toggle-track" aria-hidden="true"></span>
               <span class="toggle-copy">
                 <span class="toggle-name">Buildings</span>
-                <span class="toggle-hint">Generate and furnish buildings after drawing the map.</span>
+                <span class="toggle-hint">Furnish a building for every footprint when the map is exported.</span>
               </span>
             </label>
             <label class="toggle toggle-sub">
@@ -295,33 +296,17 @@
                 <span class="toggle-hint">Add roads, buildings and place names to the in-game map.</span>
               </span>
             </label>
+            <label class="toggle">
+              <input type="checkbox" id="genCull">
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Cull mods</span>
+                <span class="toggle-hint">After the terrain is drawn, click whole mods to leave them out of the map and out of building generation.</span>
+              </span>
+            </label>
           </div>
-          <button id="generateBtn" class="btn btn-primary" disabled>Generate map</button>
-          <div id="status"></div>
+          <p class="hint">These choices are applied when you press Begin export.</p>
         </section>
-        <div class="pipe-card" data-step="buildings">
-          <div class="pipe-body">
-            <div class="pipe-title">Buildings</div>
-            <span id="buildingsNote" class="step-note">Makes a furnished building for every footprint.</span>
-            <div class="building-legend" aria-label="Building generation colours">
-              <span><i class="pending"></i>Waiting</span>
-              <span><i class="active"></i>Building</span>
-              <span><i class="complete"></i>Complete</span>
-            </div>
-            <div class="bar bar-indet" id="buildingsMeter"><div id="buildingsBar" class="bar-fill"></div></div>
-            <div id="census" class="census" hidden>
-              <div class="census-head">Population</div>
-              <div class="tiles census-tiles" id="censusTiles"></div>
-              <div class="census-official" id="censusOfficial"></div>
-              <div class="census-actions">
-                <button id="recountBtn" class="btn btn-small" type="button">Recount</button>
-                <span id="censusNote" class="step-note">Change the zombie settings under Advanced,
-                  then recount. No need to rebuild.</span>
-              </div>
-            </div>
-          </div>
-          <button class="btn btn-stop" data-stop hidden>Stop</button>
-        </div>
         <div id="genOverlays" class="gen-overlays" hidden>
           <div class="field-label">Overlays</div>
           <label class="toggle">
@@ -516,7 +501,7 @@
                 </div>
               </div>
             </div>
-            <label class="toggle">
+            <label class="toggle" id="installToggle">
               <input type="checkbox" id="optInstall" checked>
               <span class="toggle-track" aria-hidden="true"></span>
               <span class="toggle-copy">
@@ -531,15 +516,56 @@
                 <input type="text" id="exportInstallPath" readonly aria-label="Install location">
               </div>
             </div>
+            <label class="toggle" id="drawToggle">
+              <input type="checkbox" id="optDraw">
+              <span class="toggle-track" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <span class="toggle-name">Draw map</span>
+                <span class="toggle-hint">After compiling, draw pictures of the finished map.</span>
+              </span>
+            </label>
             <label class="toggle">
-              <input type="checkbox" id="optEditable" checked>
+              <input type="checkbox" id="optEditable">
               <span class="toggle-track" aria-hidden="true"></span>
               <span class="toggle-copy">
                 <span class="toggle-name">Editable Map File</span>
-                <span class="toggle-hint">Outputs a WorldEd Project for further editing</span>
+                <span class="toggle-hint">Writes a WorldEd project on its own, separate from the compiled map.</span>
               </span>
             </label>
-            <div id="editableOutputSlot"></div>
+            <div class="export-location" id="exportMapFileRow" hidden>
+              <div class="field-label">Output location</div>
+              <div class="game-location-row">
+                <button type="button" id="exportMapFileBrowse" class="btn">Browse…</button>
+                <input type="text" id="exportMapFilePath" readonly aria-label="Map file location">
+              </div>
+            </div>
+          </div>
+          <div id="status"></div>
+          <div id="cullBar" hidden>
+            <p class="step-note">Click a mod on the map to drop it. A dropped mod is left out of the output and is not built.</p>
+            <button id="cullContinue" class="btn btn-primary" type="button">Continue</button>
+          </div>
+          <div class="pipe-card" data-step="buildings" hidden>
+            <div class="pipe-body">
+              <div class="pipe-title">Buildings</div>
+              <span id="buildingsNote" class="step-note">Makes a furnished building for every footprint.</span>
+              <div class="building-legend" aria-label="Building generation colours">
+                <span><i class="pending"></i>Waiting</span>
+                <span><i class="active"></i>Building</span>
+                <span><i class="complete"></i>Complete</span>
+              </div>
+              <div class="bar bar-indet" id="buildingsMeter"><div id="buildingsBar" class="bar-fill"></div></div>
+              <div id="census" class="census" hidden>
+                <div class="census-head">Population</div>
+                <div class="tiles census-tiles" id="censusTiles"></div>
+                <div class="census-official" id="censusOfficial"></div>
+                <div class="census-actions">
+                  <button id="recountBtn" class="btn btn-small" type="button">Recount</button>
+                  <span id="censusNote" class="step-note">Change the zombie settings under Advanced,
+                    then recount. No need to rebuild.</span>
+                </div>
+              </div>
+            </div>
           </div>
           <div class="bar"><div id="compileBar" class="bar-fill"></div></div>
           <span id="compileNote" class="step-note"></span>
@@ -547,40 +573,11 @@
           <span id="installNote" class="step-note"></span>
           <span id="worldedNote" class="step-note"></span>
           <button id="retryCellsBtn" class="btn btn-small" type="button" hidden>Compile the cells that failed</button>
+          <div id="pictureNote" class="hint"></div>
+          <div id="pictureShots" class="shots" hidden></div>
           <div class="export-actions">
-            <button id="exportBtn" class="btn" type="button">Export</button>
+            <button id="exportBtn" class="btn btn-primary" type="button">Begin export</button>
             <button class="btn btn-stop" data-stop hidden>Stop</button>
-          </div>
-          <div id="pictureDraw" class="picture-draw" hidden>
-            <div class="area-toggles" id="pictureOptions">
-              <label class="toggle">
-                <input type="checkbox" value="town" checked>
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-copy">
-                  <span class="toggle-name">The whole map</span>
-                  <span class="toggle-hint">One picture of the entire map.</span>
-                </span>
-              </label>
-              <label class="toggle">
-                <input type="checkbox" value="close" checked>
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-copy">
-                  <span class="toggle-name">Close up</span>
-                  <span class="toggle-hint">The middle of the map, close enough to see.</span>
-                </span>
-              </label>
-              <label class="toggle">
-                <input type="checkbox" value="inside" checked>
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-copy">
-                  <span class="toggle-name">With the roofs off</span>
-                  <span class="toggle-hint">That same middle, with the roofs off so the rooms show.</span>
-                </span>
-              </label>
-            </div>
-            <button id="makePictures" class="btn" type="button">Draw a picture of it</button>
-            <div id="pictureNote" class="hint"></div>
-            <div id="pictureShots" class="shots" hidden></div>
           </div>
         </section>
       </div>
@@ -629,9 +626,19 @@
   </div>
 </div>
 
+<div id="regionAsk" class="region-ask" hidden>
+  <div class="region-ask-box" role="dialog" aria-modal="true" aria-labelledby="regionAskTitle">
+    <p id="regionAskTitle">Do you want to replace the current selection, or add to it?</p>
+    <div class="region-ask-actions">
+      <button type="button" id="regionReplace" class="btn region-ask-btn">Replace</button>
+      <button type="button" id="regionAdd" class="btn region-ask-btn">Add</button>
+    </div>
+  </div>
+</div>
+
 <script src="/static/vendor/leaflet/leaflet.js"></script>
 <script src="/static/vendor/leaflet-draw/leaflet.draw.js"></script>
-<script src="/static/js/clip.js"></script>
+<script src="/static/js/clip.js?v={{ asset_rev }}"></script>
 <script src="/static/js/fx.js"></script>
 <script src="/static/js/georef.js"></script>
 <script src="/static/js/app.js?v={{ asset_rev }}"></script>

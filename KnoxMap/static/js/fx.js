@@ -130,12 +130,15 @@ const fx = (() => {
   function timeLeft(seconds) {
     if (seconds == null || Number.isNaN(Number(seconds))) return null;
     const s = Math.max(0, Math.round(Number(seconds)));
-    if (s < 5) return 'a few seconds left';
-    if (s < 60) return `${s}s left`;
-    const m = Math.floor(s / 60);
-    const r = s % 60;
-    if (m < 60) return r ? `${m}m ${r}s left` : `${m}m left`;
-    return `${Math.floor(m / 60)}h ${m % 60}m left`;
+    // Whole minutes. Seconds twitched on every poll, and "1m left" used to
+    // sit there while a long stage was still going.
+    if (s < 45) return 'under a minute left';
+    if (s < 90) return 'about a minute left';
+    const m = Math.round(s / 60);
+    if (m < 60) return `about ${m} min left`;
+    const h = Math.floor(m / 60);
+    const rm = m % 60;
+    return rm ? `about ${h} h ${rm} min left` : `about ${h} h left`;
   }
 
   let clockTimer = null;
@@ -170,12 +173,93 @@ const fx = (() => {
     clockTimer = setInterval(tick, 500);
   }
 
+  function paintGenSections(stage, sections, fallback) {
+    if (!sections.length) {
+      stage.textContent = fallback || '';
+      return;
+    }
+    stage.replaceChildren();
+    for (const section of sections) {
+      const line = document.createElement('div');
+      line.className = 'gen-section';
+      const where = document.createElement('span');
+      where.className = 'gen-where';
+      where.textContent = section.where || '';
+      const step = document.createElement('span');
+      step.className = 'gen-step';
+      step.textContent = section.step || '';
+      if (section.where) line.append(where);
+      line.append(step);
+      const total = Number(section.total) || 0;
+      if (total > 0) {
+        const count = document.createElement('span');
+        count.className = 'gen-count';
+        count.textContent = `${Number(section.done || 0).toLocaleString()} of ${total.toLocaleString()}`;
+        line.append(count);
+      }
+      if (section.left) {
+        const eta = document.createElement('span');
+        eta.className = 'gen-eta';
+        eta.textContent = section.left;
+        line.append(eta);
+      }
+      stage.append(line);
+    }
+  }
+
+  function showCompileTracks(on) {
+    const tracks = $('#gen-tracks');
+    const meter = $('#gen-meter');
+    if (tracks) tracks.hidden = !on;
+    if (meter) meter.hidden = !!on;
+  }
+
+  function paintCompileTrack(track) {
+    const row = document.createElement('div');
+    row.className = 'gen-track';
+    const head = document.createElement('div');
+    head.className = 'gen-track-head';
+    const label = document.createElement('span');
+    label.className = 'gen-track-label';
+    label.textContent = track.where
+      ? `${track.label} · ${track.where}`
+      : (track.label || '');
+    const total = Number(track.total) || 0;
+    const done = Number(track.done) || 0;
+    const fraction = Number.isFinite(Number(track.fraction))
+      ? Math.max(0, Math.min(1, Number(track.fraction)))
+      : (total > 0 ? done / total : 0);
+    const percent = Math.min(100, Math.round(fraction * 100));
+    const pct = document.createElement('span');
+    pct.className = 'gen-track-pct';
+    pct.textContent = `${percent}%`;
+    const eta = document.createElement('span');
+    eta.className = 'gen-eta';
+    eta.textContent = track.left || '';
+    head.append(label, pct, eta);
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const fill = document.createElement('div');
+    fill.className = 'bar-fill';
+    fill.style.width = `${Math.max(0, Math.min(100, fraction * 100))}%`;
+    bar.append(fill);
+    const count = document.createElement('div');
+    count.className = 'gen-track-count';
+    count.textContent = total > 0
+      ? `${done.toLocaleString()} of ${total.toLocaleString()}`
+      : '';
+    row.append(head, bar);
+    if (count.textContent) row.append(count);
+    return row;
+  }
+
   const overlay = {
     show() {
       clearTimeout(hideTimer);
       const el = $('#gen-overlay');
       el.hidden = false;
       el.dataset.mode = 'terrain';
+      showCompileTracks(false);
       $('.gen-kicker', el).textContent = 'Generating terrain';
       $('#gen-stage').textContent = 'Checking daily map extracts…';
       $('#gen-detail').textContent = '';
@@ -189,8 +273,13 @@ const fx = (() => {
       const starting = el.hidden || el.dataset.mode !== 'buildings';
       el.hidden = false;
       el.dataset.mode = 'buildings';
+      showCompileTracks(false);
       $('.gen-kicker', el).textContent = 'Generating buildings';
-      $('#gen-stage').textContent = (view && view.stage) || 'Generating buildings';
+      paintGenSections(
+        $('#gen-stage'),
+        (view && Array.isArray(view.sections)) ? view.sections : [],
+        (view && view.stage) || 'Generating buildings',
+      );
       $('#gen-detail').textContent = (view && view.detail) || '';
       const pct = Math.max(0, Math.min(100, Number(view && view.pct) || 0));
       $('#gen-bar').style.width = `${Math.max(pct, 2)}%`;
@@ -205,7 +294,8 @@ const fx = (() => {
     },
     update(p) {
       const el = $('#gen-overlay');
-      if (el && el.dataset.mode === 'buildings') return;
+      if (el && (el.dataset.mode === 'buildings' || el.dataset.mode === 'cull' || el.dataset.mode === 'compile')) return;
+      showCompileTracks(false);
       if (p.stage === 'osm' || p.stage === 'regions' || p.stage === 'overture') {
         const total = p.total || 1;
         const done = p.done || 0;
@@ -250,26 +340,11 @@ const fx = (() => {
           ? Math.max(0, Math.min(1, p.piece)) : null;
         const wave = typeof p.wave === 'number'
           ? Math.max(0, Math.min(1, p.wave)) : null;
-        const stage = $('#gen-stage');
-        const sections = Array.isArray(p.sections) ? p.sections : [];
-        if (sections.length) {
-          stage.replaceChildren();
-          for (const section of sections) {
-            const line = document.createElement('div');
-            line.className = 'gen-section';
-            const where = document.createElement('span');
-            where.className = 'gen-where';
-            where.textContent = section.where || '';
-            const step = document.createElement('span');
-            step.className = 'gen-step';
-            step.textContent = section.step || '';
-            if (section.where) line.append(where);
-            line.append(step);
-            stage.append(line);
-          }
-        } else {
-          stage.textContent = p.view || 'Drawing a map piece';
-        }
+        paintGenSections(
+          $('#gen-stage'),
+          Array.isArray(p.sections) ? p.sections : [],
+          p.view || 'Drawing a map piece',
+        );
         const parts = [];
         if (p.detail) parts.push(p.detail);
         if (piece != null) parts.push(`${Math.round(piece * 100)}% of this piece`);
@@ -287,15 +362,47 @@ const fx = (() => {
         $('#gen-stage').textContent = p.view || 'Drawing the terrain';
         $('#gen-detail').textContent = `${(p.features || 0).toLocaleString()} features`;
         $('#gen-bar').style.width = '82%';
-      } else if (p.view) {
+      } else if (p.stage === 'done' && p.message) {
+        $('#gen-stage').textContent = p.message;
+      } else if (p.view && p.stage !== 'done') {
         $('#gen-stage').textContent = p.view;
       }
+    },
+    compile(view) {
+      clearTimeout(hideTimer);
+      const el = $('#gen-overlay');
+      const starting = el.hidden || el.dataset.mode !== 'compile';
+      el.hidden = false;
+      el.dataset.mode = 'compile';
+      showCompileTracks(true);
+      $('.gen-kicker', el).textContent = 'Compiling';
+      $('#gen-stage').textContent = '';
+      $('#gen-detail').textContent = (view && view.detail) || '';
+      const host = $('#gen-tracks');
+      const tracks = (view && Array.isArray(view.tracks)) ? view.tracks : [];
+      if (host) host.replaceChildren(...tracks.map(paintCompileTrack));
+      showElapsedWord(true);
+      if (starting) armClock(true);
+    },
+    cull(detail) {
+      clearTimeout(hideTimer);
+      const el = $('#gen-overlay');
+      el.hidden = false;
+      el.dataset.mode = 'cull';
+      showCompileTracks(false);
+      $('.gen-kicker', el).textContent = 'Culling';
+      $('#gen-stage').textContent = 'Choose mods to leave out';
+      $('#gen-detail').textContent = detail
+        || 'Click a mod on the map. Continue when the ones to drop are marked.';
+      $('#gen-bar').style.width = '100%';
+      showElapsedWord(false);
     },
     done(summary) {
       clearTimeout(hideTimer);
       const el = $('#gen-overlay');
       el.hidden = false;
       delete el.dataset.mode;
+      showCompileTracks(false);
       $('.gen-kicker', el).textContent = 'Done';
       $('#gen-stage').textContent = summary || '';
       $('#gen-detail').textContent = '';
@@ -308,6 +415,7 @@ const fx = (() => {
       const el = $('#gen-overlay');
       el.hidden = false;
       delete el.dataset.mode;
+      showCompileTracks(false);
       $('.gen-kicker', el).textContent = 'Failed';
       $('#gen-stage').textContent = message.length > 160 ? message.slice(0, 157) + '…' : message;
       $('#gen-detail').textContent = '';
